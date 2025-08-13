@@ -24,7 +24,7 @@ public class FormSearchController {
 
         @PostMapping("/addBig")
         public String addForm(@RequestBody MultipleFields multipleFields) {
-            formSearchService.saveBig(multipleFields);
+            formSearchService.saveBiggest(multipleFields);
             return "Form added!";
         }
 
