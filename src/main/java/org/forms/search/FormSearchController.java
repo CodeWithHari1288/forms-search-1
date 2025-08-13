@@ -1,4 +1,4 @@
-package org.example;
+package org.forms.search;
 
 import org.springframework.ai.document.Document;
 import org.springframework.web.bind.annotation.*;

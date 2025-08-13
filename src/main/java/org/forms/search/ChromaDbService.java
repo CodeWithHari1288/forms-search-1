@@ -1,4 +1,4 @@
-package org.example;
+package org.forms.search;
 
 import java.util.List;
 import java.util.Map;

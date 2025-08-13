@@ -1,4 +1,4 @@
-package org.example;
+package org.forms.search;
 
 import org.springframework.ai.autoconfigure.vectorstore.chroma.ChromaVectorStoreProperties;
 import org.springframework.ai.chroma.vectorstore.ChromaApi;

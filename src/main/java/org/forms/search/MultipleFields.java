@@ -1,4 +1,4 @@
-package org.example;
+package org.forms.search;
 
 import lombok.Data;
 
