@@ -1,274 +1,101 @@
-import com.fasterxml.jackson.core.JsonFactory;
-import com.fasterxml.jackson.core.JsonParser;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
-import com.fasterxml.jackson.databind.node.ObjectNode;
+from typing import Any, Dict, List, Tuple, Iterable, Union
+from collections import defaultdict
+import re
 
-import java.io.File;
-import java.nio.file.Files;
-import java.nio.file.Paths;
-import java.text.SimpleDateFormat;
-import java.util.*;
-import java.util.regex.Pattern;
-import java.util.stream.Collectors;
+Json = Union[Dict[str, Any], List[Any], str, int, float, bool, None]
 
-/**
- * Read a file that contains an ARRAY of JSON objects, infer semantic sections without any hardcoded keys,
- * and write back an array of { id, sections: [{title, text}] }.
- *
- * Usage:
- *   javac -cp jackson-databind-2.17.1.jar:jackson-core-2.17.1.jar:jackson-annotations-2.17.1.jar JsonToGenericSections.java
- *   java  -cp .:jackson-databind-2.17.1.jar:jackson-core-2.17.1.jar:jackson-annotations-2.17.1.jar JsonToGenericSections input.json output.sections.json
- *
- * Maven (add to your pom):
- *   <dependency>
- *     <groupId>com.fasterxml.jackson.core</groupId>
- *     <artifactId>jackson-databind</artifactId>
- *     <version>2.17.1</version>
- *   </dependency>
- */
-public class JsonToGenericSections {
+# ---- helpers ----
+_WORDS = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+")
 
-    // ---- Tunables (safe defaults) ----
-    private static final int MAX_ITEMS_PER_ARRAY_SECTION = 10;   // limit detailed array previews
-    private static final int MAX_PREVIEW_FIELDS_IN_OBJECT = 6;   // when summarizing array objects
-    private static final int MAX_STRING_PREVIEW = 300;           // truncate very long text
-    private static final ObjectMapper M = new ObjectMapper();
+def _split_words(s: str) -> List[str]:
+    return [m.group(0) for m in _WORDS.finditer((s or "").replace("_", " "))] or [s or ""]
 
-    // value-pattern detectors (no key assumptions)
-    private static final Pattern ISO_DATE  = Pattern.compile("^\\d{4}-\\d{2}-\\d{2}$");
-    private static final Pattern ISO_DATETIME_Z = Pattern.compile("^\\d{4}-\\d{2}-\\d{2}[ T]\\d{2}:\\d{2}(:\\d{2})?(\\.\\d+)?(Z|[+-]\\d{2}:?\\d{2})?$");
-    private static final Pattern PHONE_LIKE = Pattern.compile("^\\+?[0-9()\\-\\s]{7,}$");
-    private static final Pattern EMAIL_LIKE = Pattern.compile("^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$");
+def _title(label: str) -> str:
+    return " ".join(w[:1].upper() + w[1:] for w in _split_words(label) if w)
 
-    public static void main(String[] args) throws Exception {
-        if (args.length < 2) {
-            System.err.println("Usage: java JsonToGenericSections <input.json> <output.json>");
-            System.exit(1);
-        }
-        final String inputPath = args[0];
-        final String outputPath = args[1];
+def _dedupe_adjacent(segments: Iterable[str]) -> List[str]:
+    out, last = [], None
+    for seg in segments:
+        if last is None or seg.lower() != last.lower():
+            out.append(seg); last = seg
+    return out
 
-        JsonNode root = readJson(inputPath);
-        if (root == null || !root.isArray()) {
-            throw new IllegalArgumentException("Input must be a JSON array of objects.");
-        }
+def _node_label(path: List[str]) -> str:
+    return _title(path[-1]) if path else "Root"
 
-        ArrayNode in = (ArrayNode) root;
-        ArrayNode out = M.createArrayNode();
+# ---- core: JSON → only "has" statements, grouped per entity ----
+def json_to_has_sections(
+    data: Json,
+    *,
+    root_name: str = "Root",
+    ignore_keys: Iterable[str] = ("_id", "id", "@type", "type"),
+    skip_empty: bool = True,
+) -> List[Dict[str, str]]:
+    """
+    Returns a list of sections:
+      { "id": "<stable-id>", "entity": "<EntityName>", "text": "<lines joined by \\n>" }
+    Lines look like: "<Entity> has <Field> = <Value>"
+    """
+    ignore = {k.lower() for k in ignore_keys}
+    # entity -> set(lines)
+    by_entity: Dict[str, List[str]] = defaultdict(list)
 
-        for (int i = 0; i < in.size(); i++) {
-            JsonNode node = in.get(i);
-            if (!node.isObject()) continue;
+    def walk(node: Json, path: List[str]):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if isinstance(k, str) and k.lower() in ignore:
+                    walk(v, path)  # skip naming this key but keep traversing
+                    continue
+                walk(v, _dedupe_adjacent(path + [k]))
+        elif isinstance(node, list):
+            # no indices; traverse items at same path
+            for item in node:
+                walk(item, path)
+        else:
+            # leaf → "<Entity> has <Field> = <Value>"
+            entity = _node_label(path[:-1]) if len(path) > 1 else _title(root_name)
+            field  = _title(path[-1]) if path else _title("Value")
+            val = "" if node is None else str(node)
+            if skip_empty and not str(val).strip():
+                return
+            by_entity[entity].append(f"{entity} has {field} = {val}")
 
-            Map<String, List<String>> sections = new LinkedHashMap<>();
-            // Walk object; top-level scalars go by type; nested items grouped under their parent path.
-            walkObject((ObjectNode) node, sections, new ArrayList<String>(), true);
+    walk(data, [root_name])
 
-            // Marshal to output shape
-            ArrayNode sectionArr = M.createArrayNode();
-            for (Map.Entry<String, List<String>> e : sections.entrySet()) {
-                String text = e.getValue().stream().filter(s -> s != null && !s.trim().isEmpty())
-                        .collect(Collectors.joining("\n"));
-                ObjectNode sec = M.createObjectNode();
-                sec.put("title", e.getKey());
-                sec.put("text", text);
-                sectionArr.add(sec);
-            }
+    # build sections: sort lines & dedupe case-insensitively
+    sections: List[Dict[str, str]] = []
+    for entity in sorted(by_entity.keys(), key=str.lower):
+        lines = by_entity[entity]
+        # dedupe while preserving order
+        seen, uniq = set(), []
+        for s in lines:
+            k = s.lower()
+            if k not in seen:
+                uniq.append(s); seen.add(k)
+        uniq.sort(key=str.lower)  # stable, tidy order
+        sections.append({
+            "id": f"{entity.replace(' ', '_').lower()}",
+            "entity": entity,
+            "text": "\n".join(uniq),
+        })
+    return sections
 
-            ObjectNode outObj = M.createObjectNode();
-            outObj.put("id", stableId(node, i));
-            outObj.set("sections", sectionArr);
-            out.add(outObj);
-        }
-
-        Files.write(Paths.get(outputPath), M.writerWithDefaultPrettyPrinter().writeValueAsBytes(out));
-        System.out.println("Wrote sections to: " + outputPath);
-    }
-
-    private static JsonNode readJson(String path) throws Exception {
-        JsonFactory f = new JsonFactory();
-        try (JsonParser p = f.createParser(new File(path))) {
-            return M.readTree(p);
-        }
-    }
-
-    // Build a deterministic id without relying on any key names
-    private static String stableId(JsonNode node, int idx) {
-        // hash of canonical JSON + index (guards collisions across equal objects)
-        int h = Objects.hash(node.toString(), idx);
-        return "row-" + idx + "-" + Integer.toHexString(h);
-    }
-
-    private static void walkObject(ObjectNode obj,
-                                   Map<String, List<String>> sections,
-                                   List<String> path,
-                                   boolean isTopLevel) {
-        // For reproducible ordering
-        List<Map.Entry<String, JsonNode>> fields = new ArrayList<>();
-        obj.fields().forEachRemaining(fields::add);
-        fields.sort(Comparator.comparing(Map.Entry::getKey, String.CASE_INSENSITIVE_ORDER));
-
-        for (Map.Entry<String, JsonNode> e : fields) {
-            String key = e.getKey();
-            JsonNode v = e.getValue();
-            String niceKey = humanizeKey(key);
-
-            if (v == null || v.isNull()) {
-                String sec = sectionTitle(path, isTopLevel, v);
-                addLine(sections, sec, niceKey + " has null");
-                continue;
-            }
-
-            if (v.isValueNode()) {
-                // scalars
-                String sec = sectionTitle(path, isTopLevel, v);
-                addLine(sections, sec, niceKey + " has " + renderScalar(v));
-            } else if (v.isObject()) {
-                // nested object: recurse under its own section
-                List<String> newPath = extend(path, niceKey);
-                // Optional short summary line based on a few scalars:
-                String summary = objectPreview((ObjectNode) v);
-                if (!summary.isEmpty()) {
-                    addLine(sections, humanizePath(newPath), "Summary: " + summary);
-                }
-                walkObject((ObjectNode) v, sections, newPath, false);
-            } else if (v.isArray()) {
-                // arrays summarized under "<Path › NiceKey> (List)"
-                List<String> newPath = extend(path, niceKey + " (List)");
-                summarizeArray((ArrayNode) v, sections, newPath);
-            } else {
-                String sec = sectionTitle(path, isTopLevel, v);
-                addLine(sections, sec, niceKey + " relates to " + v.toString());
-            }
+# ---- demo ----
+if __name__ == "__main__":
+    sample = {
+        "customer": {
+            "customer": {
+                "name": "Hari",
+                "city": "Hyderabad",
+                "address": {"city": "Hyderabad", "pinCode": "500001"}
+            },
+            "orders": [
+                {"order": {"id": "123", "amount": 500}},
+                {"order": {"id": "456", "amount": 900}}
+            ]
         }
     }
-
-    private static void summarizeArray(ArrayNode arr,
-                                       Map<String, List<String>> sections,
-                                       List<String> path) {
-        String sec = humanizePath(path);
-        if (arr.size() == 0) {
-            addLine(sections, sec, "List has 0 items");
-            return;
-        }
-
-        // If scalar list
-        if (arr.get(0).isValueNode()) {
-            int n = Math.min(arr.size(), MAX_ITEMS_PER_ARRAY_SECTION);
-            for (int i = 0; i < n; i++) {
-                addLine(sections, sec, "Item " + (i + 1) + " has " + renderScalar(arr.get(i)));
-            }
-            if (arr.size() > n) addLine(sections, sec, "… and " + (arr.size() - n) + " more");
-            return;
-        }
-
-        // Object list: show compact previews
-        int shown = 0;
-        for (int i = 0; i < arr.size() && shown < MAX_ITEMS_PER_ARRAY_SECTION; i++) {
-            JsonNode it = arr.get(i);
-            if (!it.isObject()) continue;
-            String preview = objectPreview((ObjectNode) it);
-            if (preview.isEmpty()) {
-                addLine(sections, sec, "Item " + (i + 1) + " relates to an object");
-            } else {
-                addLine(sections, sec, "Item " + (i + 1) + " relates to \"" + preview + "\"");
-            }
-            shown++;
-        }
-        if (arr.size() > shown) addLine(sections, sec, "… and " + (arr.size() - shown) + " more objects");
-    }
-
-    // Section title logic with ZERO key assumptions:
-    // - Top-level scalars grouped by value type (Dates/Times, Numbers, Booleans, Strings)
-    // - Nested entries grouped under their parent path (e.g., "Employment › History")
-    private static String sectionTitle(List<String> path, boolean isTopLevel, JsonNode value) {
-        if (!path.isEmpty()) return humanizePath(path);
-        if (!isTopLevel) return humanizePath(path);
-        if (value != null && value.isValueNode()) {
-            if (looksLikeDate(value.asText())) return "Dates / Times";
-            if (value.isNumber()) return "Numbers";
-            if (value.isBoolean()) return "Booleans";
-            // Optionally distinguish Contacts by value shape, still not key-based:
-            String s = value.asText();
-            if (EMAIL_LIKE.matcher(s).matches()) return "Emails";
-            if (PHONE_LIKE.matcher(s).matches()) return "Phone Numbers";
-            return "Strings";
-        }
-        return "Other";
-    }
-
-    private static boolean looksLikeDate(String s) {
-        if (s == null) return false;
-        return ISO_DATE.matcher(s).matches() || ISO_DATETIME_Z.matcher(s).matches();
-    }
-
-    private static String objectPreview(ObjectNode obj) {
-        // Pick up to MAX_PREVIEW_FIELDS_IN_OBJECT scalar fields, no key whitelists.
-        List<Map.Entry<String, JsonNode>> fields = new ArrayList<>();
-        obj.fields().forEachRemaining(fields::add);
-
-        // Prefer shorter scalar values for signal
-        List<String> parts = new ArrayList<>();
-        for (Map.Entry<String, JsonNode> e : fields) {
-            if (parts.size() >= MAX_PREVIEW_FIELDS_IN_OBJECT) break;
-            JsonNode v = e.getValue();
-            if (v.isContainerNode()) continue;
-            String k = humanizeKey(e.getKey());
-            String vs = v.asText();
-            vs = vs == null ? "" : vs.trim().replaceAll("\\s+", " ");
-            if (vs.length() > 80) vs = vs.substring(0, 77) + "...";
-            parts.add(k + "=" + (v.isTextual() ? "\"" + vs + "\"" : vs));
-        }
-        return String.join(", ", parts);
-    }
-
-    private static void addLine(Map<String, List<String>> sections, String title, String line) {
-        List<String> bucket = sections.computeIfAbsent(title, k -> new ArrayList<>());
-        bucket.add(line);
-    }
-
-    // ---- text helpers ----
-    private static final Pattern CAMEL_BOUNDARY = Pattern.compile(
-            "(?<=[A-Z])(?=[A-Z][a-z])|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Za-z])(?=[0-9])|(?<=[0-9])(?=[A-Za-z])"
-    );
-
-    private static String humanizeKey(String raw) {
-        if (raw == null) return "";
-        String s = raw.replace('_', ' ');
-        s = CAMEL_BOUNDARY.matcher(s).replaceAll(" ");
-        s = s.replaceAll("\\s+", " ").trim();
-        if (s.isEmpty()) return raw;
-        StringBuilder out = new StringBuilder();
-        for (String part : s.split(" ")) {
-            if (part.isEmpty()) continue;
-            out.append(Character.toUpperCase(part.charAt(0)));
-            if (part.length() > 1) out.append(part.substring(1).toLowerCase(Locale.ROOT));
-            out.append(" ");
-        }
-        return out.toString().trim();
-    }
-
-    private static String humanizePath(List<String> path) {
-        return String.join(" › ", path);
-    }
-
-    private static List<String> extend(List<String> path, String next) {
-        List<String> out = new ArrayList<>(path);
-        out.add(next);
-        return out;
-    }
-
-    private static String renderScalar(JsonNode n) {
-        if (n.isTextual()) {
-            String s = n.asText();
-            s = s == null ? "" : s.replaceAll("\\s+", " ").trim();
-            if (s.length() > MAX_STRING_PREVIEW) s = s.substring(0, MAX_STRING_PREVIEW - 3) + "...";
-            return "\"" + s + "\"";
-        }
-        if (n.isNumber() || n.isBoolean()) return n.asText();
-        if (n.isNull()) return "null";
-        return "\"" + n.toString().replaceAll("\\s+", " ").trim() + "\"";
-    }
-}
+    secs = json_to_has_sections(sample, root_name="Customer")
+    for s in secs:
+        print(f"\n=== [{s['id']}] {s['entity']} ===")
+        print(s["text"])
