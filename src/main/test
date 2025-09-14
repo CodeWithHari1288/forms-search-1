@@ -99,3 +99,26 @@ if __name__ == "__main__":
     for s in secs:
         print(f"\n=== [{s['id']}] {s['entity']} ===")
         print(s["text"])
+
+
+
+
+
+
+from sentence_transformers import SentenceTransformer
+import torch
+
+model = SentenceTransformer(
+    "BAAI/bge-m3",
+    trust_remote_code=True,
+    device="cuda" if torch.cuda.is_available() else "cpu",
+)
+
+def encode_docs(texts, batch_size=64):
+    return model.encode(texts, normalize_embeddings=True, batch_size=batch_size, show_progress_bar=True)
+
+# build sections
+sections = json_to_has_sections(sample, root_name="Customer")
+doc_ids   = [s["id"] for s in sections]
+doc_texts = [s["text"] for s in sections]
+doc_embs  = encode_docs(doc_texts)   # np.ndarray [N, D]
