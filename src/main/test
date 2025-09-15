@@ -63,8 +63,7 @@ public class JsonToSectionsText {
 
         if (!record.isObject()) {
             LinkedHashSet<String> root = sectionToStatements.computeIfAbsent("Root", k -> new LinkedHashSet<>());
-            String subj = "Record " + recordNum;
-            emitNodeStatements(subj, new ArrayDeque<>(Collections.singletonList(subj)), record, root);
+            emitNodeStatements("", new ArrayDeque<>(), record, root);
         } else {
             ObjectNode on = (ObjectNode) record;
             Iterator<Map.Entry<String, JsonNode>> fields = on.fields();
@@ -75,24 +74,21 @@ public class JsonToSectionsText {
                 JsonNode val = e.getValue();
 
                 String sectionName = toKeyLabel(topKey);
-                String recordSubject = "Record " + recordNum;
 
                 if (val.isValueNode()) {
                     LinkedHashSet<String> rootSection = sectionToStatements.computeIfAbsent("Root", k -> new LinkedHashSet<>());
                     Deque<String> path = new ArrayDeque<>();
-                    path.add(recordSubject);
                     path.add(sectionName);
-                    emitScalarStatement(recordSubject, path, sectionName, val, rootSection);
+                    emitScalarStatement("", path, sectionName, val, rootSection);
                 } else {
                     LinkedHashSet<String> bucket = sectionToStatements.computeIfAbsent(sectionName, k -> new LinkedHashSet<>());
                     Deque<String> path = new ArrayDeque<>();
-                    path.add(recordSubject);
                     path.add(sectionName);
 
                     if (val.isObject()) {
-                        processNode(recordSubject, val, path, bucket);
+                        processNode("", val, path, bucket);
                     } else if (val.isArray()) {
-                        handleArray(recordSubject, sectionName, val, path, bucket);
+                        handleArray("", sectionName, val, path, bucket);
                     }
                 }
             }
@@ -222,8 +218,8 @@ public class JsonToSectionsText {
             prev = pp;
         }
         int n = dedup.size();
-        if (n <= 3) return String.join(" ", dedup);
-        return String.join(" ", dedup.subList(n - 3, n));
+        if (n <= 2) return String.join(" ", dedup);
+        return String.join(" ", dedup.subList(n - 2, n));
     }
 
     private static String normalizeValue(JsonNode v) {
