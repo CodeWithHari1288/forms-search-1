@@ -11,11 +11,13 @@ import java.util.*;
 
 public class JsonToSectionsText {
 
+    // ---- Tuning knobs ----
     private static final int MAX_VALUE_LEN = 160;
     private static final int MAX_ARRAY_ITEMS_INLINE = 5;
     private static final int MAX_ARRAY_OBJECTS_EXPANDED = 5;
     private static final boolean EMIT_COUNTS_FOR_ARRAYS = true;
 
+    // Identifier hints for labeling array items
     private static final Set<String> LIKELY_IDENTIFIER_KEYS =
             new HashSet<>(Arrays.asList("id", "name", "code", "key", "sku", "uuid", "number"));
 
@@ -41,13 +43,20 @@ public class JsonToSectionsText {
                 if (root.isArray()) {
                     int idx = 0;
                     for (JsonNode item : root) {
+                        String recId = (item.isObject())
+                                ? extractRecordId((ObjectNode) item, idx + 1)
+                                : String.valueOf(idx + 1);
+
                         emitSectionsForRecord(item, idx + 1, bw);
-                        bw.write("--- End of Record " + (idx + 1) + " ---\n\n");
+                        bw.write("--- End of Record " + recId + " ---\n\n");
                         idx++;
                     }
                 } else {
+                    String recId = (root.isObject())
+                            ? extractRecordId((ObjectNode) root, 1)
+                            : "1";
                     emitSectionsForRecord(root, 1, bw);
-                    bw.write("--- End of Record 1 ---\n\n");
+                    bw.write("--- End of Record " + recId + " ---\n\n");
                 }
             }
 
@@ -55,6 +64,40 @@ public class JsonToSectionsText {
             e.printStackTrace();
             System.exit(2);
         }
+    }
+
+    /**
+     * Extract a human ID for the record from common top-level keys.
+     * Falls back to the numeric index if not found.
+     */
+    private static String extractRecordId(ObjectNode node, int fallbackNum) {
+        String[] candidateKeys = {"id", "orderId", "recordId", "uuid", "key"};
+        // Case-sensitive first
+        for (String k : candidateKeys) {
+            JsonNode v = node.get(k);
+            if (v != null && v.isValueNode()) {
+                String s = v.asText();
+                if (s != null && !s.trim().isEmpty()) return s.trim();
+            }
+        }
+        // Case-insensitive pass
+        Iterator<String> it = node.fieldNames();
+        Map<String, String> lowerToActual = new HashMap<>();
+        while (it.hasNext()) {
+            String actual = it.next();
+            lowerToActual.put(actual.toLowerCase(Locale.ROOT), actual);
+        }
+        for (String k : candidateKeys) {
+            String actual = lowerToActual.get(k.toLowerCase(Locale.ROOT));
+            if (actual != null) {
+                JsonNode v = node.get(actual);
+                if (v != null && v.isValueNode()) {
+                    String s = v.asText();
+                    if (s != null && !s.trim().isEmpty()) return s.trim();
+                }
+            }
+        }
+        return String.valueOf(fallbackNum);
     }
 
     // ---- Per-record grouping ----
@@ -188,7 +231,9 @@ public class JsonToSectionsText {
                                             LinkedHashSet<String> out) {
         String subject = compressPath(path);
         String value = normalizeValue(val);
-        out.add(subject + " has " + keyLabel.toLowerCase(Locale.ROOT) + " " + value + ".");
+        // Heuristic verbs kept simple: "has" / "is" / "occurs on"
+        String verb = chooseVerb(keyLabel, val);
+        out.add(subject + " " + verb + " " + keyLabel.toLowerCase(Locale.ROOT) + " " + value + ".");
     }
 
     // ---- Helpers ----
@@ -220,6 +265,20 @@ public class JsonToSectionsText {
         int n = dedup.size();
         if (n <= 2) return String.join(" ", dedup);
         return String.join(" ", dedup.subList(n - 2, n));
+    }
+
+    private static String chooseVerb(String keyLabel, JsonNode val) {
+        String k = keyLabel.toLowerCase(Locale.ROOT);
+        if (k.contains("date") || looksLikeDate(val)) return "occurs on";
+        if (k.equals("status") || k.endsWith(" status") || k.contains("state")) return "is";
+        if (val.isBoolean()) return "is";
+        return "has";
+    }
+
+    private static boolean looksLikeDate(JsonNode val) {
+        if (!val.isValueNode()) return false;
+        String s = val.asText();
+        return s.matches("\\d{4}-\\d{2}-\\d{2}([ T].*)?") || s.matches("\\d{2}/\\d{2}/\\d{4}");
     }
 
     private static String normalizeValue(JsonNode v) {
