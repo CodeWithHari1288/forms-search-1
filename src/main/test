@@ -1,124 +1,370 @@
-from typing import Any, Dict, List, Tuple, Iterable, Union
-from collections import defaultdict
-import re
+import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 
-Json = Union[Dict[str, Any], List[Any], str, int, float, bool, None]
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
 
-# ---- helpers ----
-_WORDS = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+")
+/**
+ * JsonToSections
+ *
+ * Reads arbitrary JSON (single object or array of objects) and emits JSONL where each line
+ * represents a "section" (grouped primarily by top-level key) containing a list of clean,
+ * semantically helpful statements suitable for text embeddings.
+ *
+ * Example output line:
+ * {
+ *   "record": 1,
+ *   "section": "Customer",
+ *   "subject": "Record 1 Customer",
+ *   "statements": ["Record 1 Customer has name \"Riya\".", "..."]
+ * }
+ */
+public class JsonToSections {
 
-def _split_words(s: str) -> List[str]:
-    return [m.group(0) for m in _WORDS.finditer((s or "").replace("_", " "))] or [s or ""]
+    // ---- Tuning knobs --------------------------------------------------------
+    private static final int MAX_VALUE_LEN = 160;            // truncate long text values
+    private static final int MAX_ARRAY_ITEMS_INLINE = 5;     // primitive array items listed inline
+    private static final int MAX_ARRAY_OBJECTS_EXPANDED = 5; // how many array objects to expand
+    private static final boolean EMIT_COUNTS_FOR_ARRAYS = true;
 
-def _title(label: str) -> str:
-    return " ".join(w[:1].upper() + w[1:] for w in _split_words(label) if w)
+    // Keys we consider "identifiers" when labeling array items / subjects
+    private static final Set<String> LIKELY_IDENTIFIER_KEYS =
+            new HashSet<>(Arrays.asList("id", "name", "code", "key", "sku", "uuid", "number"));
+    // ----------------------------------------------------------------------------
 
-def _dedupe_adjacent(segments: Iterable[str]) -> List[str]:
-    out, last = [], None
-    for seg in segments:
-        if last is None or seg.lower() != last.lower():
-            out.append(seg); last = seg
-    return out
+    private static final ObjectMapper MAPPER = new ObjectMapper(new JsonFactory());
 
-def _node_label(path: List[str]) -> str:
-    return _title(path[-1]) if path else "Root"
+    public static void main(String[] args) {
+        if (args.length < 1 || args.length > 2) {
+            System.err.println("Usage: java JsonToSections <input.json> [output.jsonl]");
+            System.exit(1);
+        }
+        String inputPath = args[0];
+        String outputPath = args.length == 2 ? args[1] : null;
 
-# ---- core: JSON → only "has" statements, grouped per entity ----
-def json_to_has_sections(
-    data: Json,
-    *,
-    root_name: str = "Root",
-    ignore_keys: Iterable[str] = ("_id", "id", "@type", "type"),
-    skip_empty: bool = True,
-) -> List[Dict[str, str]]:
-    """
-    Returns a list of sections:
-      { "id": "<stable-id>", "entity": "<EntityName>", "text": "<lines joined by \\n>" }
-    Lines look like: "<Entity> has <Field> = <Value>"
-    """
-    ignore = {k.lower() for k in ignore_keys}
-    # entity -> set(lines)
-    by_entity: Dict[str, List[str]] = defaultdict(list)
+        try (InputStream in = new FileInputStream(inputPath)) {
+            JsonParser jp = MAPPER.getFactory().createParser(in);
+            JsonNode root = MAPPER.readTree(jp);
 
-    def walk(node: Json, path: List[str]):
-        if isinstance(node, dict):
-            for k, v in node.items():
-                if isinstance(k, str) and k.lower() in ignore:
-                    walk(v, path)  # skip naming this key but keep traversing
-                    continue
-                walk(v, _dedupe_adjacent(path + [k]))
-        elif isinstance(node, list):
-            # no indices; traverse items at same path
-            for item in node:
-                walk(item, path)
-        else:
-            # leaf → "<Entity> has <Field> = <Value>"
-            entity = _node_label(path[:-1]) if len(path) > 1 else _title(root_name)
-            field  = _title(path[-1]) if path else _title("Value")
-            val = "" if node is None else str(node)
-            if skip_empty and not str(val).strip():
-                return
-            by_entity[entity].append(f"{entity} has {field} = {val}")
+            Writer writer;
+            if (outputPath == null) {
+                writer = new OutputStreamWriter(System.out, StandardCharsets.UTF_8);
+            } else {
+                writer = new OutputStreamWriter(new FileOutputStream(outputPath), StandardCharsets.UTF_8);
+            }
 
-    walk(data, [root_name])
+            try (BufferedWriter bw = new BufferedWriter(writer)) {
+                if (root.isArray()) {
+                    int idx = 0;
+                    for (JsonNode item : root) {
+                        int recordNum = idx + 1;
+                        emitSectionsForRecord(item, recordNum, bw);
+                        idx++;
+                    }
+                } else {
+                    emitSectionsForRecord(root, 1, bw);
+                }
+            }
 
-    # build sections: sort lines & dedupe case-insensitively
-    sections: List[Dict[str, str]] = []
-    for entity in sorted(by_entity.keys(), key=str.lower):
-        lines = by_entity[entity]
-        # dedupe while preserving order
-        seen, uniq = set(), []
-        for s in lines:
-            k = s.lower()
-            if k not in seen:
-                uniq.append(s); seen.add(k)
-        uniq.sort(key=str.lower)  # stable, tidy order
-        sections.append({
-            "id": f"{entity.replace(' ', '_').lower()}",
-            "entity": entity,
-            "text": "\n".join(uniq),
-        })
-    return sections
-
-# ---- demo ----
-if __name__ == "__main__":
-    sample = {
-        "customer": {
-            "customer": {
-                "name": "Hari",
-                "city": "Hyderabad",
-                "address": {"city": "Hyderabad", "pinCode": "500001"}
-            },
-            "orders": [
-                {"order": {"id": "123", "amount": 500}},
-                {"order": {"id": "456", "amount": 900}}
-            ]
+        } catch (Exception e) {
+            e.printStackTrace();
+            System.exit(2);
         }
     }
-    secs = json_to_has_sections(sample, root_name="Customer")
-    for s in secs:
-        print(f"\n=== [{s['id']}] {s['entity']} ===")
-        print(s["text"])
 
+    // ----- Core per-record logic ----------------------------------------------
 
+    private static void emitSectionsForRecord(JsonNode record, int recordNum, BufferedWriter bw) throws IOException {
+        // Group statements by "section" (top-level key). Also collect root-level scalars under "Root".
+        Map<String, LinkedHashSet<String>> sectionToStatements = new LinkedHashMap<>();
 
+        if (!record.isObject()) {
+            // If the root is not an object, just dump a single "Root" section.
+            LinkedHashSet<String> root = sectionToStatements.computeIfAbsent("Root", k -> new LinkedHashSet<>());
+            String subj = "Record " + recordNum;
+            emitNodeStatements(subj, new ArrayDeque<>(Collections.singletonList(subj)), record, root);
+        } else {
+            ObjectNode on = (ObjectNode) record;
 
+            // 1) Root-level scalars -> "Root" section
+            LinkedHashSet<String> rootSection = null;
 
+            Iterator<Map.Entry<String, JsonNode>> fields = on.fields();
+            while (fields.hasNext()) {
+                Map.Entry<String, JsonNode> e = fields.next();
+                String topKey = e.getKey();
+                JsonNode val = e.getValue();
 
-from sentence_transformers import SentenceTransformer
-import torch
+                String sectionName = toKeyLabel(topKey); // e.g., "Customer", "Items", "Order Id"
+                String recordSubject = "Record " + recordNum;
 
-model = SentenceTransformer(
-    "BAAI/bge-m3",
-    trust_remote_code=True,
-    device="cuda" if torch.cuda.is_available() else "cpu",
-)
+                if (val.isValueNode()) {
+                    if (rootSection == null) rootSection = sectionToStatements.computeIfAbsent("Root", k -> new LinkedHashSet<>());
+                    Deque<String> path = new ArrayDeque<>();
+                    path.add(recordSubject);
+                    path.add(sectionName);
+                    emitScalarStatement(recordSubject, path, sectionName, val, rootSection);
+                } else {
+                    // Make a section bucket for this top-level key
+                    LinkedHashSet<String> bucket = sectionToStatements.computeIfAbsent(sectionName, k -> new LinkedHashSet<>());
 
-def encode_docs(texts, batch_size=64):
-    return model.encode(texts, normalize_embeddings=True, batch_size=batch_size, show_progress_bar=True)
+                    // Subject carries record and section for readability
+                    Deque<String> path = new ArrayDeque<>();
+                    path.add(recordSubject);
+                    path.add(sectionName);
 
-# build sections
-sections = json_to_has_sections(sample, root_name="Customer")
-doc_ids   = [s["id"] for s in sections]
-doc_texts = [s["text"] for s in sections]
-doc_embs  = encode_docs(doc_texts)   # np.ndarray [N, D]
+                    if (val.isObject()) {
+                        // Recurse within the section
+                        processNode(recordSubject, val, path, bucket);
+                    } else if (val.isArray()) {
+                        handleArray(recordSubject, sectionName, val, path, bucket);
+                    }
+                }
+            }
+        }
+
+        // Write JSONL lines: one per section
+        for (Map.Entry<String, LinkedHashSet<String>> entry : sectionToStatements.entrySet()) {
+            String section = entry.getKey();
+            List<String> statements = new ArrayList<>(entry.getValue());
+            String subject = "Record " + recordNum + (section.equals("Root") ? "" : " " + section);
+
+            // Build JSON line
+            Map<String, Object> line = new LinkedHashMap<>();
+            line.put("record", recordNum);
+            line.put("section", section);
+            line.put("subject", subject);
+            line.put("statements", statements);
+
+            bw.write(MAPPER.writeValueAsString(line));
+            bw.write('\n');
+        }
+    }
+
+    // ----- Traversal / statement building -------------------------------------
+
+    private static void processNode(String subjectSeed,
+                                    JsonNode node,
+                                    Deque<String> path,
+                                    LinkedHashSet<String> out) {
+        if (node == null || node.isNull()) return;
+
+        if (node.isObject()) {
+            Iterator<Map.Entry<String, JsonNode>> it = node.fields();
+            while (it.hasNext()) {
+                Map.Entry<String, JsonNode> e = it.next();
+                String key = e.getKey();
+                JsonNode val = e.getValue();
+
+                String keyLabel = toKeyLabel(key);
+                Deque<String> newPath = new ArrayDeque<>(path);
+                newPath.add(keyLabel);
+
+                if (val.isObject()) {
+                    processNode(subjectSeed, val, newPath, out);
+                } else if (val.isArray()) {
+                    handleArray(subjectSeed, keyLabel, val, newPath, out);
+                } else if (val.isValueNode()) {
+                    emitScalarStatement(subjectSeed, path, keyLabel, val, out);
+                }
+            }
+        } else if (node.isArray()) {
+            handleArray(subjectSeed, "Items", node, path, out);
+        } else if (node.isValueNode()) {
+            String subject = compressPath(path);
+            out.add(subject + " is " + normalizeValue(node) + ".");
+        }
+    }
+
+    private static void handleArray(String subjectSeed,
+                                    String keyLabel,
+                                    JsonNode arrayNode,
+                                    Deque<String> path,
+                                    LinkedHashSet<String> out) {
+        ArrayNode arr = (ArrayNode) arrayNode;
+
+        if (EMIT_COUNTS_FOR_ARRAYS) {
+            String subject = compressPath(path);
+            out.add(subject + " includes " + arr.size() + " " + pluralize(keyLabel) + ".");
+        }
+        if (arr.size() == 0) return;
+
+        if (allPrimitives(arr)) {
+            List<String> items = new ArrayList<>();
+            int limit = Math.min(arr.size(), MAX_ARRAY_ITEMS_INLINE);
+            for (int i = 0; i < limit; i++) {
+                items.add(normalizeValue(arr.get(i)));
+            }
+            String subject = compressPath(path);
+            out.add(subject + " has " + joinList(items) + ".");
+        } else {
+            // Expand a few object elements with labels for context
+            int expanded = 0;
+            for (int i = 0; i < arr.size() && expanded < MAX_ARRAY_OBJECTS_EXPANDED; i++) {
+                JsonNode elem = arr.get(i);
+                if (!elem.isObject()) continue;
+
+                String itemTag = arrayItemTag((ObjectNode) elem, i);
+                Deque<String> itemPath = new ArrayDeque<>(path);
+                itemPath.add(itemTag);
+
+                processNode(subjectSeed, elem, itemPath, out);
+                expanded++;
+            }
+        }
+    }
+
+    private static void emitScalarStatement(String subjectSeed,
+                                            Deque<String> path,
+                                            String keyLabel,
+                                            JsonNode val,
+                                            LinkedHashSet<String> out) {
+        String subject = compressPath(path);
+        String value = normalizeValue(val);
+        String verb = chooseVerb(keyLabel, val);
+
+        // Avoid redundant "... Address Address city"
+        String statementSubject = dropTailRedundancy(subject, keyLabel);
+
+        out.add(statementSubject + " " + verb + " " + keyLabel.toLowerCase(Locale.ROOT) + " " + value + ".");
+    }
+
+    // ----- Helpers: formatting / heuristics -----------------------------------
+
+    private static boolean allPrimitives(ArrayNode arr) {
+        for (JsonNode n : arr) if (!n.isValueNode()) return false;
+        return true;
+    }
+
+    private static String arrayItemTag(ObjectNode obj, int index) {
+        for (String k : LIKELY_IDENTIFIER_KEYS) {
+            JsonNode v = obj.get(k);
+            if (v != null && v.isValueNode()) {
+                String val = cleanVal(v.asText());
+                if (!val.isEmpty()) return toKeyLabel(k) + " " + val;
+            }
+        }
+        return "#" + (index + 1);
+    }
+
+    private static String dropTailRedundancy(String subject, String keyLabel) {
+        String tail = keyLabel.toLowerCase(Locale.ROOT);
+        String subj = subject.trim();
+        if (subj.toLowerCase(Locale.ROOT).endsWith(" " + tail)) {
+            return subj.substring(0, subj.length() - tail.length() - 1);
+        }
+        return subj;
+    }
+
+    private static String compressPath(Deque<String> path) {
+        // Remove consecutive duplicates & keep last up to 3 parts for context
+        List<String> parts = new ArrayList<>(path);
+        List<String> dedup = new ArrayList<>();
+        String prev = null;
+        for (String p : parts) {
+            String pp = p.trim();
+            if (!pp.equalsIgnoreCase(prev)) dedup.add(pp);
+            prev = pp;
+        }
+        int n = dedup.size();
+        if (n <= 3) return String.join(" ", dedup);
+        return String.join(" ", dedup.subList(n - 3, n));
+    }
+
+    private static String chooseVerb(String keyLabel, JsonNode val) {
+        String k = keyLabel.toLowerCase(Locale.ROOT);
+        if (k.contains("date") || looksLikeDate(val)) return "occurs on";
+        if (k.equals("status") || k.endsWith(" status") || k.contains("state")) return "is";
+        if (val.isBoolean()) return "is";
+        return "has";
+    }
+
+    private static boolean looksLikeDate(JsonNode val) {
+        if (!val.isValueNode()) return false;
+        String s = val.asText();
+        return s.matches("\\d{4}-\\d{2}-\\d{2}([ T].*)?") || s.matches("\\d{2}/\\d{2}/\\d{4}");
+    }
+
+    private static String normalizeValue(JsonNode v) {
+        if (v == null || v.isNull()) return "null";
+        if (v.isTextual()) {
+            String s = cleanVal(v.asText());
+            if (s.length() > MAX_VALUE_LEN) s = s.substring(0, MAX_VALUE_LEN) + "…";
+            return "\"" + s + "\"";
+        }
+        if (v.isNumber()) return v.numberValue().toString();
+        if (v.isBoolean()) return v.asBoolean() ? "true" : "false";
+        if (v.isArray()) {
+            ArrayNode arr = (ArrayNode) v;
+            if (arr.size() <= MAX_ARRAY_ITEMS_INLINE && allPrimitives(arr)) {
+                List<String> items = new ArrayList<>();
+                for (JsonNode n : arr) items.add(normalizeValue(n));
+                return "[" + String.join(", ", items) + "]";
+            }
+            return "\"(array)\"";
+        }
+        if (v.isObject()) return "\"(object)\"";
+        return "\"" + cleanVal(v.asText()) + "\"";
+    }
+
+    private static String cleanVal(String s) {
+        if (s == null) return "";
+        String t = s.trim().replaceAll("[\\r\\n\\t]+", " ");
+        return t.replaceAll("\\s{2,}", " ");
+    }
+
+    private static String toKeyLabel(String key) {
+        String words = key == null ? "" : key.trim();
+        words = words.replaceAll("[_\\-]+", " ");
+        words = words.replaceAll("(?<=[a-z])(?=[A-Z])", " ");
+        words = words.replaceAll("(?<=[A-Za-z])(?=\\d)", " ");
+        words = words.replaceAll("(?<=\\d)(?=[A-Za-z])", " ");
+        words = words.replaceAll("\\s{2,}", " ").trim();
+        return capitalize(words);
+    }
+
+    private static String capitalize(String s) {
+        if (s.isEmpty()) return s;
+        StringBuilder sb = new StringBuilder(s.length());
+        boolean start = true;
+        for (char c : s.toCharArray()) {
+            if (start && Character.isLetter(c)) {
+                sb.append(Character.toUpperCase(c));
+                start = false;
+            } else {
+                sb.append(c);
+            }
+            if (c == ' ') start = true;
+        }
+        return sb.toString();
+    }
+
+    private static String pluralize(String s) {
+        String w = s.toLowerCase(Locale.ROOT);
+        if (w.endsWith("y") && !w.endsWith("ay") && !w.endsWith("ey") && !w.endsWith("iy") && !w.endsWith("oy") && !w.endsWith("uy")) {
+            return s.substring(0, s.length() - 1) + "ies";
+        }
+        if (w.endsWith("s") || w.endsWith("x") || w.endsWith("z") || w.endsWith("ch") || w.endsWith("sh")) {
+            return s + "es";
+        }
+        return s + "s";
+    }
+
+    private static String joinList(List<String> items) {
+        if (items.isEmpty()) return "";
+        if (items.size() == 1) return items.get(0);
+        if (items.size() == 2) return items.get(0) + " and " + items.get(1);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < items.size(); i++) {
+            if (i > 0) sb.append(i == items.size() - 1 ? ", and " : ", ");
+            sb.append(items.get(i));
+        }
+        return sb.toString();
+    }
+}
