@@ -1,0 +1,171 @@
+import os
+import re
+import uuid
+import argparse
+from typing import List, Dict, Tuple, Iterable
+
+from sentence_transformers import SentenceTransformer
+import chromadb
+from chromadb.config import Settings
+
+SECTION_HEADER_RE = re.compile(r"^=== Section:\s*(.+?)\s*===$")
+RECORD_END_RE    = re.compile(r"^--- End of Record\s+(.+?)\s*---\s*$")  # capture any ID
+
+
+def parse_records_iter(path: str) -> Iterable[List[Dict]]:
+    """
+    Stream parser that yields a list of rows for each record.
+    Each yielded list contains dicts:
+      {"record_id": str, "section": str, "statement_idx": int, "text": str}
+    """
+    current_section: str | None = None
+    section_counter: Dict[str, int] = {}
+    record_buffer: List[Tuple[str, str, int]] = []  # (section, text, idx_in_section)
+
+    with open(path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.rstrip("\n")
+            if not line.strip():
+                continue
+
+            # End-of-record line with ID
+            m_end = RECORD_END_RE.match(line)
+            if m_end:
+                record_id = m_end.group(1).strip()
+                rows = [{
+                    "record_id": record_id,
+                    "section": sec,
+                    "statement_idx": idx,
+                    "text": txt
+                } for (sec, txt, idx) in record_buffer]
+                yield rows
+                # reset for next record
+                record_buffer.clear()
+                current_section = None
+                section_counter.clear()
+                continue
+
+            # Section header line
+            m_sec = SECTION_HEADER_RE.match(line)
+            if m_sec:
+                current_section = (m_sec.group(1) or "Root").strip()
+                section_counter.setdefault(current_section, 0)
+                continue
+
+            # Statement line
+            if current_section is None:
+                current_section = "Root"
+                section_counter.setdefault(current_section, 0)
+
+            section_counter[current_section] += 1
+            record_buffer.append((current_section, line.strip(), section_counter[current_section]))
+
+    # If file ended without a separator, flush remaining as UNKNOWN
+    if record_buffer:
+        rows = [{
+            "record_id": "UNKNOWN",
+            "section": sec,
+            "statement_idx": idx,
+            "text": txt
+        } for (sec, txt, idx) in record_buffer]
+        yield rows
+
+
+def prefix_passages(texts: List[str]) -> List[str]:
+    # Best practice for BGE: prefix corpus with "passage: ", queries with "query: "
+    return [f"passage: {t}" for t in texts]
+
+
+class BGEModel:
+    def __init__(self, device=None):
+        self.model = SentenceTransformer("BAAI/bge-m3", device=device)
+
+    def encode(self, texts: List[str], batch_size: int = 64):
+        return self.model.encode(
+            prefix_passages(texts),
+            batch_size=batch_size,
+            show_progress_bar=False,
+            normalize_embeddings=True
+        )
+
+
+def get_collection(persist_dir: str, collection_name: str):
+    os.makedirs(persist_dir, exist_ok=True)
+    client = chromadb.PersistentClient(path=persist_dir, settings=Settings(anonymized_telemetry=False))
+    coll = client.get_or_create_collection(name=collection_name, metadata={"hnsw:space": "cosine"})
+    return client, coll
+
+
+def upsert_in_batches(coll, rows: List[Dict], embeddings, chroma_batch: int):
+    """
+    Split a (rows, embeddings) chunk into sub-batches for collection.add.
+    Keeps metadata primitive-only; preserves record_id for every doc.
+    """
+    n = len(rows)
+    # embeddings can be numpy array or list-like; we slice it the same way we slice rows
+    for start in range(0, n, chroma_batch):
+        end = min(start + chroma_batch, n)
+        sub_rows = rows[start:end]
+        sub_emb = embeddings[start:end]
+        ids = [str(uuid.uuid4()) for _ in sub_rows]  # swap for deterministic ids if you prefer
+        documents = [r["text"] for r in sub_rows]
+        metadatas = [{"record_id": str(r["record_id"]),
+                      "section": str(r["section"]),
+                      "statement_idx": int(r["statement_idx"])} for r in sub_rows]
+        coll.add(ids=ids, documents=documents, embeddings=sub_emb.tolist(), metadatas=metadatas)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Batched BGE-M3 -> Chroma (preserving record_id from 'End of Record <ID>')")
+    ap.add_argument("--input", required=True, help="Path to text output from JsonToSectionsText.java")
+    ap.add_argument("--chroma-dir", default="./chroma_store", help="Folder for Chroma persistence")
+    ap.add_argument("--collection", default="sections_bge_m3", help="Chroma collection name")
+    ap.add_argument("--device", default=None, help='Force device: "cpu", "cuda", or "mps"')
+    ap.add_argument("--embed-batch", type=int, default=64, help="Encoder batch size (per forward pass)")
+    ap.add_argument("--upsert-batch", type=int, default=512, help="How many statements to embed before upserting")
+    ap.add_argument("--chroma-batch", type=int, default=200, help="Docs per collection.add() call")
+    ap.add_argument("--reset", action="store_true", help="Delete the collection before upserting")
+    args = ap.parse_args()
+
+    client, coll = get_collection(args.chroma_dir, args.collection)
+    if args.reset:
+        try:
+            client.delete_collection(args.collection)
+            print(f"Deleted existing collection: {args.collection}")
+        except Exception:
+            pass
+        _, coll = get_collection(args.chroma_dir, args.collection)
+
+    encoder = BGEModel(device=args.device)
+
+    total = 0
+    buffer_rows: List[Dict] = []
+
+    for record_rows in parse_records_iter(args.input):
+        # accumulate rows per record into a global buffer
+        buffer_rows.extend(record_rows)
+
+        # if buffer big enough, embed & upsert this chunk
+        while len(buffer_rows) >= args.upsert_batch:
+            chunk = buffer_rows[:args.upsert_batch]
+            del buffer_rows[:args.upsert_batch]
+
+            texts = [r["text"] for r in chunk]
+            emb = encoder.encode(texts, batch_size=args.embed_batch)
+            upsert_in_batches(coll, chunk, emb, chroma_batch=args.chroma_batch)
+            total += len(chunk)
+            print(f"Upserted {total} statements...")
+
+    # flush any remaining rows
+    if buffer_rows:
+        texts = [r["text"] for r in buffer_rows]
+        emb = encoder.encode(texts, batch_size=args.embed_batch)
+        upsert_in_batches(coll, buffer_rows, emb, chroma_batch=args.chroma_batch)
+        total += len(buffer_rows)
+        print(f"Upserted {total} statements (final).")
+
+    print(f"Done. Collection '{args.collection}' at {args.chroma_dir}.")
+
+
+if __name__ == "__main__":
+    main()
