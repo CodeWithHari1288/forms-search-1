@@ -1,0 +1,150 @@
+import os
+import re
+import uuid
+import argparse
+from typing import List, Dict, Tuple
+
+from sentence_transformers import SentenceTransformer
+import chromadb
+from chromadb.config import Settings
+
+SECTION_HEADER_RE = re.compile(r"^=== Section:\s*(.+?)\s*===$")
+RECORD_END_RE    = re.compile(r"^--- End of Record\s+(.+?)\s*---\s*$")  # capture any ID
+
+def parse_grouped_text_with_ids(path: str) -> List[Dict]:
+    """
+    Parse the text produced by JsonToSectionsText.java (no 'Record N' prefixes),
+    with per-record separators like:  --- End of Record <ID> ---
+
+    We buffer statements for the current record until we hit the separator line,
+    then assign that <ID> to all buffered statements as 'record_id'.
+
+    Returns rows:
+      { "record_id": str, "section": str, "statement_idx": int, "text": str }
+    """
+    rows: List[Dict] = []
+
+    current_section: str | None = None
+    section_counter: Dict[str, int] = {}
+    # Buffer holds (section, text, idx_in_section) until we know record_id
+    record_buffer: List[Tuple[str, str, int]] = []
+
+    with open(path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.rstrip("\n")
+            if not line.strip():
+                continue
+
+            # record separator with ID?
+            m_end = RECORD_END_RE.match(line)
+            if m_end:
+                record_id = m_end.group(1).strip()
+                # flush buffer with this record_id
+                for sec, text, idx in record_buffer:
+                    rows.append({
+                        "record_id": record_id,
+                        "section": sec,
+                        "statement_idx": idx,
+                        "text": text
+                    })
+                # reset for next record
+                record_buffer.clear()
+                current_section = None
+                section_counter.clear()
+                continue
+
+            # section header?
+            m_sec = SECTION_HEADER_RE.match(line)
+            if m_sec:
+                current_section = m_sec.group(1).strip() or "Root"
+                if current_section not in section_counter:
+                    section_counter[current_section] = 0
+                continue
+
+            # otherwise a statement line
+            if current_section is None:
+                current_section = "Root"
+                if current_section not in section_counter:
+                    section_counter[current_section] = 0
+
+            section_counter[current_section] += 1
+            record_buffer.append((current_section, line.strip(), section_counter[current_section]))
+
+    # If file didn't end with a separator, flush remaining buffer with a fallback id
+    if record_buffer:
+        fallback_id = "UNKNOWN"
+        for sec, text, idx in record_buffer:
+            rows.append({
+                "record_id": fallback_id,
+                "section": sec,
+                "statement_idx": idx,
+                "text": text
+            })
+
+    return rows
+
+
+def prefix_passages(texts: List[str]) -> List[str]:
+    # Best practice for BGE: prefix corpus with "passage: ", queries with "query: "
+    return [f"passage: {t}" for t in texts]
+
+
+def embed_bge_m3(texts: List[str], batch_size: int = 64, device: str | None = None):
+    model = SentenceTransformer("BAAI/bge-m3", device=device)
+    return model.encode(
+        prefix_passages(texts),
+        batch_size=batch_size,
+        show_progress_bar=True,
+        normalize_embeddings=True
+    )
+
+
+def upsert_to_chroma(persist_dir: str, collection_name: str, rows: List[Dict], embeddings):
+    os.makedirs(persist_dir, exist_ok=True)
+    client = chromadb.PersistentClient(path=persist_dir, settings=Settings(anonymized_telemetry=False))
+    coll = client.get_or_create_collection(name=collection_name, metadata={"hnsw:space": "cosine"})
+
+    ids = [str(uuid.uuid4()) for _ in rows]
+    documents = [r["text"] for r in rows]
+    # Keep metadata primitives only (str/int/float)
+    metadatas = [{"record_id": str(r["record_id"]), "section": str(r["section"]), "statement_idx": int(r["statement_idx"])} for r in rows]
+
+    coll.add(ids=ids, documents=documents, embeddings=embeddings.tolist(), metadatas=metadatas)
+    return coll
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Embed Java-sectioned statements (BGE-M3) and upsert to Chroma with record_id from separators")
+    ap.add_argument("--input", required=True, help="Path to text output from JsonToSectionsText.java")
+    ap.add_argument("--chroma-dir", default="./chroma_store", help="Folder for Chroma persistence")
+    ap.add_argument("--collection", default="sections_bge_m3", help="Chroma collection name")
+    ap.add_argument("--device", default=None, help='Force device: "cpu", "cuda", or "mps"')
+    ap.add_argument("--batch", type=int, default=64, help="Embedding batch size")
+    ap.add_argument("--reset", action="store_true", help="Delete and recreate the collection before upsert")
+    args = ap.parse_args()
+
+    rows = parse_grouped_text_with_ids(args.input)
+    if not rows:
+        print("No statements parsed. Check input formatting.")
+        return
+
+    print(f"Parsed {len(rows)} statements across {len(set(r['record_id'] for r in rows))} record_id(s).")
+    texts = [r["text"] for r in rows]
+
+    print("Embedding with BGE-M3…")
+    embeddings = embed_bge_m3(texts, batch_size=args.batch, device=args.device)
+
+    client = chromadb.PersistentClient(path=args.chroma_dir, settings=Settings(anonymized_telemetry=False))
+    if args.reset:
+        try:
+            client.delete_collection(args.collection)
+            print(f"Deleted existing collection: {args.collection}")
+        except Exception:
+            pass
+
+    coll = upsert_to_chroma(args.chroma_dir, args.collection, rows, embeddings)
+    print(f"Upserted {len(rows)} docs into Chroma collection '{coll.name}' at {args.chroma_dir}.")
+
+
+if __name__ == "__main__":
+    main()
