@@ -1,0 +1,176 @@
+import json
+import hashlib
+from typing import List, Dict, Any, Tuple, Optional
+
+import chromadb
+from sentence_transformers import SentenceTransformer
+
+
+# ========== CONFIG ==========
+INPUT_JSON_PATH   = "input.json"       # array of JSON objects
+STATEMENTS_OUT    = "statements.txt"   # optional: text file with statements + end-of-record lines
+CHROMA_PATH       = "./chroma"
+COLLECTION_NAME   = "docs"
+
+MODEL_NAME        = "BAAI/bge-m3"      # or local path
+BATCH_EMBED       = 32                  # 8–32 typical
+BATCH_ADD         = 128                 # 64–256; reduce if you still hit timeouts
+
+MAX_CHARS         = 1500                # chunk size (~512–1000 tokens)
+OVERLAP           = 200                 # 100–300 helps continuity
+NORMALIZE_EMBEDS  = True
+# ===========================
+
+
+def stable_record_id(record: Dict[str, Any]) -> str:
+    """
+    Return the 'actual id' if present as 'id' (exact key), otherwise a stable SHA256 hash of the canonical JSON.
+    (Avoids guessing likely keys.)
+    """
+    if isinstance(record, dict) and "id" in record and isinstance(record["id"], (str, int)):
+        return str(record["id"])
+    canonical = json.dumps(record, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def json_to_statements(obj: Any, path: str = "") -> List[str]:
+    """
+    Convert nested JSON to 'statements' like:
+      'person.name has value Alice'
+      'orders[0].sku has value "W-12"'
+    """
+    stmts: List[str] = []
+
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            new_path = f"{path}.{k}" if path else k
+            if isinstance(v, (dict, list)):
+                stmts.extend(json_to_statements(v, new_path))
+            else:
+                stmts.append(f"{new_path} has value {v}")
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
+            new_path = f"{path}[{i}]" if path else f"[{i}]"
+            stmts.extend(json_to_statements(item, new_path))
+    else:
+        # primitive at root
+        stmts.append(f"{path or 'root'} has value {obj}")
+
+    return stmts
+
+
+def chunk_text(s: str, max_chars: int = MAX_CHARS, overlap: int = OVERLAP) -> List[str]:
+    if max_chars <= 0:
+        return [s]
+    out, i = [], 0
+    step = max(1, max_chars - max(0, overlap))
+    while i < len(s):
+        out.append(s[i:i + max_chars])
+        i += step
+    return out
+
+
+def batchify(items: List[Any], batch_size: int):
+    for i in range(0, len(items), batch_size):
+        yield i, items[i:i + batch_size]
+
+
+def embed_batches(model: SentenceTransformer, texts: List[str], batch_size: int) -> List[List[float]]:
+    all_vecs: List[List[float]] = []
+    for _, batch in batchify(texts, batch_size):
+        vecs = model.encode(batch, normalize_embeddings=NORMALIZE_EMBEDS, show_progress_bar=False)
+        # vecs may be np.ndarray
+        all_vecs.extend([v.tolist() for v in vecs])
+    return all_vecs
+
+
+def upsert_batches_to_chroma(
+    texts: List[str],
+    ids: List[str],
+    embeddings: List[List[float]],
+    metadatas: Optional[List[Dict[str, Any]]],
+    collection_name: str,
+    chroma_path: str,
+    batch_add: int
+):
+    client = chromadb.PersistentClient(path=chroma_path)  # local client to avoid HTTP timeouts
+    coll = client.get_or_create_collection(collection_name)
+
+    n = len(texts)
+    assert len(ids) == n and len(embeddings) == n, "texts, ids, embeddings must be equal length"
+    if metadatas is not None:
+        assert len(metadatas) == n, "metadatas length must match"
+
+    for start, _ in batchify(texts, batch_add):
+        end = start + batch_add
+        coll.add(
+            documents=texts[start:end],
+            embeddings=embeddings[start:end],
+            ids=ids[start:end],
+            metadatas=(metadatas[start:end] if metadatas is not None else None),
+        )
+
+
+def main():
+    # 1) Load array of JSONs
+    with open(INPUT_JSON_PATH, "r", encoding="utf-8") as f:
+        records: List[Dict[str, Any]] = json.load(f)
+        if not isinstance(records, list):
+            raise ValueError("input.json must contain an array of JSON objects")
+
+    all_chunk_texts: List[str] = []
+    all_chunk_ids: List[str] = []
+    all_chunk_metas: List[Dict[str, Any]] = []
+
+    # 2) Convert each record to statements and append end-of-record line with actual id
+    with open(STATEMENTS_OUT, "w", encoding="utf-8") as out:
+        for rec_idx, rec in enumerate(records):
+            rid = stable_record_id(rec)  # actual id or stable hash fallback
+
+            statements = json_to_statements(rec)
+            # write statements
+            out.write("\n".join(statements))
+            out.write("\n")
+            # final marker line using the actual id
+            out.write(f"--- end of record {rid} ---\n\n")
+
+            # 3) Build a single statements block per record for chunking
+            block = "\n".join(statements) + f"\n--- end of record {rid} ---"
+            chunks = chunk_text(block, MAX_CHARS, OVERLAP)
+
+            for j, ch in enumerate(chunks):
+                all_chunk_texts.append(ch)
+                all_chunk_ids.append(f"{rid}-c{j}")  # stable, traceable
+                all_chunk_metas.append({
+                    "record_id": rid,          # ✅ actual id available for retrieval
+                    "chunk_index": j,
+                    "chunk_count": len(chunks),
+                    "source": "statements"
+                })
+
+    print(f"Prepared {len(all_chunk_texts)} chunks from {len(records)} records.")
+
+    # 4) Embed chunks (precompute to keep Chroma .add() fast and avoid EF/HTTP timeouts)
+    print("Loading embedding model...")
+    model = SentenceTransformer(MODEL_NAME, trust_remote_code=True)
+
+    print(f"Embedding {len(all_chunk_texts)} chunks in batches of {BATCH_EMBED}...")
+    vectors = embed_batches(model, all_chunk_texts, BATCH_EMBED)
+
+    # 5) Add to Chroma in batches (PersistentClient, not HTTP)
+    print(f"Upserting to Chroma in batches of {BATCH_ADD}...")
+    upsert_batches_to_chroma(
+        texts=all_chunk_texts,
+        ids=all_chunk_ids,
+        embeddings=vectors,
+        metadatas=all_chunk_metas,
+        collection_name=COLLECTION_NAME,
+        chroma_path=CHROMA_PATH,
+        batch_add=BATCH_ADD
+    )
+
+    print("Done ✅")
+
+
+if __name__ == "__main__":
+    main()
