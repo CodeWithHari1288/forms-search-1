@@ -1,0 +1,53 @@
+const path = require("path");
+
+module.exports = {
+  // ...your existing entry/output/etc
+  resolve: {
+    extensions: [".js", ".jsx", ".mjs"],
+    mainFields: ["browser", "module", "main"], // prefer ESM
+  },
+  module: {
+    rules: [
+      // 1) Let Webpack accept .mjs in node_modules
+      {
+        test: /\.m?js$/,
+        type: "javascript/auto",
+        resolve: { fullySpecified: false },
+      },
+      // 2) Transpile YOUR app code
+      {
+        test: /\.[cm]?jsx?$/,
+        exclude: /node_modules/,
+        use: {
+          loader: "babel-loader",
+          options: {
+            presets: [
+              ["@babel/preset-env", { useBuiltIns: "usage", corejs: 3, targets: "defaults" }],
+              "@babel/preset-react",
+            ],
+            plugins: [["@babel/plugin-transform-runtime", { corejs: false }]],
+          },
+        },
+      },
+      // 3) Transpile CopilotKit ESM deps (THIS fixes “Module parse failed … runtime-client-gql”)
+      {
+        test: /\.[cm]?jsx?$/,
+        include: [
+          /node_modules\/@copilotkit\/react-core/,
+          /node_modules\/@copilotkit\/react-ui/,
+          /node_modules\/@copilotkit\/runtime-client-gql/,   // <— add this
+        ],
+        use: {
+          loader: "babel-loader",
+          options: {
+            presets: [
+              ["@babel/preset-env", { useBuiltIns: "usage", corejs: 3, targets: "defaults" }],
+              "@babel/preset-react",
+            ],
+            plugins: [["@babel/plugin-transform-runtime", { corejs: false }]],
+          },
+        },
+      },
+    ],
+  },
+};
