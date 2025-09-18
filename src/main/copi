@@ -1,0 +1,24 @@
+import { useState } from "react";
+import { CopilotChat } from "@copilotkit/react-ui";
+
+export function ChatDock() {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button
+        onClick={() => setOpen((v) => !v)}
+        style={{ position: "fixed", right: 16, bottom: 16, zIndex: 1000 }}
+      >
+        {open ? "Close Copilot" : "Open Copilot"}
+      </button>
+      {open && (
+        <div style={{ position: "fixed", right: 16, bottom: 64, width: 420, height: 560, zIndex: 999 }}>
+          <CopilotChat
+            instructions="Be concise and helpful."
+            defaultOpen
+          />
+        </div>
+      )}
+    </>
+  );
+}
