@@ -1,0 +1,55 @@
+import React, { useState } from "react";
+import { CopilotKit } from "@copilotkit/react-core";
+import { useCopilotChat } from "@copilotkit/react-core"; // headless chat API
+import { CopilotChat } from "@copilotkit/react-ui";
+
+const RUNTIME = "http://localhost:8000/chat"; // your API
+
+function HeadlessControlledChat() {
+  const { messages, setMessages, appendMessage } = useCopilotChat(); // headless
+  const [sending, setSending] = useState(false);
+
+  async function sendUserMessage(text) {
+    // 1) Update local UI immediately
+    const next = [...messages, { role: "user", content: text }];
+    setMessages(next);
+
+    // 2) Build a MINIMAL payload to send — you control this
+    const minimal = next
+      .filter(m => m.role === "user" || m.role === "assistant") // drop system/tool
+      .slice(-6);                                               // last 6 turns only
+      // .map(m => ({ role: m.role, content: redact(m.content) })) // if you need redaction
+
+    setSending(true);
+    try {
+      const res = await fetch(RUNTIME, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages: minimal }),
+      });
+      const data = await res.json();
+      // 3) Append assistant reply from your API
+      if (data?.message) appendMessage(data.message);
+    } finally {
+      setSending(false);
+    }
+  }
+
+  return (
+    <div style={{ height: 520, width: 420 }}>
+      <CopilotChat
+        onSend={sendUserMessage}     // ← use our custom sender
+        labels={{ title: "Controlled Copilot" }}
+        placeholder={sending ? "Thinking…" : "Type your message…"}
+      />
+    </div>
+  );
+}
+
+export default function App() {
+  return (
+    <CopilotKit copilotRuntimeUrl={RUNTIME}>
+      <HeadlessControlledChat />
+    </CopilotKit>
+  );
+}
