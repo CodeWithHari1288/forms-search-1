@@ -1,0 +1,12 @@
+module.exports = {
+  presets: [
+    ["@babel/preset-env", { modules: "commonjs" }],
+    "@babel/preset-react",
+  ],
+  overrides: [
+    {
+      test: /node_modules[\\/](copilotkit|zod|nanoid|graphql|@copilotkit)[\\/].*\.(js|mjs)$/,
+      plugins: ["@babel/plugin-transform-modules-commonjs"],
+    },
+  ],
+};
