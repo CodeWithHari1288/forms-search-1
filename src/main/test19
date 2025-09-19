@@ -1,0 +1,33 @@
+// webpack.config.js
+const micromarkDeps = /node_modules[\\/](
+  micromark|
+  micromark-core-commonmark|
+  micromark-util-[^\\/]+|
+  micromark-extension-gfm-[^\\/]+|
+  mdast-util-[^\\/]+|
+  remark-[^\\/]+|
+  unified|
+  unist-[^\\/]+
+)[\\/]/;
+
+module.exports = {
+  module: {
+    rules: [
+      // your app code
+      { test: /\.(js|jsx)$/, exclude: /node_modules/, use: "babel-loader" },
+
+      // ✅ transpile problematic ESM deps (includes micromark gfm autolink)
+      { test: /\.(js|mjs)$/, include: micromarkDeps, use: "babel-loader" },
+
+      // ✅ allow .mjs in node_modules
+      { test: /\.mjs$/, include: /node_modules/, type: "javascript/auto" },
+
+      // (optional) relax fully-specified ESM imports
+      { test: /\.m?js$/, resolve: { fullySpecified: false } },
+    ],
+  },
+  resolve: {
+    extensions: [".mjs", ".js", ".jsx"],
+    mainFields: ["browser", "module", "main"],
+  },
+};
