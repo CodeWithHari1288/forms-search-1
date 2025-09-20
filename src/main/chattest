@@ -53,3 +53,35 @@ export default function App() {
     </CopilotKit>
   );
 }
+
+
+
+
+
+// runtime/index.js
+import express from "express";
+import cors from "cors";
+import { CopilotRuntime, copilotRuntimeNodeHttpEndpoint } from "@copilotkit/runtime";
+
+const app = express();
+app.use(cors({ origin: ["http://localhost:3000", "http://127.0.0.1:3000"] }));
+
+// Local model via Ollama
+process.env.OPENAI_API_KEY  ||= "ollama";                    // dummy
+process.env.OPENAI_BASE_URL ||= "http://localhost:11434/v1"; // ollama serve
+process.env.OPENAI_MODEL    ||= "llama3.2";                  // ollama pull llama3.2
+
+const runtime = new CopilotRuntime({
+  system: "You are helpful and concise.",
+});
+
+// Optional demo tool; remove if you just want plain chat
+runtime.registerAction({
+  name: "echo_tool",
+  description: "Echo the latest user input.",
+  parameters: { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
+  handler: async ({ text }) => `Echo: ${text}`,
+});
+
+app.all("/api/copilot", copilotRuntimeNodeHttpEndpoint({ runtime }));
+app.listen(4000, () => console.log("✅ Copilot Runtime at http://localhost:4000/api/copilot"));
