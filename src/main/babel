@@ -222,3 +222,38 @@ def parse_messages(incoming: List[Dict[str, Any]]) -> List[Message]:
         )
     return out
 
+
+
+
+// Bridge.tsx — run this once at app root
+import { useEffect } from "react";
+import { useCopilotChat } from "copilotkit/chat/hooks";
+
+export function BridgeToFastAPI() {
+  const chat = useCopilotChat();
+
+  useEffect(() => {
+    // Listen for new user messages (pseudo-code; actual event names/hooks
+    // depend on your installed CopilotKit version — see useCopilotChat docs)
+    const unsub = chat.onUserMessage(async (userMsg) => {
+      // send the whole variables.data.messages + runtimeUrl
+      const res = await fetch("http://localhost:8000/copilot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          runtimeUrl: window.location.origin,
+          variables: { data: { messages: chat.messages } }
+        })
+      });
+      const data = await res.json();
+
+      // append assistant reply so the popup shows it
+      const assistantText = data.user_text ?? data.answer ?? JSON.stringify(data);
+      chat.addMessage({ role: "assistant", content: assistantText });
+    });
+
+    return () => unsub && unsub();
+  }, [chat]);
+
+  return null;
+}
