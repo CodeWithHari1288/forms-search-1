@@ -257,3 +257,54 @@ export function BridgeToFastAPI() {
 
   return null;
 }
+
+
+
+
+import { CopilotKit } from "copilotkit";
+import { CopilotPopup } from "copilotkit/chat";
+import { useCopilotChat } from "copilotkit/chat/hooks";
+import { useEffect, useRef } from "react";
+
+function BridgeToFastAPI() {
+  const { messages, appendMessage } = useCopilotChat();
+  const prevCount = useRef(messages.length);
+
+  useEffect(() => {
+    // Only act when a new message is added
+    if (messages.length > prevCount.current) {
+      const last = messages[messages.length - 1];
+      if (last.role === "user") {
+        (async () => {
+          const res = await fetch("http://localhost:8000/copilot", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              runtimeUrl: window.location.origin,
+              variables: { data: { messages } },
+            }),
+          });
+          const data = await res.json();
+
+          const reply =
+            data.user_text ?? data.answer ?? JSON.stringify(data);
+
+          // Append assistant message so popup shows it
+          appendMessage({ role: "assistant", content: reply });
+        })();
+      }
+    }
+    prevCount.current = messages.length;
+  }, [messages, appendMessage]);
+
+  return null;
+}
+
+export default function App() {
+  return (
+    <CopilotKit runtimeUrl="about:blank">
+      <CopilotPopup title="Local Copilot (Python Echo)" />
+      <BridgeToFastAPI />
+    </CopilotKit>
+  );
+}
