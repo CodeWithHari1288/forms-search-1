@@ -25,3 +25,31 @@ module.exports = {
   },
   resolve: { extensions: [".mjs", ".js", ".jsx"] },
 };
+
+
+// app/api/copilot/route.ts (Next.js 13+)
+import { CopilotRuntime, copilotRuntimeNextJSAppRouterEndpoint } from "@copilotkit/runtime";
+
+const runtime = new CopilotRuntime({
+  system: "Use the tool `call_python_api` when helpful.",
+});
+
+// Example tool that calls your FastAPI
+runtime.registerAction({
+  name: "call_python_api",
+  parameters: { type: "object", properties: { input: { type: "string" } }, required: ["input"] },
+  handler: async ({ input }) => {
+    const r = await fetch("http://localhost:8000/copilot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ input }),
+    });
+    const data = await r.json().catch(() => ({}));
+    return data?.answer ?? "No content";
+  },
+});
+
+export const runtimeUrl = "edge"; // or "nodejs" if you prefer
+export const dynamic = "force-dynamic";
+export const GET = copilotRuntimeNextJSAppRouterEndpoint({ runtime });
+export const POST = copilotRuntimeNextJSAppRouterEndpoint({ runtime });
