@@ -1,7 +1,37 @@
-{
-  "presets": [
-    ["@babel/preset-env", { "useBuiltIns": "usage", "corejs": 3, "targets": "defaults" }],
-    "@babel/preset-react"
-  ],
-  "plugins": [["@babel/plugin-transform-runtime", { "corejs": false }]]
-}
+# fastapi_copilot_strict_messages.py
+from typing import Any, Dict, List, Optional
+from fastapi import FastAPI
+from pydantic import BaseModel, field_validator
+
+app = FastAPI()
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class CopilotMessagesPayload(BaseModel):
+    threadId: Optional[str] = None
+    messages: List[ChatMessage]
+    variables: Optional[Dict[str, Any]] = None
+
+    @field_validator("messages")
+    @classmethod
+    def must_have_at_least_one_user(cls, v):
+        if not any(m.role.lower() == "user" for m in v):
+            raise ValueError("messages must contain at least one user message")
+        return v
+
+    def last_user_text(self) -> str:
+        for m in reversed(self.messages):
+            if m.role.lower() == "user":
+                return m.content
+        # validator guarantees one exists
+        return ""
+
+@app.post("/copilot")
+async def handle_messages(payload: CopilotMessagesPayload):
+    return {
+        "threadId": payload.threadId,
+        "user_text": payload.last_user_text(),
+        "has_vars": bool(payload.variables),
+    }
