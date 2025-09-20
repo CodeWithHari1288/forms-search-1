@@ -1,0 +1,83 @@
+# app_copilot_runtimeurl.py
+from typing import Any, Dict, List, Optional
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+# --- CORS for local React dev (adjust as needed) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def get_runtime_url(body: Dict[str, Any]) -> Optional[str]:
+    # Preferred: root-level runtimeUrl
+    if isinstance(body.get("runtimeUrl"), str):
+        return body["runtimeUrl"]
+    # Common alt: metadata.runtimeUrl
+    md = body.get("metadata") or {}
+    if isinstance(md.get("runtimeUrl"), str):
+        return md["runtimeUrl"]
+    # Some apps pass context.runtimeUrl
+    ctx = body.get("context") or {}
+    if isinstance(ctx.get("runtimeUrl"), str):
+        return ctx["runtimeUrl"]
+    return None
+
+def extract_messages(body: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    # Your shape: variables.data.messages
+    variables = body.get("variables") or {}
+    data = variables.get("data") or {}
+    msgs = data.get("messages")
+    if isinstance(msgs, list):
+        return msgs
+
+    # Fallbacks
+    if isinstance(body.get("messages"), list):
+        return body["messages"]
+    if isinstance(variables.get("messages"), list):
+        return variables["messages"]
+    return None
+
+def last_user_text(messages: List[Dict[str, Any]]) -> Optional[str]:
+    for m in reversed(messages):
+        if str(m.get("role", "")).lower() == "user":
+            return m.get("content")
+    return None
+
+@app.post("/copilot")
+async def handle_copilot(request: Request):
+    body = await request.json()
+
+    runtime_url = get_runtime_url(body)
+    messages = extract_messages(body)
+
+    # If messages missing, accept single input pattern as a fallback
+    if not messages and isinstance(body.get("input"), str):
+        return {
+            "ok": True,
+            "runtimeUrl": runtime_url,
+            "source": "input",
+            "user_text": body["input"],
+            "message_count": 0
+        }
+
+    if not messages:
+        return {
+            "ok": False,
+            "error": "No messages found at variables.data.messages / messages.",
+            "runtimeUrl": runtime_url
+        }
+
+    user_text = last_user_text(messages)
+    return {
+        "ok": True,
+        "runtimeUrl": runtime_url,
+        "threadId": body.get("threadId"),
+        "message_count": len(messages),
+        "user_text": user_text,
+        "source": "variables.data.messages"
+    }
