@@ -345,3 +345,71 @@ export default function App() {
     </CopilotKit>
   );
 }
+
+
+
+
+
+
+
+import { CopilotKit } from "copilotkit";
+import { CopilotPopup } from "copilotkit/chat";
+import { useCopilotChat } from "copilotkit/chat/hooks";
+import { useEffect, useRef } from "react";
+
+function BridgeToPython() {
+  const chat = useCopilotChat();
+  const messages = chat?.messages ?? [];
+  const appendMessage = chat?.appendMessage ?? (() => {});
+  const handledCount = useRef(0);
+
+  useEffect(() => {
+    if (!Array.isArray(messages) || messages.length === 0) return;
+
+    // Only react to brand-new user messages
+    if (messages.length <= handledCount.current) return;
+    handledCount.current = messages.length;
+
+    const last = messages[messages.length - 1];
+    if (last?.role !== "user") return;
+
+    (async () => {
+      try {
+        const res = await fetch("http://localhost:8000/copilot", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            runtimeUrl: window.location.origin,
+            variables: { data: { messages } }, // shape your FastAPI expects
+          }),
+        });
+
+        let data: any = null;
+        try { data = await res.json(); } catch {}
+
+        const reply =
+          data?.user_text ??
+          data?.answer ??
+          data?.content ??
+          (data ? JSON.stringify(data) : "No content");
+
+        // 👇 This is what makes the reply appear IN THE POPUP
+        appendMessage({ role: "assistant", content: reply });
+      } catch (e: any) {
+        appendMessage({ role: "assistant", content: `Request failed: ${e?.message || e}` });
+      }
+    })();
+  }, [messages, appendMessage]);
+
+  return null;
+}
+
+export default function App() {
+  return (
+    // Not using Runtime here, so keep it blank/about:blank
+    <CopilotKit runtimeUrl="about:blank">
+      <CopilotPopup title="Local Copilot (Python API)" />
+      <BridgeToPython />
+    </CopilotKit>
+  );
+}
