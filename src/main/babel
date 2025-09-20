@@ -1,37 +1,110 @@
-# fastapi_copilot_strict_messages.py
-from typing import Any, Dict, List, Optional
-from fastapi import FastAPI
-from pydantic import BaseModel, field_validator
+import React, { useState } from "react";
+import { CopilotKit, useCopilotAction } from "@copilotkit/react-core";
 
-app = FastAPI()
+// runtimeUrl is required by the provider, but we won't actually use it.
+// The custom action handler bypasses it by doing fetch() directly.
+const UNUSED_RUNTIME_URL = "http://localhost:0/unused";
 
-class ChatMessage(BaseModel):
-    role: str
-    content: str
+function DemoForm() {
+  const [query, setQuery] = useState("hello from copilot action");
+  const [flag, setFlag] = useState(true);
+  const [result, setResult] = useState<any>(null);
+  const [error, setError] = useState<string | null>(null);
 
-class CopilotMessagesPayload(BaseModel):
-    threadId: Optional[str] = None
-    messages: List[ChatMessage]
-    variables: Optional[Dict[str, Any]] = None
+  // Define the custom action with the hook
+const sendToPython = useCopilotAction({
+    name: "sendToPython",
+    description: "Send custom body to FastAPI",
+    parameters: [
+      { name: "query", type: "string", description: "User query" },
+      { name: "flag", type: "boolean", description: "Extra flag" },
+    ],
+    handler: async ({ query, flag }) => {
+      const resp = await fetch("http://localhost:8000/myapi", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query, flag, ts: new Date().toISOString() }),
+      });
 
-    @field_validator("messages")
-    @classmethod
-    def must_have_at_least_one_user(cls, v):
-        if not any(m.role.lower() == "user" for m in v):
-            raise ValueError("messages must contain at least one user message")
-        return v
+      if (!resp.ok) {
+        const txt = await resp.text();
+        throw new Error(`Python API error: ${resp.status} ${txt}`);
+      }
 
-    def last_user_text(self) -> str:
-        for m in reversed(self.messages):
-            if m.role.lower() == "user":
-                return m.content
-        # validator guarantees one exists
-        return ""
+      return resp.json();
+    },
+  });
 
-@app.post("/copilot")
-async def handle_messages(payload: CopilotMessagesPayload):
-    return {
-        "threadId": payload.threadId,
-        "user_text": payload.last_user_text(),
-        "has_vars": bool(payload.variables),
+
+  return (
+    <div style={{ display: "grid", gap: 12 }}>
+      <label>
+        Query:
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          style={{ marginLeft: 8, width: "100%" }}
+        />
+      </label>
+      <label>
+        Flag:
+        <input
+          type="checkbox"
+          checked={flag}
+          onChange={(e) => setFlag(e.target.checked)}
+          style={{ marginLeft: 8 }}
+        />
+      </label>
+     <button
+  onClick={async () => {
+    setError(null);
+    setResult(null);
+    try {
+      const resp = await fetch("http://localhost:8000/myapi", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query, flag }),
+      });
+      const out = await resp.json();
+      setResult(out);
+    } catch (err: any) {
+      setError(err.message);
     }
+  }}
+>
+  Send directly
+</button>
+
+      {error && (
+        <pre style={{ color: "crimson", whiteSpace: "pre-wrap" }}>{error}</pre>
+      )}
+      {result && (
+        <pre
+          style={{
+            background: "#f7f7f7",
+            padding: 12,
+            borderRadius: 8,
+          }}
+        >
+          {JSON.stringify(result, null, 2)}
+        </pre>
+      )}
+    </div>
+  );
+}
+
+export default function App() {
+  return (
+    <CopilotKit runtimeUrl={UNUSED_RUNTIME_URL}>
+      <div style={{ fontFamily: "Inter, system-ui, Arial", padding: 24 }}>
+        <h1>CopilotKit useCopilotAction → Python API</h1>
+        <p>
+          This demo uses the <code>useCopilotAction</code> hook to define a
+          custom action that calls a FastAPI endpoint at{" "}
+          <code>http://localhost:8000/myapi</code>.
+        </p>
+        <DemoForm />
+      </div>
+    </CopilotKit>
+  );
+}
