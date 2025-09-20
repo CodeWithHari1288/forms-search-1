@@ -308,3 +308,40 @@ export default function App() {
     </CopilotKit>
   );
 }
+
+
+
+import { CopilotKit } from "copilotkit";
+import { CopilotPopup } from "copilotkit/chat";
+import { useCopilotChat } from "copilotkit/chat/hooks";
+import { useEffect, useState } from "react";
+
+function CaptureResponses() {
+  const { messages } = useCopilotChat();
+  const [lastReply, setLastReply] = useState<string>("");
+
+  useEffect(() => {
+    if (!messages.length) return;
+
+    const last = messages[messages.length - 1];
+    if (last.role === "assistant" && typeof last.content === "string") {
+      setLastReply(last.content); // 👈 capture text (live while streaming)
+    }
+  }, [messages]);
+
+  return (
+    <div style={{ marginTop: 10, padding: 8, background: "#eef" }}>
+      <strong>Latest reply from Runtime:</strong>
+      <div>{lastReply}</div>
+    </div>
+  );
+}
+
+export default function App() {
+  return (
+    <CopilotKit runtimeUrl="http://localhost:4000/api/copilot">
+      <CopilotPopup title="My Copilot" />
+      <CaptureResponses />
+    </CopilotKit>
+  );
+}
