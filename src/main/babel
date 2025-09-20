@@ -187,3 +187,38 @@ incoming = {
 }
 payload = parse_payload(incoming)
 print(payload.messages[0].text_message.content)  # "aa"
+
+
+
+
+# models_dc.py
+from dataclasses import dataclass
+from typing import List, Optional, Dict, Any
+
+@dataclass
+class TextMessage:
+    content: str
+    role: Optional[str] = None
+
+@dataclass
+class Message:
+    created_at: str
+    id: str
+    text_message: TextMessage
+
+def parse_messages(incoming: List[Dict[str, Any]]) -> List[Message]:
+    out: List[Message] = []
+    for m in incoming:
+        tm = m.get("textMessage") or {}
+        out.append(
+            Message(
+                created_at=str(m.get("createdAt", "")),
+                id=str(m.get("id", "")),
+                text_message=TextMessage(
+                    content=str(tm.get("content", "")),
+                    role=tm.get("role"),
+                ),
+            )
+        )
+    return out
+
