@@ -108,3 +108,29 @@ export default function App() {
     </CopilotKit>
   );
 }
+
+
+
+
+
+
+from fastapi import FastAPI, Request
+from models import Payload
+
+app = FastAPI()
+
+@app.post("/parse")
+async def parse(req: Request):
+    data = await req.json()
+    payload = Payload.model_validate(data)
+    # Access like Python objects:
+    msgs = [
+        {
+            "id": m.id,
+            "when": m.created_at.isoformat(),
+            "role": m.text_message.role,
+            "content": m.text_message.content,
+        }
+        for m in payload.messages
+    ]
+    return {"messages": msgs}
