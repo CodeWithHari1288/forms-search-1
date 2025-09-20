@@ -134,3 +134,56 @@ async def parse(req: Request):
         for m in payload.messages
     ]
     return {"messages": msgs}
+
+
+
+
+from dataclasses import dataclass
+from typing import List, Optional, Dict, Any
+from datetime import datetime
+
+@dataclass
+class TextMessage:
+    content: str
+    role: Optional[str] = None
+
+@dataclass
+class Message:
+    created_at: datetime
+    id: str
+    text_message: TextMessage
+
+@dataclass
+class Payload:
+    messages: List[Message]
+
+def parse_payload(d: Dict[str, Any]) -> Payload:
+    messages: List[Message] = []
+    for m in d.get("messages", []):
+        tm = m.get("textMessage", {}) or {}
+        messages.append(
+            Message(
+                created_at=datetime.fromisoformat(
+                    m["createdAt"].replace("Z", "+00:00")
+                ),
+                id=str(m["id"]),
+                text_message=TextMessage(
+                    content=str(tm.get("content", "")),
+                    role=tm.get("role")
+                ),
+            )
+        )
+    return Payload(messages=messages)
+
+# usage
+incoming = {
+    "messages": [
+        {
+            "createdAt": "2025-09-20T12:34:56Z",
+            "id": "12",
+            "textMessage": {"content": "aa", "role": "system"}
+        }
+    ]
+}
+payload = parse_payload(incoming)
+print(payload.messages[0].text_message.content)  # "aa"
