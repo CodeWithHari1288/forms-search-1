@@ -1,56 +1,63 @@
 import { NextRequest } from "next/server";
-import { CopilotRuntime, CopilotServerAdapter, copilotRuntimeNodeHttpEndpoint } from "@copilotkit/runtime";
+import { CopilotRuntime, copilotRuntimeNodeHttpEndpoint } from "@copilotkit/runtime";
 
-// Optional: node-fetch for Node < 18; Next 13/14 is on 18+, so global fetch is fine.
-
+// Create the runtime
 const runtime = new CopilotRuntime({
-  // Strong instruction: always call our Python tool and then respond with its text
   system:
     "For every user message, call tool `ask_python` with {input, messages} " +
-    "and then reply to the user with the tool's returned text verbatim."
+    "and then reply with the tool's returned text verbatim.",
 });
 
-runtime.registerAction({
+// ---- Safe registration (works across 1.10.x variants) ----
+const register =
+  // prefer the actions registry if present
+  (runtime as any).actions?.register?.bind((runtime as any).actions) ||
+  // else fall back to registerAction if present
+  (runtime as any).registerAction?.bind(runtime) ||
+  // else throw a clear error
+  (() => {
+    throw new Error("No action registration method found on CopilotRuntime.");
+  });
+
+// Tool: forwards the conversation to your Python API, returns plain text
+register({
   name: "ask_python",
-  description: "Send the conversation to a local Python API (which calls Ollama) and return its answer as text.",
+  description: "Send the conversation to the Python API and return its answer as text.",
   parameters: {
     type: "object",
     properties: {
       input: { type: "string", description: "Latest user message" },
-      messages: { type: "array", items: { type: "object" }, description: "Full chat transcript" }
+      messages: { type: "array", items: { type: "object" }, description: "Full chat transcript" },
     },
-    required: ["input", "messages"]
+    required: ["input", "messages"],
   },
-  handler: async ({ input, messages }) => {
-    // CHANGE this if your Python server runs elsewhere
-    const PY_API = process.env.PY_API_URL || "http://localhost:8000/copilot";
-
+  handler: async ({ input, messages }: { input: string; messages: any[] }) => {
+    const PY_API = process.env.PY_API_URL ?? "http://localhost:8000/copilot";
     const res = await fetch(PY_API, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         input,
-        // Some folks like to keep the same nesting CopilotKit uses — either is fine.
-        variables: { data: { messages } }
+        variables: { data: { messages } }, // include transcript for context
       }),
     });
 
     const data = await res.json().catch(() => ({}));
-    // Return a STRING so CopilotPopup shows a bubble automatically
+    // MUST return a string so CopilotPopup prints it automatically
     return (
       data?.answer ||
       data?.user_text ||
       (typeof data === "string" ? data : JSON.stringify(data))
     );
-  }
+  },
 });
 
-const adapter = new CopilotServerAdapter({ runtime });
+// Hook runtime into Next.js (no adapter needed in your version)
+const handler = copilotRuntimeNodeHttpEndpoint({ runtime });
 
-// Next.js App Router handlers
-export async function GET(req: NextRequest) {
-  return copilotRuntimeNodeHttpEndpoint({ adapter })(req);
+export function GET(req: NextRequest) {
+  return handler(req);
 }
-export async function POST(req: NextRequest) {
-  return copilotRuntimeNodeHttpEndpoint({ adapter })(req);
+export function POST(req: NextRequest) {
+  return handler(req);
 }
