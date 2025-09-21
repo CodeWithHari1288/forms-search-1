@@ -1,0 +1,31 @@
+"use client";
+
+import { CopilotKit } from "@copilotkit/react-core";
+import { CopilotPopup } from "@copilotkit/react-ui";
+import "@copilotkit/react-ui/styles.css";
+import { useEffect } from "react";
+
+export default function Page() {
+  // Optional: auto-open the popup on first render
+  // CopilotPopup exports hooks, but simplest is to rely on its default FAB/open behavior.
+  // If you want forced open, you can add a tiny bridge with useCopilotChat and setOpen(true).
+
+  useEffect(() => {
+    // no-op; keep if you want to run one-time client code
+  }, []);
+
+  return (
+    <CopilotKit runtimeUrl="/api/copilot">
+      <main style={{ padding: 24 }}>
+        <h2>CopilotKit + Python + Ollama</h2>
+        <p>Type in the popup; it will call Python → Ollama and stream back here.</p>
+      </main>
+
+      <CopilotPopup
+        title="My Copilot"
+        defaultOpen={true}      // open by default; remove if you prefer FAB-only
+        clickOutsideCloses={false}
+      />
+    </CopilotKit>
+  );
+}
