@@ -1,0 +1,65 @@
+import React, { useEffect, useRef, useState } from "react";
+import ChatBot from "react-simple-chatbot";
+
+function PythonStep(props) {
+  const [reply, setReply] = useState("…");
+  const ranRef = useRef(false);
+
+  useEffect(() => {
+    if (ranRef.current) return;
+    ranRef.current = true;
+
+    const userMessage = props.previousStep?.message || "";
+
+    // ✅ Sanitize steps: keep only serializable, relevant fields
+    const stepsObj = props.steps || {};
+    const stepsArray = Object.values(stepsObj);
+    const history = stepsArray
+      .filter(s => typeof s?.message === "string" || s?.value != null)
+      .map(s => ({
+        id: s.id,
+        // prefer message; fall back to value if user typed
+        message: typeof s.message === "string" ? s.message : String(s.value ?? ""),
+        user: !!s.user,          // whether this was a user step
+        stepId: s.id,
+      }));
+
+    // Optional: inspect in browser console
+    console.log("payload history →", history);
+
+    (async () => {
+      try {
+        const res = await fetch("http://localhost:8000/copilot", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" }, // ✅ no 'no-cors'
+          body: JSON.stringify({
+            input: userMessage,
+            variables: { data: { history } },             // ✅ sanitized array
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        setReply(data.answer || JSON.stringify(data));
+      } catch (e) {
+        setReply("Error: " + (e?.message || e));
+      } finally {
+        props.triggerNextStep({ trigger: "user" });
+      }
+    })();
+  }, [props.previousStep?.message, props.triggerNextStep]);
+
+  return <div>{reply}</div>;
+}
+
+export default function App() {
+  const steps = [
+    { id: "welcome", message: "Hi! Ask me something.", trigger: "user" },
+    { id: "user", user: true, trigger: "python" },
+    {
+      id: "python",
+      component: <PythonStep />,
+      asMessage: true,
+      waitAction: true,  // we'll trigger manually
+    },
+  ];
+  return <ChatBot steps={steps} />;
+}
