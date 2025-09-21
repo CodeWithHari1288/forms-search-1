@@ -1,0 +1,94 @@
+# app.py
+import os, threading
+from typing import List, Dict, Any
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+import requests
+
+OLLAMA_BASE  = os.getenv("OLLAMA_BASE",  "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
+
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000","http://127.0.0.1:3000"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- naive in-memory summary (swap for DB/Redis in prod) ---
+summary_lock = threading.Lock()
+rolling_summary = ""  # a single-thread demo; scope per user/session in real apps
+
+def update_summary(prev: str, new_turns: List[Dict[str, str]], max_len: int = 1200) -> str:
+    """Tiny, cheap summarizer: concatenate & cap (replace with LLM-based summary in prod)."""
+    text = (prev + " | " if prev else "") + " | ".join(f"{t['role']}:{t['content']}" for t in new_turns)
+    return text[-max_len:]  # keep tail
+
+def build_messages(user_input: str, history: List[Dict[str, str]], summary: str,
+                   tail_turns: int = 10) -> List[Dict[str, str]]:
+    recent = history[-tail_turns:] if tail_turns > 0 else history
+    msgs: List[Dict[str, str]] = [
+        {"role": "system", "content": "You are a concise, helpful assistant."},
+    ]
+    if summary:
+        msgs.append({"role": "system", "content": f"Conversation summary: {summary}"})
+    msgs.extend(recent)
+    # ensure latest user input is last (if your client hasn’t appended it yet)
+    if not recent or recent[-1].get("content") != user_input or recent[-1].get("role") != "user":
+        msgs.append({"role": "user", "content": user_input})
+    return msgs
+
+@app.post("/copilot")
+def copilot(req: Request):
+    body: Dict[str, Any] = req.json() if hasattr(req, "json") else {}
+    try:
+        body = req.json()  # FastAPI sync path won't work; use await in async def
+    except Exception:
+        pass
+    # In FastAPI, write as async to use await; here I'll switch to async version below.
+    return {"error": "Use the async version below"}
+
+
+
+
+
+
+
+@app.post("/copilot")
+async def copilot(request: Request):
+    body: Dict[str, Any] = await request.json()
+    user_input: str = (body.get("input") or "").strip()
+    history: List[Dict[str, str]] = body.get("history") or []
+
+    if not isinstance(history, list):
+        history = []
+
+    # 1) Build prompt messages
+    with summary_lock:
+        global rolling_summary
+        msgs = build_messages(user_input, history, rolling_summary, tail_turns=10)
+
+    # 2) Call Ollama (OpenAI-compatible chat)
+    r = requests.post(
+        f"{OLLAMA_BASE}/v1/chat/completions",
+        json={
+            "model": OLLAMA_MODEL,
+            "messages": msgs,
+            "temperature": 0.2,
+            "stream": False,  # set True for streaming (see below)
+        },
+        timeout=120,
+    )
+    r.raise_for_status()
+    data = r.json()
+    answer = data["choices"][0]["message"]["content"]
+
+    # 3) Update rolling summary with this new turn
+    with summary_lock:
+        rolling_summary = update_summary(rolling_summary, [
+            {"role": "user", "content": user_input},
+            {"role": "assistant", "content": answer},
+        ])
+
+    return {"answer": answer}
