@@ -8,8 +8,8 @@ export default function Page() {
   return (
     <CopilotKit runtimeUrl="/api/copilot">
       <main style={{ padding: 24 }}>
-        <h2>CopilotKit v1.10.4 → Python → Ollama</h2>
-        <p>Open the popup and ask something.</p>
+        <h2>CopilotKit → Python → Ollama</h2>
+        <p>Open the popup and ask anything — it will call Python and show the answer.</p>
       </main>
       <CopilotPopup title="My Copilot" defaultOpen />
     </CopilotKit>
