@@ -15,3 +15,28 @@ export default function Page() {
     </CopilotKit>
   );
 }
+
+
+
+
+
+
+import { NextRequest, NextResponse } from "next/server";
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+const PY_API = process.env.PY_API_URL ?? "http://localhost:8000/copilot";
+
+export async function POST(req: NextRequest) {
+  const body = await req.json();
+  const res = await fetch(PY_API, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  return new NextResponse(text, {
+    status: 200,
+    headers: { "Content-Type": res.headers.get("content-type") ?? "application/json" },
+  });
+}
