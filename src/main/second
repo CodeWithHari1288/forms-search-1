@@ -1,0 +1,54 @@
+import React, { useEffect, useState } from "react";
+import ChatBot from "react-simple-chatbot";
+
+function PythonStep(props: any) {
+  const [reply, setReply] = useState("…");
+
+  useEffect(() => {
+    const fetchReply = async () => {
+      const userMessage = props.previousStep.message; // last user input
+      try {
+        const res = await fetch("http://localhost:8000/copilot", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            input: userMessage,
+            variables: { data: { history: props.steps } }, // pass full chat history
+          }),
+        });
+        const data = await res.json();
+        setReply(data.answer ?? JSON.stringify(data));
+      } catch (e: any) {
+        setReply("Error: " + e.message);
+      }
+    };
+    fetchReply();
+  }, [props.previousStep, props.steps]);
+
+  // ChatBot will display whatever you return here
+  return <div>{reply}</div>;
+}
+
+export default function App() {
+  const steps = [
+    {
+      id: "welcome",
+      message: "Hi! Ask me something.",
+      trigger: "user",
+    },
+    {
+      id: "user",
+      user: true,
+      trigger: "python",
+    },
+    {
+      id: "python",
+      component: <PythonStep />,
+      asMessage: true,
+      waitAction: true,
+      trigger: "user", // loop back to allow continuous conversation
+    },
+  ];
+
+  return <ChatBot steps={steps} />;
+}
