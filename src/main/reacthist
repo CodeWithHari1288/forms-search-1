@@ -1,0 +1,132 @@
+// Chat.tsx (React + TS)
+import { useEffect, useMemo, useRef, useState } from "react";
+
+type Role = "system" | "user" | "assistant";
+type Msg = { id: string; role: Role; content: string; ts: number };
+
+const STORAGE_KEY = "chat.history.v1";
+const SUMMARY_KEY = "chat.summary.v1";
+
+function summarise(prev: string, newMsgs: Msg[], maxLen = 800) {
+  const s = [prev, ...newMsgs.map(m => `${m.role}:${m.content}`)].filter(Boolean).join(" | ");
+  return s.length > maxLen ? s.slice(-maxLen) : s;
+}
+
+function buildOllamaPayload(
+  summary: string,
+  history: Msg[],
+  tail = 10, // keep last N messages for token efficiency
+  model = "llama3.2"
+) {
+  const recent = history.slice(-tail).map(({ role, content }) => ({ role, content }));
+  return {
+    model,
+    messages: [
+      { role: "system", content: "You are a concise, helpful assistant." },
+      ...(summary ? [{ role: "system", content: `Conversation summary: ${summary}` as const }] : []),
+      ...recent,
+    ],
+    temperature: 0.2,
+    stream: false, // set true if you stream (see part C)
+  };
+}
+
+export default function Chat() {
+  const [messages, setMessages] = useState<Msg[]>([]);
+  const [summary, setSummary] = useState("");
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // Load persisted memory
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) setMessages(JSON.parse(raw));
+      const s = localStorage.getItem(SUMMARY_KEY);
+      if (s) setSummary(s);
+    } catch {}
+  }, []);
+
+  // Persist on change
+  useEffect(() => localStorage.setItem(STORAGE_KEY, JSON.stringify(messages)), [messages]);
+  useEffect(() => localStorage.setItem(SUMMARY_KEY, summary), [summary]);
+
+  const send = async () => {
+    const text = input.trim();
+    if (!text || busy) return;
+    setInput("");
+    const user: Msg = { id: crypto.randomUUID(), role: "user", content: text, ts: Date.now() };
+    const withUser = [...messages, user];
+    setMessages(withUser);
+    setBusy(true);
+
+    try {
+      const nextSummary = summarise(summary, [user]);
+      const payload = buildOllamaPayload(nextSummary, withUser, 10, "llama3.2");
+
+      // 👇 call your backend proxy to Ollama (see section B)
+      const r = await fetch("/api/ollama/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await r.json();
+      const assistantText = data?.choices?.[0]?.message?.content ?? data?.answer ?? "No response";
+
+      const assistant: Msg = { id: crypto.randomUUID(), role: "assistant", content: assistantText, ts: Date.now() };
+      setMessages(curr => [...curr, assistant]);
+
+      // fold both turns into the summary
+      setSummary(summarise(nextSummary, [assistant]));
+    } catch (e: any) {
+      setMessages(curr => [...curr, { id: crypto.randomUUID(), role: "assistant", content: `Error: ${e?.message ?? e}`, ts: Date.now() }]);
+    } finally {
+      setBusy(false);
+      inputRef.current?.focus();
+    }
+  };
+
+  const lastAssistant = useMemo(() => [...messages].reverse().find(m => m.role === "assistant")?.content ?? "", [messages]);
+
+  return (
+    <div style={{ maxWidth: 720, margin: "32px auto", padding: 16, fontFamily: "ui-sans-serif, system-ui" }}>
+      <h3>Ollama Chat (with memory)</h3>
+      <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 8 }}>
+        msgs:{messages.length} · summary:{summary.length} chars
+      </div>
+
+      <div style={{ border:"1px solid #e5e7eb", borderRadius:8, padding:12, minHeight:300 }}>
+        {messages.map(m => (
+          <div key={m.id} style={{ textAlign: m.role === "user" ? "right" : "left", margin:"6px 0" }}>
+            <div style={{
+              display:"inline-block", maxWidth:"80%", whiteSpace:"pre-wrap",
+              padding:"8px 10px", borderRadius:12,
+              background: m.role === "user" ? "#2563eb" : "#fff",
+              color: m.role === "user" ? "#fff" : "#111",
+              border: m.role === "assistant" ? "1px solid #eee" : "none"
+            }}>
+              <div style={{ fontSize: 12, opacity: 0.6, marginBottom: 4 }}>{m.role}</div>
+              {m.content}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <form onSubmit={e => { e.preventDefault(); send(); }} style={{ display:"flex", gap:8, marginTop:12 }}>
+        <input
+          ref={inputRef}
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          placeholder="Ask something…"
+          style={{ flex:1, padding:"10px 12px", borderRadius:8, border:"1px solid #ddd" }}
+        />
+        <button type="submit" disabled={!input.trim() || busy}>{busy ? "…" : "Send"}</button>
+      </form>
+
+      <div style={{ marginTop: 8, fontSize: 12, color: "#6b7280" }}>
+        Last assistant: {lastAssistant || "—"}
+      </div>
+    </div>
+  );
+}
