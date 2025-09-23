@@ -10,43 +10,47 @@ from langgraph.checkpoint.memory import MemorySaver
 from langchain_ollama import ChatOllama
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
 
-# ---- LangGraph State ----
+from chroma_tools import query_chroma
+
+# ---- State
 class ChatState(TypedDict):
     messages: List[BaseMessage]
+    context: str  # concatenated passages from Chroma
 
-# ---- LLM (Ollama) ----
-llm = ChatOllama(model="llama3.2")  # make sure `ollama serve` is running
+SYSTEM = SystemMessage(content="You are a concise assistant. Use the provided context. If unsure, say so.")
 
-SYSTEM_PROMPT = SystemMessage(
-    content="You are a helpful, concise assistant. Keep answers short and clear."
-)
+llm = ChatOllama(model="llama3.2")
 
-# ---- Node: call the model on the latest message ----
-def call_llm(state: ChatState) -> ChatState:
-    """
-    Expects state['messages'] with prior history + latest HumanMessage.
-    Appends the AIMessage response and returns updated state.
-    """
-    messages = state["messages"]
-    # Ensure system prompt is present at the start of every turn
-    if not messages or not isinstance(messages[0], SystemMessage):
-        messages = [SYSTEM_PROMPT] + messages
+# ---- Node 1: ALWAYS run Chroma (your method only)
+def retrieve(state: ChatState) -> ChatState:
+    last_user = next((m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None)
+    q = last_user.content if last_user else ""
+    hits = query_chroma(q, k=5)
+    context = "\n\n".join(f"[{i+1}] {doc} (dist={dist:.3f})" for i, (doc, dist) in enumerate(hits))
+    return {"messages": state["messages"], "context": context}
 
-    response = llm.invoke(messages)  # returns an AIMessage
-    return {"messages": messages + [response]}
+# ---- Node 2: Ask LLM using only that context
+def answer(state: ChatState) -> ChatState:
+    msgs = [
+        SYSTEM,
+        SystemMessage(content=f"Context:\n{state['context']}"),
+        *state["messages"]
+    ]
+    ai: AIMessage = llm.invoke(msgs)
+    return {"messages": state["messages"] + [ai], "context": state["context"]}
 
-# ---- Build graph ----
+# ---- Build graph: START -> retrieve -> answer -> END
 graph = StateGraph(ChatState)
-graph.add_node("llm", call_llm)
-graph.add_edge(START, "llm")
-graph.add_edge("llm", END)
+graph.add_node("retrieve", retrieve)
+graph.add_node("answer", answer)
+graph.add_edge(START, "retrieve")
+graph.add_edge("retrieve", "answer")
+graph.add_edge("answer", END)
 
-# Keep conversation history per session/thread id
-checkpointer = MemorySaver()
-app_graph = graph.compile(checkpointer=checkpointer)
+app_graph = graph.compile(checkpointer=MemorySaver())
 
-# ---- FastAPI wiring ----
-api = FastAPI(title="LangGraph + Ollama Chatbot")
+# ---- FastAPI
+api = FastAPI()
 
 class ChatRequest(BaseModel):
     session_id: str
@@ -56,17 +60,11 @@ class ChatResponse(BaseModel):
     answer: str
 
 @api.post("/chat", response_model=ChatResponse)
-def chat_endpoint(req: ChatRequest):
-    # Build the input state: previous turns are automatically restored by the checkpointer
-    human = HumanMessage(content=req.user_input)
-    # Invoke the compiled graph; thread_id scopes the memory
-    result_state: ChatState = app_graph.invoke(
-        {"messages": [human]},
-        config={"configurable": {"thread_id": req.session_id}},
+def chat(req: ChatRequest):
+    state = {"messages": [HumanMessage(content=req.user_input)], "context": ""}
+    out: ChatState = app_graph.invoke(
+        state, config={"configurable": {"thread_id": req.session_id}}
     )
-    # Last message is the assistant’s reply
-    last = result_state["messages"][-1]
-    text = last.content if isinstance(last, AIMessage) else str(last)
-    return ChatResponse(answer=text)
+    return ChatResponse(answer=out["messages"][-1].content)
 
-# Run with: uvicorn main:api --reload
+# Run: uvicorn main:api --reload
