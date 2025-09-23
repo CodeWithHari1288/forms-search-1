@@ -1,0 +1,72 @@
+# main.py
+from __future__ import annotations
+from typing import TypedDict, List
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
+
+from langchain_ollama import ChatOllama
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
+
+# ---- LangGraph State ----
+class ChatState(TypedDict):
+    messages: List[BaseMessage]
+
+# ---- LLM (Ollama) ----
+llm = ChatOllama(model="llama3.2")  # make sure `ollama serve` is running
+
+SYSTEM_PROMPT = SystemMessage(
+    content="You are a helpful, concise assistant. Keep answers short and clear."
+)
+
+# ---- Node: call the model on the latest message ----
+def call_llm(state: ChatState) -> ChatState:
+    """
+    Expects state['messages'] with prior history + latest HumanMessage.
+    Appends the AIMessage response and returns updated state.
+    """
+    messages = state["messages"]
+    # Ensure system prompt is present at the start of every turn
+    if not messages or not isinstance(messages[0], SystemMessage):
+        messages = [SYSTEM_PROMPT] + messages
+
+    response = llm.invoke(messages)  # returns an AIMessage
+    return {"messages": messages + [response]}
+
+# ---- Build graph ----
+graph = StateGraph(ChatState)
+graph.add_node("llm", call_llm)
+graph.add_edge(START, "llm")
+graph.add_edge("llm", END)
+
+# Keep conversation history per session/thread id
+checkpointer = MemorySaver()
+app_graph = graph.compile(checkpointer=checkpointer)
+
+# ---- FastAPI wiring ----
+api = FastAPI(title="LangGraph + Ollama Chatbot")
+
+class ChatRequest(BaseModel):
+    session_id: str
+    user_input: str
+
+class ChatResponse(BaseModel):
+    answer: str
+
+@api.post("/chat", response_model=ChatResponse)
+def chat_endpoint(req: ChatRequest):
+    # Build the input state: previous turns are automatically restored by the checkpointer
+    human = HumanMessage(content=req.user_input)
+    # Invoke the compiled graph; thread_id scopes the memory
+    result_state: ChatState = app_graph.invoke(
+        {"messages": [human]},
+        config={"configurable": {"thread_id": req.session_id}},
+    )
+    # Last message is the assistant’s reply
+    last = result_state["messages"][-1]
+    text = last.content if isinstance(last, AIMessage) else str(last)
+    return ChatResponse(answer=text)
+
+# Run with: uvicorn main:api --reload
