@@ -135,3 +135,44 @@ class RAGState(TypedDict, total=False):   # total=False = keys optional
 
 
 
+
+
+
+def retrieve(state: RAGState) -> RAGState:
+    q = state.get("retriever_query", "") or ""
+    docs = chroma_search(q)                 # list[str]
+    ctx = "\n\n".join(docs) if docs else ""
+    return {"context": ctx}                 # <-- ALWAYS set context
+
+
+
+
+
+
+from langchain_core.messages import SystemMessage, AIMessage
+
+SYSTEM = SystemMessage(content="Be concise. Use Context if relevant.")
+
+def answer(state: RAGState) -> RAGState:
+    ctx = state.get("context", "")          # <-- avoid KeyError
+    msgs = [SYSTEM]
+    if ctx:
+        msgs.append(SystemMessage(content=f"Context:\n{ctx}"))
+    msgs += state["messages"]
+    ai: AIMessage = llm.invoke(msgs)
+    return {"messages": [ai]}               # <-- append only the new AI msg
+
+
+
+
+
+from langchain_core.messages import HumanMessage
+
+state_in: RAGState = {
+    "messages": [HumanMessage(content=req.user_input)],
+    "context": ""                          # default present
+}
+out = app_graph.invoke(
+    state_in,
+    config={"configurable": {"thread_id": req.session_id}},
+)
