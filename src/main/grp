@@ -68,3 +68,54 @@ def chat(req: ChatRequest):
     return ChatResponse(answer=out["messages"][-1].content)
 
 # Run: uvicorn main:api --reload
+
+
+
+
+
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_ollama import ChatOllama
+
+llm = ChatOllama(model="llama3.2")
+SYSTEM = SystemMessage(content="Be concise. Use Context when relevant.")
+
+def rewrite_query(state: MessagesState) -> dict:
+    recent = state["messages"][-8:]  # <- history is coming from LangGraph state
+    prompt = [
+        SystemMessage(content=(
+            "Rewrite the user's latest message into a standalone search query. "
+            "Resolve references using recent conversation. Return only the query."
+        )),
+        *recent
+    ]
+    rewritten = llm.invoke(prompt).content.strip()
+    if not rewritten:  # fallback to last human
+        for m in reversed(state["messages"]):
+            if m.type == "human":
+                rewritten = m.content
+                break
+    return {"retriever_query": rewritten}
+
+def retrieve(state: MessagesState) -> dict:
+    q = state.get("retriever_query", "")
+    docs = chroma_search(q)      # your function; returns List[str]
+    return {"context": "\n\n".join(docs)}
+
+def answer(state: MessagesState) -> MessagesState:
+    msgs = [SYSTEM, SystemMessage(content=f"Context:\n{state.get('context','')}"),
+            *state["messages"]]
+    ai: AIMessage = llm.invoke(msgs)
+    return {"messages": [ai]}    # append only the new AI message
+
+g = StateGraph(MessagesState)
+g.add_node("rewrite_query", rewrite_query)
+g.add_node("retrieve", retrieve)
+g.add_node("answer", answer)
+g.add_edge(START, "rewrite_query")
+g.add_edge("rewrite_query", "retrieve")
+g.add_edge("retrieve", "answer")
+g.add_edge("answer", END)
+
+app_graph = g.compile(checkpointer=SqliteSaver("chat_memory.sqlite"))
