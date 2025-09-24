@@ -162,3 +162,16 @@ def seed():
     # upsert is safe to re-run
     collection.upsert(ids=ids, documents=texts, embeddings=embs)
     return {"ok": True, "added": len(texts)}
+
+
+
+
+def is_confident(rewritten: str, original: str) -> bool:
+    if not rewritten or len(rewritten.strip()) < 3:
+        return False
+    if rewritten.strip().lower() == original.strip().lower():
+        return False
+    return True
+
+rewritten = llm.invoke(user_query).content
+final_query = rewritten if is_confident(rewritten, user_query) else user_query
