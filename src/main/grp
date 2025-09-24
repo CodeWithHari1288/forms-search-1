@@ -119,3 +119,19 @@ g.add_edge("retrieve", "answer")
 g.add_edge("answer", END)
 
 app_graph = g.compile(checkpointer=SqliteSaver("chat_memory.sqlite"))
+
+
+
+
+from typing import TypedDict, List, Annotated
+from langgraph.graph import add_messages
+from langchain_core.messages import BaseMessage
+
+class RAGState(TypedDict, total=False):   # total=False = keys optional
+    messages: Annotated[List[BaseMessage], add_messages]
+    retriever_query: str
+    context: str
+
+
+
+
