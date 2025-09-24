@@ -1,0 +1,164 @@
+from __future__ import annotations
+# ================== Std / typing ==================
+from typing import TypedDict, List, Annotated
+# ================== FastAPI ==================
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+# ================== LangGraph / LangChain ==================
+from langgraph.graph import StateGraph, START, END, add_messages
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langchain_ollama import ChatOllama
+# ================== Chroma / Embeddings ==================
+import chromadb
+from sentence_transformers import SentenceTransformer
+
+# ---------- Config ----------
+ALLOWED_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
+OLLAMA_MODEL = "llama3.2"
+CHROMA_PATH = "./chroma"
+CHROMA_COLLECTION = "kb"
+SQLITE_PATH = "chat_memory.sqlite"
+
+# ---------- Singletons (created once; DO NOT put in state) ----------
+llm = ChatOllama(model=OLLAMA_MODEL)
+SYSTEM = SystemMessage(content="You are a concise assistant. Use Context if relevant. "
+                               "If unsure, say you don't know.")
+
+chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
+collection = chroma_client.get_or_create_collection(CHROMA_COLLECTION)
+embedder = SentenceTransformer("BAAI/bge-m3")  # choose any SentenceTransformers model
+
+# ---------- Helpers ----------
+def chroma_search(query: str, k: int = 5) -> List[str]:
+    """Return up to k documents (strings) for the query. Safe across Chroma versions."""
+    if not query:
+        return []
+    q_emb = embedder.encode([query], normalize_embeddings=True)
+    if hasattr(q_emb, "tolist"):
+        q_emb = q_emb.tolist()
+    res = collection.query(query_embeddings=q_emb, n_results=k, include=["documents"])
+    docs = res.get("documents", [[]])
+    docs = docs[0] if docs else []
+    return [d for d in docs if d]
+
+# ---------- State (includes context & retriever_query) ----------
+class RAGState(TypedDict, total=False):
+    messages: Annotated[List[BaseMessage], add_messages]  # reducer: append
+    retriever_query: str                                   # last-writer-wins
+    context: str                                           # last-writer-wins
+
+# ---------- Nodes ----------
+def rewrite_query(state: RAGState) -> RAGState:
+    """Rewrite the latest user message into a standalone search query using conversation history."""
+    recent = state.get("messages", [])[-8:]  # small window
+    prompt = [
+        SystemMessage(content=(
+            "Rewrite the user's latest message into a standalone, explicit search query. "
+            "Resolve pronouns/references using the recent conversation. "
+            "Return ONLY the query text."
+        )),
+        *recent
+    ]
+    try:
+        rewritten = llm.invoke(prompt).content.strip()
+    except Exception:
+        rewritten = ""
+    if not rewritten:
+        # Fallback to last human message
+        for m in reversed(state.get("messages", [])):
+            if m.type == "human":
+                rewritten = m.content
+                break
+    return {"retriever_query": rewritten or ""}
+
+def retrieve(state: RAGState) -> RAGState:
+    """Query Chroma with the rewritten query and pack Context. Always sets context (may be '')."""
+    q = state.get("retriever_query", "") or ""
+    docs = chroma_search(q, k=5)
+    ctx = "\n\n".join(docs) if docs else ""
+    return {"context": ctx}
+
+def answer(state: RAGState) -> RAGState:
+    """Answer using chat history + Context. Return ONLY new AI message (delta)."""
+    ctx = state.get("context", "")  # avoid KeyError
+    msgs = [SYSTEM]
+    if ctx:
+        msgs.append(SystemMessage(content=f"Context:\n{ctx}"))
+    msgs += state.get("messages", [])
+    ai: AIMessage = llm.invoke(msgs)
+    return {"messages": [ai]}
+
+# ---------- Build & compile graph (persistent memory) ----------
+g = StateGraph(RAGState)
+g.add_node("rewrite_query", rewrite_query)
+g.add_node("retrieve", retrieve)
+g.add_node("answer", answer)
+g.add_edge(START, "rewrite_query")
+g.add_edge("rewrite_query", "retrieve")
+g.add_edge("retrieve", "answer")
+g.add_edge("answer", END)
+
+checkpointer = SqliteSaver(SQLITE_PATH)
+app_graph = g.compile(checkpointer=checkpointer)
+
+# ---------- FastAPI app ----------
+api = FastAPI(title="LangGraph + Ollama + Chroma RAG")
+
+api.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------- Schemas ----------
+class ChatRequest(BaseModel):
+    session_id: str
+    user_input: str
+
+class ChatResponse(BaseModel):
+    answer: str
+    retriever_query: str | None = None
+
+# ---------- Endpoints ----------
+@api.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest):
+    """One user turn. History is restored by thread_id; nodes run and append AI reply."""
+    out: RAGState = app_graph.invoke(
+        {"messages": [HumanMessage(content=req.user_input)], "context": ""},  # default context present
+        config={"configurable": {"thread_id": req.session_id}},
+    )
+    # Read merged state to return the query used for retrieval
+    st = app_graph.get_state({"configurable": {"thread_id": req.session_id}})
+    rq = st.values.get("retriever_query", None)
+    return ChatResponse(answer=out["messages"][-1].content, retriever_query=rq)
+
+@api.get("/debug/state")
+def debug_state(session_id: str):
+    """Inspect stored state for a thread."""
+    st = app_graph.get_state({"configurable": {"thread_id": session_id}})
+    vals = st.values or {}
+    return {
+        "thread_id": session_id,
+        "messages_len": len(vals.get("messages", [])),
+        "has_context": bool(vals.get("context")),
+        "context_len": len(vals.get("context", "")),
+        "retriever_query": vals.get("retriever_query"),
+    }
+
+@api.post("/seed")
+def seed():
+    """Optional: quickly add a few docs to Chroma for testing."""
+    texts = [
+        "S3 bucket policies control access via IAM principals and JSON statements.",
+        "Use aws:PrincipalOrgID to scope access to an entire AWS Organization.",
+        "For cross-account access, set Principal to the external account ID.",
+    ]
+    embs = embedder.encode(texts, normalize_embeddings=True).tolist()
+    ids = [f"doc-{i}" for i in range(len(texts))]
+    # upsert is safe to re-run
+    collection.upsert(ids=ids, documents=texts, embeddings=embs)
+    return {"ok": True, "added": len(texts)}
