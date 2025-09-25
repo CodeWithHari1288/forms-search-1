@@ -1,0 +1,172 @@
+from __future__ import annotations
+from typing import List, Optional, Dict, Any
+from typing_extensions import TypedDict
+
+from fastapi import FastAPI
+from pydantic import BaseModel
+import ollama
+
+# ---------- Config ----------
+OLLAMA_MODEL = "llama3.2"   # change to your local model name
+
+# ---------- Minimal in-memory corpus & retriever ----------
+DOCS = [
+    "LangGraph lets you build stateful, multi-step LLM workflows as graphs.",
+    "Retrieval-Augmented Generation (RAG) adds context from external documents to improve answers.",
+    "ChromaDB is a lightweight vector database often used for local RAG experiments.",
+    "You can generate follow-up suggestions after an answer to guide the next turn.",
+    "React chat UIs often show suggestion chips under each bot message.",
+]
+
+def simple_retriever(query: str, k: int = 3) -> List[str]:
+    """Toy keyword retriever: ranks docs by overlapping words."""
+    q = set(query.lower().split())
+    scored = []
+    for d in DOCS:
+        score = len(q.intersection(set(d.lower().split())))
+        scored.append((score, d))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [d for s, d in scored[:k] if s > 0] or DOCS[:k]
+
+# ---------- LLM helpers ----------
+def llm_completion(prompt: str) -> str:
+    """Single prompt -> text with Ollama."""
+    res = ollama.chat(
+        model=OLLAMA_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        options={"temperature": 0.3},
+    )
+    # ollama.chat returns {'message': {'content': '...'}}
+    return (res.get("message") or {}).get("content", "").strip()
+
+def llm_json_list_from_text(prompt: str, default_fallback: List[str]) -> List[str]:
+    """Ask model for a JSON list; fall back to lines if parsing fails."""
+    import json, re
+    text = llm_completion(prompt)
+    # Try to find a JSON array in the output
+    match = re.search(r"\[.*\]", text, flags=re.DOTALL)
+    if match:
+        try:
+            arr = json.loads(match.group(0))
+            return [str(x) for x in arr if isinstance(x, (str, int, float))]
+        except Exception:
+            pass
+    # fallback: split lines / bullets
+    candidates = [t.strip("- •\t ") for t in text.splitlines() if t.strip()]
+    return candidates[:3] or default_fallback
+
+# ---------- LangGraph-like minimal framework ----------
+# We’ll avoid pulling in langchain_core messages and keep a simple TypedDict state.
+
+class ChatMessage(TypedDict):
+    role: str      # "user" | "assistant" | "system"
+    content: str
+
+class RAGState(TypedDict, total=False):
+    messages: List[ChatMessage]
+    retriever_query: Optional[str]
+    documents: Optional[List[str]]
+    answer: Optional[str]
+    suggestions: Optional[List[str]]
+
+# Nodes
+def node_rewrite(state: RAGState) -> RAGState:
+    """Rewrite last user message into a concise retriever query."""
+    user_msgs = [m for m in state["messages"] if m["role"] == "user"]
+    last_user = user_msgs[-1]["content"] if user_msgs else ""
+    prompt = f"""Rewrite the following user message into a short, keyword-rich search query:
+
+User message:
+{last_user}
+
+Rules:
+- Remove chit-chat and filler.
+- Keep names/terms that help search.
+- Max 15 words, no quotes or extra punctuation.
+Return ONLY the rewritten query as plain text."""
+    rq = llm_completion(prompt) if last_user else ""
+    rq = rq.strip() or last_user.strip()
+    return {**state, "retriever_query": rq}
+
+def node_retrieve(state: RAGState) -> RAGState:
+    """Use retriever_query to fetch documents."""
+    q = state.get("retriever_query") or ""
+    docs = simple_retriever(q, k=4) if q else []
+    return {**state, "documents": docs}
+
+def node_answer(state: RAGState) -> RAGState:
+    """Answer using documents as context."""
+    user_msgs = [m for m in state["messages"] if m["role"] == "user"]
+    last_user = user_msgs[-1]["content"] if user_msgs else ""
+    docs = state.get("documents") or []
+    context = "\n\n".join(f"- {d}" for d in docs)
+    prompt = f"""You are a helpful assistant. Use the context to answer the user.
+If the context is not enough, be honest and say so, then do your best.
+
+Context:
+{context or "(no context)"} 
+
+User:
+{last_user}
+
+Answer concisely in 3-6 sentences."""
+    ans = llm_completion(prompt)
+    return {**state, "answer": ans}
+
+def node_suggest(state: RAGState) -> RAGState:
+    """Generate 3 follow-up suggestions based on the answer & intent."""
+    answer = state.get("answer") or ""
+    q = state.get("retriever_query") or ""
+    default = [
+        "Show related documents",
+        "Summarize the key points",
+        "Explain this in simpler terms",
+    ]
+    prompt = f"""Based on the answer below and the user intent (“{q}”), suggest 3 helpful follow-up queries.
+Return a JSON array of 3 short strings (max 8 words each), imperative or question style.
+
+Answer:
+{answer}
+"""
+    suggestions = llm_json_list_from_text(prompt, default)
+    # normalize & cap to 3
+    clean = []
+    for s in suggestions:
+        s = s.strip()
+        if s and s not in clean:
+            clean.append(s)
+        if len(clean) == 3:
+            break
+    return {**state, "suggestions": clean or default}
+
+# A simple linear "graph" runner: rewrite -> retrieve -> answer -> suggest
+def run_graph(initial: RAGState) -> RAGState:
+    state = initial
+    for node in (node_rewrite, node_retrieve, node_answer, node_suggest):
+        state = node(state)
+    return state
+
+# ---------- FastAPI ----------
+app = FastAPI()
+
+class ChatRequest(BaseModel):
+    messages: List[ChatMessage]
+
+class ChatResponse(BaseModel):
+    answer: str
+    suggestions: List[str]
+    retriever_query: Optional[str] = None
+    documents: List[str] = []
+
+@app.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest):
+    init_state: RAGState = {
+        "messages": req.messages,
+    }
+    final = run_graph(init_state)
+    return ChatResponse(
+        answer=final.get("answer") or "",
+        suggestions=final.get("suggestions") or [],
+        retriever_query=final.get("retriever_query"),
+        documents=final.get("documents") or [],
+    )
