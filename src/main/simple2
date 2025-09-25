@@ -91,3 +91,21 @@ return ( <> {/* Launcher when closed */} {!isOpen && !isMinimized && ( <button s
 
 
 
+
+
+
+
+.rsc-container {
+  display: flex !important;
+  flex-direction: column !important;
+  height: 100% !important;
+}
+
+.rsc-content {
+  flex: 1 1 auto !important;
+  overflow-y: auto !important;
+}
+
+.rsc-footer {
+  order: 2 !important; /* push footer (input) to the bottom */
+}
