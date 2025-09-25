@@ -1,0 +1,91 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"; import ChatBot from "react-simple-chatbot";
+
+/**
+
+FloatingChatbot.jsx
+
+
+---
+
+Copilot-like floating chat for react-simple-chatbot with:
+
+Expand/Collapse
+
+
+Minimize -> shows ONLY a round 💬 icon (no pill)
+
+
+Keeps ChatBot mounted (hidden via CSS) to avoid setState-after-unmount
+
+
+Abort in-flight work on close/minimize */
+
+
+
+export default function FloatingChatbot({ title = "Assistant", initialOpen = false, theme = {}, steps: externalSteps, }) { const [isOpen, setIsOpen] = useState(initialOpen); const [isExpanded, setIsExpanded] = useState(false); const [isMinimized, setIsMinimized] = useState(false);
+
+const [stopController, setStopController] = useState(null); const [isBusy, setIsBusy] = useState(false); const [error, setError] = useState("");
+
+// Guard state updates after unmount const mounted = useRef(false); useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+
+// Sizes const collapsedSize = { width: 340, height: 460 }; const expandedSize = { width: 520, height: 640 }; const { width, height } = isExpanded ? expandedSize : collapsedSize;
+
+// Steps (fallback demo if none passed) const steps = useMemo(() => ( externalSteps?.length ? externalSteps : [ { id: "start", message: "Hi! How can I help today?", trigger: "ask" }, { id: "ask", user: true, trigger: "answer" }, { id: "answer", message: "(Demo) You can wire this to your API.", end: true }, ] ), [externalSteps]);
+
+// Theme const mergedTheme = { background: "#ffffff", fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial", headerBgColor: "#111827", headerFontColor: "#ffffff", headerFontSize: "16px", botBubbleColor: "#111827", botFontColor: "#ffffff", userBubbleColor: "#e5e7eb", userFontColor: "#111827", ...theme, };
+
+// Control helpers const safeSet = (fn) => { if (mounted.current) fn(); };
+
+const handleClose = () => { if (stopController) stopController.abort(); safeSet(() => { setIsOpen(false); setIsExpanded(false); setIsMinimized(false); }); }; const handleMinimize = () => { if (stopController) stopController.abort(); safeSet(() => { setIsOpen(false); setIsMinimized(true); }); };
+
+// Optional example async (if you later add custom sends) const fakeAsync = useCallback(async () => { safeSet(() => { setIsBusy(true); setError(""); }); const controller = new AbortController(); safeSet(() => setStopController(controller)); try { await new Promise((r) => setTimeout(r, 500)); } catch (e) { if (e?.name !== "AbortError") safeSet(() => setError(String(e?.message || e))); } finally { controller.abort(); safeSet(() => { setStopController(null); setIsBusy(false); }); } }, []);
+
+// Styles const styles = { launcherBtn: { position: "fixed", right: 16, bottom: 16, zIndex: 9999, borderRadius: 999, padding: "12px 14px", border: "none", fontWeight: 700, background: "#111827", color: "#fff", cursor: "pointer", boxShadow: "0 6px 20px rgba(0,0,0,0.15)", width: 48, height: 48, display: "flex", alignItems: "center", justifyContent: "center", }, shell: { position: "fixed", right: 16, bottom: 16, zIndex: 10000, width, height, maxWidth: "95vw", maxHeight: "85vh", borderRadius: 16, overflow: "hidden", background: "#fff", boxShadow: "0 24px 60px rgba(0,0,0,0.25)", display: "flex", flexDirection: "column", // Keep mounted, hide when closed visibility: isOpen ? "visible" : "hidden", pointerEvents: isOpen ? "auto" : "none", }, header: { height: 48, background: "#111827", color: "#fff", display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 12px", }, iconBtn: { height: 28, minWidth: 28, padding: "0 8px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.2)", background: "transparent", color: "#fff", cursor: "pointer", fontSize: 12, }, body: { flex: 1, minHeight: 0, background: "#fff" }, error: { color: "#b91c1c", background: "#fee2e2", border: "1px solid #fecaca", borderRadius: 10, margin: 8, padding: "6px 10px", fontSize: 12, }, };
+
+return ( <> {/* Launcher when closed */} {!isOpen && !isMinimized && ( <button style={styles.launcherBtn} onClick={() => mounted.current && setIsOpen(true)} aria-label="Open chat" title="Open chat" > 💬 </button> )}
+
+{/* Minimized -> show only round icon */}
+  {isMinimized && (
+    <button
+      style={styles.launcherBtn}
+      onClick={() => { if (mounted.current) { setIsOpen(true); setIsMinimized(false); } }}
+      aria-label="Open chat"
+      title="Open chat"
+    >
+      💬
+    </button>
+  )}
+
+  {/* Chat shell (always mounted) */}
+  <div style={styles.shell}>
+    <div style={styles.header}>
+      <div style={{ fontSize: 14, fontWeight: 700 }}>{title}</div>
+      <div style={{ display: "flex", gap: 8 }}>
+        <button style={styles.iconBtn} onClick={() => mounted.current && setIsExpanded(v => !v)} title={isExpanded ? "Collapse" : "Expand"}>
+          {isExpanded ? "⤢" : "⤡"}
+        </button>
+        <button style={styles.iconBtn} onClick={() => handleMinimize()} title="Minimize">▃</button>
+        <button style={styles.iconBtn} onClick={() => handleClose()} title="Close">✕</button>
+      </div>
+    </div>
+
+    {/* Optional error slot */}
+    {error && <div style={styles.error}>⚠️ {error}</div>}
+
+    <div style={styles.body}>
+      <ChatBot
+        hideHeader
+        hideUserAvatar
+        botDelay={300}
+        customDelay={300}
+        steps={steps}
+        contentStyle={{ height: "100%" }}
+        style={{ width: "100%", height: "100%", borderRadius: 0 }}
+        theme={mergedTheme}
+      />
+    </div>
+  </div>
+</>
+
+); }
+
