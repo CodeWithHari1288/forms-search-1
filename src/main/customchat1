@@ -199,3 +199,48 @@ export default function Page() {
     />
   );
 }
+
+
+
+
+
+# app.py
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
+
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://localhost:3000", "*"],  # dev only
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class Message(BaseModel):
+    role: str              # "user" | "assistant" | "system"
+    content: str
+
+class ChatRequest(BaseModel):
+    messages: List[Message]
+
+class ChatResponse(BaseModel):
+    answer: str
+    suggestions: List[str]
+    retriever_query: Optional[str] = None
+    documents: List[str] = []
+
+# ---- import your RAG graph (rewrite -> retrieve -> answer -> suggest) ----
+# from my_rag_graph import run_graph   # should accept {messages:[...]} and return state
+
+@app.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest):
+    # Call your graph. Example below assumes run_graph returns dict-like state:
+    final = run_graph({"messages": [m.model_dump() for m in req.messages]})
+    return ChatResponse(
+        answer=final.get("answer") or "",
+        suggestions=final.get("suggestions") or [],
+        retriever_query=final.get("retriever_query"),
+        documents=final.get("documents") or [],
+    )
