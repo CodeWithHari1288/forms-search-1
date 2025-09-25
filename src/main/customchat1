@@ -173,3 +173,29 @@ function Bubble({ role, text }) { const isUser = role === "user"; const align = 
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); } function formatErr(e) { return typeof e === "string" ? e : (e?.message || JSON.stringify(e)); }
 
+
+
+
+
+
+
+import ResizableChat from "./ResizableChat";
+
+export default function Page() {
+  return (
+    <ResizableChat
+      title="Assistant"
+      initialOpen={false}
+      onSend={async (messages, controller) => {
+        const res = await fetch("http://localhost:8000/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messages }),
+          signal: controller?.signal, // optional
+        });
+        const data = await res.json(); // { answer, suggestions }
+        return { text: data.answer, suggestions: data.suggestions || [] };
+      }}
+    />
+  );
+}
