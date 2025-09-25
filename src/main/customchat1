@@ -1,0 +1,175 @@
+import React, { useEffect, useMemo, useRef, useState, useCallback } from "react"; // Optional: npm i react-rnd import { Rnd } from "react-rnd";
+
+/**
+
+ResizableChat.jsx
+
+
+---
+
+A custom chat widget that replaces react-simple-chatbot.
+
+Floating launcher (💬)
+
+
+Draggable + resizable window (via react-rnd)
+
+
+Message bubbles (user/assistant)
+
+
+Bottom-anchored composer (Enter to send, Shift+Enter newline)
+
+
+Suggestion chips under bot messages
+
+
+Stop/Regenerate controls
+
+
+Pluggable backend via onSend(messages, controller)
+
+
+Usage:
+
+<ResizableChat onSend={async (messages, controller) => {
+
+const res = await fetch("http://localhost:8000/chat", {
+
+method: "POST",
+
+headers: { "Content-Type": "application/json" },
+
+body: JSON.stringify({ messages }),
+
+signal: controller.signal,
+
+});
+
+const data = await res.json();
+
+// expected: { answer: string, suggestions?: string[] }
+
+return { text: data.answer, suggestions: data.suggestions || [] };
+
+}}/> */
+
+
+export default function ResizableChat({ title = "Assistant", initialOpen = false, initialPos = { x: 0, y: 0 }, // auto set if null initialSize = { width: 380, height: 520 }, minSize = { width: 320, height: 420 }, onSend, welcome = "Hi! Ask me anything.", }) { const [isOpen, setIsOpen] = useState(initialOpen); const [isBusy, setIsBusy] = useState(false); const [error, setError] = useState(""); const [input, setInput] = useState(""); const [lastBotSuggestions, setLastBotSuggestions] = useState([]); const [size, setSize] = useState(initialSize); const [position, setPosition] = useState(() => { if (initialPos && (initialPos.x !== 0 || initialPos.y !== 0)) return initialPos; // default: bottom-right with margin if (typeof window !== "undefined") { return { x: window.innerWidth - initialSize.width - 16, y: window.innerHeight - initialSize.height - 16 }; } return { x: 24, y: 24 }; });
+
+const mounted = useRef(false); useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+
+const [messages, setMessages] = useState(() => ( welcome ? [{ role: "assistant", content: welcome }] : [] ));
+
+const listRef = useRef(null); useEffect(() => { if (!listRef.current) return; listRef.current.scrollTop = listRef.current.scrollHeight; }, [messages, isOpen, size]);
+
+const safeSet = (fn) => { if (mounted.current) fn(); };
+
+const sendMessage = useCallback(async (text) => { const trimmed = (text ?? input).trim(); if (!trimmed || isBusy) return;
+
+safeSet(() => { setError(""); setIsBusy(true); setLastBotSuggestions([]); });
+
+setMessages((prev) => [...prev, { role: "user", content: trimmed }]);
+setInput("");
+
+const controller = new AbortController();
+try {
+  let out = { text: "(no response)", suggestions: [] };
+  if (typeof onSend === "function") {
+    const res = await onSend([...messages, { role: "user", content: trimmed }], controller);
+    if (res && typeof res.text === "string") out.text = res.text;
+    if (res && Array.isArray(res.suggestions)) out.suggestions = res.suggestions;
+  } else {
+    await sleep(400);
+    out = { text: `You said: ${trimmed}`, suggestions: ["Explain simpler", "Show related", "Summarize"] };
+  }
+
+  safeSet(() => {
+    setMessages((prev) => [...prev, { role: "assistant", content: out.text }]);
+    setLastBotSuggestions(out.suggestions || []);
+  });
+} catch (e) {
+  if (e?.name !== "AbortError") safeSet(() => setError(formatErr(e)));
+} finally {
+  controller.abort();
+  safeSet(() => setIsBusy(false));
+}
+
+// eslint-disable-next-line react-hooks/exhaustive-deps }, [input, isBusy, onSend, messages]);
+
+const stop = () => { /* wire to backend stream abort if you stream */ }; const regenerate = () => { for (let i = messages.length - 1; i >= 0; i--) { if (messages[i].role === "user") return sendMessage(messages[i].content); } };
+
+const pickSuggestion = (s) => { if (!isBusy) sendMessage(s); };
+
+return ( <> {!isOpen && ( <button style={styles.launcher} onClick={() => setIsOpen(true)} aria-label="Open chat">💬</button> )}
+
+{isOpen && (
+    <Rnd
+      size={size}
+      position={position}
+      minWidth={minSize.width}
+      minHeight={minSize.height}
+      bounds="window"
+      onDragStop={(e, d) => setPosition({ x: d.x, y: d.y })}
+      onResizeStop={(e, dir, ref, delta, pos) => {
+        setSize({ width: ref.offsetWidth, height: ref.offsetHeight });
+        setPosition(pos);
+      }}
+      style={{ zIndex: 10000, borderRadius: 14, boxShadow: "0 24px 64px rgba(0,0,0,0.25)" }}
+      dragHandleClassName="chat-header"
+    >
+      <div style={styles.shell}>
+        {/* Header (drag handle) */}
+        <div className="chat-header" style={styles.header}>
+          <div style={{ fontWeight: 700 }}>{title}</div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button style={styles.hdrBtn} onClick={regenerate} disabled={isBusy} title="Regenerate">↻</button>
+            <button style={styles.hdrBtn} onClick={() => setIsOpen(false)} title="Close">✕</button>
+          </div>
+        </div>
+
+        {/* Messages */}
+        <div ref={listRef} style={styles.list}>
+          {messages.map((m, i) => (
+            <Bubble key={i} role={m.role} text={m.content} />
+          ))}
+          {lastBotSuggestions?.length > 0 && (
+            <div style={{ marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {lastBotSuggestions.map((s, i) => (
+                <button key={i} style={styles.suggestionChip} onClick={() => pickSuggestion(s)}>
+                  {s}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Error */}
+        {error && <div style={styles.error}>⚠️ {error}</div>}
+
+        {/* Composer */}
+        <div style={styles.composer}>
+          <textarea
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}
+            placeholder="Type your message…"
+            rows={1}
+            style={styles.textarea}
+            disabled={isBusy}
+          />
+          <button onClick={() => sendMessage()} disabled={!input.trim() || isBusy} style={styles.sendBtn} aria-label="Send">➤</button>
+        </div>
+      </div>
+    </Rnd>
+  )}
+</>
+
+); }
+
+function Bubble({ role, text }) { const isUser = role === "user"; const align = isUser ? "flex-end" : "flex-start"; const bubbleStyle = isUser ? styles.userBubble : styles.aiBubble; return ( <div style={{ width: "100%", display: "flex", justifyContent: align }}> <div style={bubbleStyle}> <div style={{ whiteSpace: "pre-wrap" }}>{text}</div> </div> </div> ); }
+
+// -------------------- Styles -------------------- const styles = { launcher: { position: "fixed", right: 16, bottom: 16, zIndex: 9999, width: 48, height: 48, borderRadius: 999, display: "flex", alignItems: "center", justifyContent: "center", border: "none", background: "#111827", color: "#fff", fontWeight: 800, fontSize: 18, boxShadow: "0 8px 24px rgba(0,0,0,0.25)", cursor: "pointer", }, shell: { display: "flex", flexDirection: "column", width: "100%", height: "100%", background: "#fff", border: "1px solid #e5e7eb", borderRadius: 14, overflow: "hidden", }, header: { height: 44, background: "#111827", color: "#fff", display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 10px", cursor: "move", }, list: { flex: 1, minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column", gap: 10, padding: 12, background: "#ffffff", }, composer: { display: "flex", alignItems: "flex-end", gap: 8, padding: 10, background: "#ffffff", borderTop: "1px solid #e5e7eb", }, textarea: { flex: 1, minHeight: 20, maxHeight: 120, resize: "none", outline: "none", borderRadius: 12, padding: "10px 12px", border: "1px solid #e5e7eb", fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial", }, sendBtn: { borderRadius: 12, padding: "10px 12px", border: "1px solid #111827", background: "#111827", color: "white", fontWeight: 700, cursor: "pointer", }, suggestionChip: { border: "1px solid #e5e7eb", background: "#f8fafc", borderRadius: 999, padding: "6px 10px", fontSize: 12, cursor: "pointer", }, userBubble: { maxWidth: "80%", background: "#111827", color: "#fff", borderRadius: 14, padding: "10px 12px", boxShadow: "0 6px 18px rgba(0,0,0,0.15)", }, aiBubble: { maxWidth: "85%", background: "#f8fafc", color: "#111827", borderRadius: 14, padding: "10px 12px", border: "1px solid #e5e7eb", boxShadow: "0 6px 16px rgba(0,0,0,0.08)", }, error: { color: "#b91c1c", background: "#fee2e2", border: "1px solid #fecaca", borderRadius: 10, margin: "6px 10px", padding: "6px 10px", fontSize: 12, }, };
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); } function formatErr(e) { return typeof e === "string" ? e : (e?.message || JSON.stringify(e)); }
+
