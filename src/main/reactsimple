@@ -1,0 +1,264 @@
+import React, { useMemo, useState } from "react";
+import ChatBot from "react-simple-chatbot";
+// Uncomment next line if you install react-rnd for drag+resize
+// import { Rnd } from "react-rnd";
+
+/**
+ * FloatingChatbot
+ * - Fixed bottom-right widget
+ * - Toggle open/close
+ * - Expand/collapse (larger panel)
+ * - Optional: make resizable/draggable by un-commenting Rnd code
+ */
+export default function FloatingChatbot({
+  title = "Assistant",
+  initialOpen = false,
+  theme = {},
+  steps: externalSteps,
+}) {
+  const [isOpen, setIsOpen] = useState(initialOpen);
+  const [isExpanded, setIsExpanded] = useState(false);
+  const [isMinimized, setIsMinimized] = useState(false);
+
+  // Sizes
+  const collapsedSize = { width: 340, height: 460 };
+  const expandedSize = { width: 520, height: 640 };
+
+  // Compute style based on state
+  const { width, height } = isExpanded ? expandedSize : collapsedSize;
+
+  // Example steps if none are provided
+  const defaultSteps = useMemo(
+    () => [
+      { id: "start", message: "Hi! How can I help today?", trigger: "ask" },
+      { id: "ask", user: true, trigger: "answer" },
+      {
+        id: "answer",
+        message:
+          "Got it! (This is a demo answer.) You can wire this to your API.",
+        end: true,
+      },
+    ],
+    []
+  );
+
+  const steps = externalSteps && externalSteps.length ? externalSteps : defaultSteps;
+
+  // Basic theme (you can override via props.theme)
+  const mergedTheme = {
+    background: "#ffffff",
+    fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial",
+    headerBgColor: "#111827", // slate-900
+    headerFontColor: "#ffffff",
+    headerFontSize: "16px",
+    botBubbleColor: "#111827",
+    botFontColor: "#ffffff",
+    userBubbleColor: "#e5e7eb", // gray-200
+    userFontColor: "#111827",
+    ...theme,
+  };
+
+  // Simple styles (no Tailwind needed)
+  const styles = {
+    launcherBtn: {
+      position: "fixed",
+      right: 16,
+      bottom: 16,
+      zIndex: 9999,
+      borderRadius: 999,
+      padding: "12px 16px",
+      border: "none",
+      fontWeight: 600,
+      background: "#111827",
+      color: "#fff",
+      cursor: "pointer",
+      boxShadow: "0 6px 20px rgba(0,0,0,0.15)",
+    },
+    shell: {
+      position: "fixed",
+      right: 16,
+      bottom: 16,
+      zIndex: 10000,
+      width,
+      height,
+      maxWidth: "95vw",
+      maxHeight: "85vh",
+      borderRadius: 16,
+      overflow: "hidden",
+      background: "#fff",
+      boxShadow: "0 24px 60px rgba(0,0,0,0.25)",
+      display: isOpen ? "flex" : "none",
+      flexDirection: "column",
+    },
+    header: {
+      height: 48,
+      background: "#111827",
+      color: "#fff",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      padding: "0 12px",
+    },
+    headerTitle: { fontSize: 14, fontWeight: 600 },
+    headerActions: { display: "flex", gap: 8 },
+    iconBtn: {
+      height: 28,
+      minWidth: 28,
+      padding: "0 8px",
+      borderRadius: 8,
+      border: "1px solid rgba(255,255,255,0.2)",
+      background: "transparent",
+      color: "#fff",
+      cursor: "pointer",
+      fontSize: 12,
+    },
+    body: {
+      flex: 1,
+      minHeight: 0,
+      background: "#fff",
+    },
+    minimizedBar: {
+      position: "fixed",
+      right: 16,
+      bottom: 16,
+      zIndex: 10000,
+      width: 220,
+      height: 44,
+      background: "#111827",
+      color: "#fff",
+      borderRadius: 999,
+      boxShadow: "0 14px 40px rgba(0,0,0,0.2)",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      padding: "0 10px",
+      cursor: "pointer",
+    },
+  };
+
+  // Optional: wrap in react-rnd to drag/resize (uncomment if using Rnd)
+  const Shell = ({ children }) => {
+    // return (
+    //   <Rnd
+    //     default={{
+    //       x: window.innerWidth - width - 16,
+    //       y: window.innerHeight - height - 16,
+    //       width,
+    //       height,
+    //     }}
+    //     minWidth={320}
+    //     minHeight={380}
+    //     bounds="window"
+    //     enableResizing={{
+    //       bottom: true,
+    //       bottomLeft: true,
+    //       bottomRight: true,
+    //       left: false,
+    //       right: true,
+    //       top: false,
+    //       topLeft: false,
+    //       topRight: false,
+    //     }}
+    //     style={{ zIndex: 10000, borderRadius: 16, overflow: "hidden", boxShadow: styles.shell.boxShadow }}
+    //   >
+    //     {children}
+    //   </Rnd>
+    // );
+    return <div style={styles.shell}>{children}</div>;
+  };
+
+  if (isMinimized && !isOpen) {
+    return (
+      <div
+        style={styles.minimizedBar}
+        role="button"
+        aria-label="Open chat"
+        onClick={() => {
+          setIsOpen(true);
+          setIsMinimized(false);
+        }}
+      >
+        <span style={{ fontSize: 13, fontWeight: 600 }}>{title}</span>
+        <span style={{ opacity: 0.8, fontSize: 12 }}>Tap to open</span>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      {/* Launcher */}
+      {!isOpen && !isMinimized && (
+        <button
+          style={styles.launcherBtn}
+          onClick={() => setIsOpen(true)}
+          aria-label="Open chat"
+        >
+          💬 Chat
+        </button>
+      )}
+
+      {/* Chat Shell */}
+      <Shell>
+        <div style={styles.header}>
+          <div style={styles.headerTitle}>{title}</div>
+          <div style={styles.headerActions}>
+            <button
+              style={styles.iconBtn}
+              onClick={() => setIsExpanded((v) => !v)}
+              title={isExpanded ? "Collapse" : "Expand"}
+              aria-label={isExpanded ? "Collapse" : "Expand"}
+            >
+              {isExpanded ? "⤢" : "⤡"}
+            </button>
+            <button
+              style={styles.iconBtn}
+              onClick={() => {
+                setIsOpen(false);
+                setIsMinimized(true);
+              }}
+              title="Minimize"
+              aria-label="Minimize"
+            >
+              ▃
+            </button>
+            <button
+              style={styles.iconBtn}
+              onClick={() => {
+                setIsOpen(false);
+                setIsExpanded(false);
+                setIsMinimized(false);
+              }}
+              title="Close"
+              aria-label="Close"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+
+        <div style={styles.body}>
+          <ChatBot
+            key={`${isExpanded ? "expanded" : "collapsed"}`} // re-mount if size mode changes
+            headerTitle={null} // we already render our own header
+            hideHeader
+            hideUserAvatar
+            hideBotAvatar={false}
+            botDelay={300}
+            customDelay={300}
+            recognitionEnable={false}
+            steps={steps}
+            contentStyle={{ height: "100%" }}
+            style={{
+              width: "100%",
+              height: "100%",
+              borderRadius: 0,
+            }}
+            // theme docs: https://www.npmjs.com/package/react-simple-chatbot
+            // @ts-ignore
+            theme={mergedTheme}
+          />
+        </div>
+      </Shell>
+    </>
+  );
+}
