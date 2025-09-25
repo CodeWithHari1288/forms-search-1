@@ -1,0 +1,220 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+/**
+
+
+
+---
+
+A single-file, dependency-free React chat UI that feels like CopilotKit's
+
+chat window (floating launcher → side panel, message list, composer,
+
+suggestions, typing indicator, Stop/Regenerate, etc.).
+
+✅ Works in any React app (no Next.js / Tailwind / shadcn required)
+
+✅ Floating widget with open/close and expand to tall mode
+
+✅ Suggestions ("quick prompts") row
+
+✅ Typing/Generating indicator with animated dots
+
+✅ Stop / Regenerate controls for the current turn
+
+✅ Keyboard shortcuts: Enter to send, Shift+Enter for newline, Esc to close
+
+✅ Pluggable back-end: pass an onSend prop; default demo calls /chat
+
+Usage:
+
+import CopilotLikeChat from "./CopilotLikeChat";
+
+<CopilotLikeChat onSend={async (messages, controller) => {
+
+// Call your API here. Example with fetch streaming or simple JSON.
+
+const res = await fetch("/chat", {
+
+method: "POST",
+
+headers: { "Content-Type": "application/json" },
+
+body: JSON.stringify({ messages }),
+
+signal: controller.signal,
+
+});
+
+const data = await res.json();
+
+return data.text ?? "(no response)";
+
+}} />
+
+Notes:
+
+If you want true SSE/streaming, use the controller signal and update
+
+
+partial text via an optional onPartial(aiText) callback prop.
+
+Style is done with inline objects for portability; tweak to match your app. */
+
+
+
+export default function CopilotLikeChat({ title = "Assistant", placeholder = "Ask anything…", initialOpen = false, initialExpanded = false, suggestions = [ "Summarize this page", "What can you do?", "Explain like I'm five", "Draft an email reply", ], onSend,            // async (messagesArray, controller) => string | Promise<string> onPartial,         // optional (aiPartialText) => void (for streaming) welcome = "Hi! I'm your AI assistant. How can I help today?", }) { const [isOpen, setIsOpen] = useState(initialOpen); const [isExpanded, setIsExpanded] = useState(initialExpanded); const [isBusy, setIsBusy] = useState(false); const [error, setError] = useState(""); const [input, setInput] = useState(""); const [stopController, setStopController] = useState(null);
+
+// messages: [{ role: 'user'|'assistant'|'system', content: string }] const [messages, setMessages] = useState(() => [ { role: "assistant", content: welcome }, ]);
+
+const shellRef = useRef(null); const listRef = useRef(null); const inputRef = useRef(null);
+
+// Auto-scroll to bottom on new messages useEffect(() => { if (!listRef.current) return; listRef.current.scrollTop = listRef.current.scrollHeight; }, [messages, isOpen, isExpanded]);
+
+// Close on Escape useEffect(() => { function onKey(e) { if (e.key === "Escape") setIsOpen(false); } window.addEventListener("keydown", onKey); return () => window.removeEventListener("keydown", onKey); }, []);
+
+const sendMessage = useCallback(async (text) => { const trimmed = (text ?? input).trim(); if (!trimmed || isBusy) return;
+
+setError("");
+setIsBusy(true);
+
+// Push user message
+setMessages((prev) => [...prev, { role: "user", content: trimmed }]);
+setInput("");
+
+const controller = new AbortController();
+setStopController(controller);
+
+try {
+  let aiText = "";
+
+  if (typeof onSend === "function") {
+    // Allow streaming via onPartial callback
+    const res = onSend([...messages, { role: "user", content: trimmed }], controller);
+
+    if (res && typeof res.then === "function") {
+      // Promise path
+      aiText = await res;
+    } else if (typeof res === "string") {
+      aiText = res;
+    } else {
+      aiText = "(No response)";
+    }
+  } else {
+    // Default demo: echo back
+    await sleep(600);
+    aiText = `You said: ${trimmed}`;
+  }
+
+  setMessages((prev) => [...prev, { role: "assistant", content: aiText }]);
+} catch (err) {
+  if (err?.name === "AbortError") {
+    setMessages((prev) => [...prev, { role: "assistant", content: "(stopped)" }]);
+  } else {
+    setError(formatErr(err));
+  }
+} finally {
+  controller.abort();
+  setStopController(null);
+  setIsBusy(false);
+}
+
+// eslint-disable-next-line react-hooks/exhaustive-deps }, [input, isBusy, onSend, messages]);
+
+const onKeyDown = (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } };
+
+const stop = () => { if (stopController) stopController.abort(); };
+
+const regenerate = () => { // Find last user turn and resend it for (let i = messages.length - 1; i >= 0; i--) { if (messages[i].role === "user") { return sendMessage(messages[i].content); } } };
+
+const quickSend = (prompt) => { if (isBusy) return; setInput(prompt); // small delay so UI updates input before send setTimeout(() => sendMessage(prompt), 10); };
+
+// Sizing const size = isExpanded ? { width: 420, height: 640 } : { width: 360, height: 520 };
+
+return ( <div> {!isOpen && ( <button onClick={() => setIsOpen(true)} style={styles.launcher} aria-label="Open chat" > 💬 Ask AI </button> )}
+
+{isOpen && (
+    <div ref={shellRef} style={{ ...styles.shell, width: size.width, height: size.height }}>
+      <Header
+        title={title}
+        isExpanded={isExpanded}
+        onExpand={() => setIsExpanded((v) => !v)}
+        onMinimize={() => setIsOpen(false)}
+      />
+
+      {/* Suggestions */}
+      {!!suggestions?.length && (
+        <div style={styles.suggestionsWrap}>
+          {suggestions.map((s, i) => (
+            <button key={i} style={styles.suggestion} onClick={() => quickSend(s)}>
+              {s}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* Messages */}
+      <div ref={listRef} style={styles.list}>
+        {messages.map((m, idx) => (
+          <Bubble key={idx} role={m.role} text={m.content} />
+        ))}
+        {isBusy && <ThinkingBubble />}
+      </div>
+
+      {/* Error */}
+      {error && (
+        <div style={styles.error}>⚠️ {error}</div>
+      )}
+
+      {/* Controls */}
+      <div style={styles.controlsRow}>
+        <button
+          onClick={stop}
+          disabled={!isBusy}
+          style={{ ...styles.ctrlBtn, opacity: isBusy ? 1 : 0.5 }}
+        >
+          Stop
+        </button>
+        <button onClick={regenerate} disabled={isBusy} style={{ ...styles.ctrlBtn, opacity: isBusy ? 0.5 : 1 }}>
+          Regenerate
+        </button>
+      </div>
+
+      {/* Composer */}
+      <div style={styles.composerWrap}>
+        <textarea
+          ref={inputRef}
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={onKeyDown}
+          placeholder={placeholder}
+          rows={1}
+          style={styles.textarea}
+        />
+        <button
+          onClick={() => sendMessage()}
+          disabled={!input.trim() || isBusy}
+          style={{ ...styles.sendBtn, opacity: !input.trim() || isBusy ? 0.6 : 1 }}
+          aria-label="Send"
+        >
+          ➤
+        </button>
+      </div>
+    </div>
+  )}
+</div>
+
+); }
+
+function Header({ title, isExpanded, onExpand, onMinimize }) { return ( <div style={styles.header}> <div style={{ display: "flex", alignItems: "center", gap: 10 }}> <div style={styles.logo}>⚡</div> <div style={{ fontWeight: 700 }}>{title}</div> </div> <div style={{ display: "flex", gap: 8 }}> <button style={styles.iconBtn} onClick={onExpand} title={isExpanded ? "Collapse" : "Expand"}> {isExpanded ? "⤢" : "⤡"} </button> <button style={styles.iconBtn} onClick={onMinimize} title="Close">✕</button> </div> </div> ); }
+
+function Bubble({ role, text }) { const isUser = role === "user"; const align = isUser ? "flex-end" : "flex-start"; const bubbleStyle = isUser ? styles.userBubble : styles.aiBubble; return ( <div style={{ width: "100%", display: "flex", justifyContent: align }}> <div style={bubbleStyle}> {!isUser && <div style={styles.roleTag}>AI</div>} <div style={{ whiteSpace: "pre-wrap" }}>{text}</div> </div> </div> ); }
+
+function ThinkingBubble() { return ( <div style={{ width: "100%", display: "flex", justifyContent: "flex-start" }}> <div style={styles.aiBubble}> <div style={styles.roleTag}>AI</div> <TypingDots /> </div> </div> ); }
+
+function TypingDots() { const [dot, setDot] = useState(0); useEffect(() => { const id = setInterval(() => setDot((d) => (d + 1) % 3), 400); return () => clearInterval(id); }, []); return <div style={{ opacity: 0.9 }}>{"…".slice(0, dot + 1)}</div>; }
+
+const styles = { launcher: { position: "fixed", right: 16, bottom: 16, zIndex: 9999, borderRadius: 999, padding: "10px 14px", border: "1px solid #e5e7eb", background: "#111827", color: "white", fontWeight: 700, boxShadow: "0 10px 30px rgba(0,0,0,0.25)", cursor: "pointer", }, shell: { position: "fixed", right: 16, bottom: 16, zIndex: 10000, background: "#ffffff", border: "1px solid #e5e7eb", borderRadius: 16, boxShadow: "0 24px 64px rgba(0,0,0,0.25)", display: "flex", flexDirection: "column", overflow: "hidden", maxWidth: "95vw", maxHeight: "85vh", }, header: { height: 48, background: "#111827", color: "white", display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 12px", }, logo: { width: 22, height: 22, borderRadius: 6, background: "#22c55e", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, }, suggestionsWrap: { display: "flex", flexWrap: "wrap", gap: 8, padding: 10, borderBottom: "1px solid #f1f5f9", }, suggestion: { borderRadius: 999, padding: "6px 10px", border: "1px solid #e5e7eb", background: "#f8fafc", fontSize: 12, cursor: "pointer", }, list: { flex: 1, minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column", gap: 10, padding: 12, background: "#ffffff", }, roleTag: { display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, color: "#111827", background: "#e5e7eb", borderRadius: 999, padding: "2px 6px", marginBottom: 6, }, userBubble: { maxWidth: "80%", background: "#111827", color: "white", borderRadius: 14, padding: "10px 12px", boxShadow: "0 6px 18px rgba(0,0,0,0.15)", }, aiBubble: { maxWidth: "85%", background: "#f8fafc", color: "#111827", borderRadius: 14, padding: "10px 12px", border: "1px solid #e5e7eb", boxShadow: "0 6px 16px rgba(0,0,0,0.08)", }, controlsRow: { display: "flex", gap: 8, padding: "6px 10px", borderTop: "1px solid #f1f5f9", background: "#fff", }, ctrlBtn: { borderRadius: 10, padding: "6px 10px", border: "1px solid #e5e7eb", background: "#fff", fontSize: 12, cursor: "pointer", }, composerWrap: { display: "flex", alignItems: "flex-end", gap: 8, padding: 10, borderTop: "1px solid #f1f5f9", background: "#ffffff", }, textarea: { flex: 1, minHeight: 20, maxHeight: 120, resize: "none", outline: "none", borderRadius: 12, padding: "10px 12px", border: "1px solid #e5e7eb", fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial", }, sendBtn: { borderRadius: 12, padding: "10px 12px", border: "1px solid #111827", background: "#111827", color: "white", fontWeight: 700, cursor: "pointer", }, error: { color: "#b91c1c", background: "#fee2e2", border: "1px solid #fecaca", borderRadius: 10, margin: "6px 10px", padding: "6px 10px", fontSize: 12, }, };
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); } function formatErr(e) { if (!e) return "Unknown error"; if (typeof e === "string") return e; if (e.message) return e.message; return JSON.stringify(e); }
+
