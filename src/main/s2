@@ -1,0 +1,134 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+
+/**
+
+ServiceNowStyleChat.jsx
+
+
+---
+
+A dependency‑free React TSX chat widget styled like ServiceNow Virtual Agent.
+
+Floating 💬 launcher → panel
+
+
+Agent (left) / User (right) bubbles
+
+
+Bottom‑anchored composer (Enter to send, Shift+Enter for newline)
+
+
+Suggestion chips below bot messages
+
+
+Pure React, no external UI libs */
+
+
+
+const defaultSuggestions = (): string[] => [ "Search knowledge", "Raise an incident", "Check ticket status", ];
+
+const ServiceNowStyleChat = ({ title = "Virtual Agent", initialOpen = false, welcome = "Hi! I'm your Virtual Agent. How can I help today?", brandColor = "#118a00", onSend, // New banner props bannerText = "", bannerColor = "#f1f5f9", bannerTextColor = "#111827", bannerIcon = "ℹ️", bannerDismissible = true, }) => { const [isOpen, setIsOpen] = useState<boolean>(initialOpen); const [isExpanded, setIsExpanded] = useState<boolean>(false); const [input, setInput] = useState<string>(""); const [isBusy, setIsBusy] = useState<boolean>(false); const [messages, setMessages] = useState<ChatMessage[]>(() => welcome ? [{ role: "assistant", content: welcome }] : [] );
+
+const [bannerVisible, setBannerVisible] = useState(Boolean(bannerText)); const listRef = useRef(null);
+
+useEffect(() => { if (!listRef.current) return; listRef.current.scrollTop = listRef.current.scrollHeight; }, [messages, isOpen, isExpanded]);
+
+const size = useMemo(() => (isExpanded ? { width: 420, height: 640 } : { width: 360, height: 520 }), [isExpanded]);
+
+async function handleSend(text?: string) { const trimmed = (text ?? input).trim(); if (!trimmed || isBusy) return;
+
+setIsBusy(true);
+setMessages((prev) => [...prev, { role: "user", content: trimmed }]);
+setInput("");
+
+try {
+  let result: { text: string; suggestions?: string[] } = { text: `You said: ${trimmed}`, suggestions: [] };
+  if (typeof onSend === "function") {
+    const out = await onSend([...messages, { role: "user", content: trimmed }]);
+    if (out && typeof out.text === "string") result.text = out.text;
+    if (out && Array.isArray(out.suggestions)) result.suggestions = out.suggestions;
+  }
+  setMessages((prev) => [
+    ...prev,
+    { role: "assistant", content: result.text, suggestions: result.suggestions },
+  ]);
+} catch (e: any) {
+  setMessages((prev) => [
+    ...prev,
+    { role: "assistant", content: `Sorry, something went wrong: ${e?.message ?? String(e)}` },
+  ]);
+} finally {
+  setIsBusy(false);
+}
+
+}
+
+return ( <div> {!isOpen && ( <button style={styles.launcher(brandColor)} onClick={() => setIsOpen(true)} aria-label="Open chat" title="Open chat" > 💬 </button> )}
+
+{isOpen && (
+    <div style={styles.shell(size)}>
+      <Header
+        title={title}
+        brandColor={brandColor}
+        onClose={() => { setIsOpen(false); setIsExpanded(false); }}
+        onExpand={() => setIsExpanded((v) => !v)}
+        isExpanded={isExpanded}
+      />
+
+      {/* Top banner */}
+      {/* Scrollable content area with sticky banner */}
+      <div style={styles.contentWrap}>
+        {bannerVisible && bannerText && (
+          <div style={styles.banner(bannerColor, bannerTextColor)}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span aria-hidden>{bannerIcon}</span>
+              <span>{bannerText}</span>
+            </div>
+            {bannerDismissible && (
+              <button style={styles.bannerClose} onClick={() => setBannerVisible(false)} aria-label="Dismiss banner">✕</button>
+            )}
+          </div>
+        )}
+
+        <div ref={listRef} style={styles.list}>
+        {messages.map((m, i) => (
+          <MessageBubble key={i} msg={m} brandColor={brandColor} onPick={(s) => handleSend(s)} />
+        ))}
+      </div>
+
+      <Composer
+        value={input}
+        onChange={setInput}
+        onSend={() => handleSend()}
+        disabled={isBusy}
+      />
+    </div>
+  )}
+</div>
+
+); };
+
+export default ServiceNowStyleChat;
+
+// -------------------- Subcomponents --------------------
+
+const Header = ({ title, brandColor, onClose, onExpand, isExpanded }) => ({ title, brandColor, onClose, onExpand, isExpanded }) => (
+
+  <div style={styles.header(brandColor)}>
+    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+      <div style={styles.logo}>🤖</div>
+      <div style={{ fontWeight: 700 }}>{title}</div>
+    </div>
+    <div style={{ display: "flex", gap: 8 }}>
+      <button style={styles.hdrBtn} onClick={onExpand} title={isExpanded ? "Collapse" : "Expand"}>
+        {isExpanded ? "⤢" : "⤡"}
+      </button>
+      <button style={styles.hdrBtn} onClick={onClose} title="Close">✕</button>
+    </div>
+  </div>
+);const MessageBubble = ({ msg, brandColor, onPick }) => {{ msg, brandColor, onPick }) => { const isUser = msg.role === "user"; const bubbleStyle = isUser ? styles.userBubble : styles.agentBubble(brandColor); return ( <div style={{ width: "100%", display: "flex", justifyContent: isUser ? "flex-end" : "flex-start" }}> <div style={bubbleStyle}> <div style={{ whiteSpace: "pre-wrap" }}>{msg.content}</div> {!!msg.suggestions?.length && ( <div style={styles.suggestionsRow}> {msg.suggestions.map((s, i) => ( <button key={i} style={styles.suggestionChip} onClick={() => onPick(s)}>{s}</button> ))} </div> )} </div> </div> ); };
+
+const Composer = ({ value, onChange, onSend, disabled }) => {{ value, onChange, onSend, disabled }) => { const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); onSend(); } }; return ( <div style={styles.composerWrap}> <textarea value={value} onChange={(e) => onChange(e.target.value)} onKeyDown={onKeyDown} placeholder="Describe your issue or ask a question…" rows={1} disabled={disabled} style={styles.textarea} /> <button onClick={onSend} disabled={!value.trim() || !!disabled} style={styles.sendBtn} aria-label="Send">➤</button> </div> ); };
+
+// -------------------- Styles -------------------- const styles = { contentWrap: { flex: 1, minHeight: 0, overflowY: 'auto', display: 'flex', flexDirection: 'column', }, banner: (bg, color) => ({ position: 'sticky', top: 0, zIndex: 1, display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 10px', background: bg, color, borderBottom: '1px solid #e5e7eb', }), bannerClose: { border: '1px solid #e5e7eb', background: '#ffffff', borderRadius: 8, padding: '2px 8px', cursor: 'pointer', }, launcher: (brandColor) => ({ position: "fixed", right: 16, bottom: 16, zIndex: 9999, width: 48, height: 48, borderRadius: 999, display: "flex", alignItems: "center", justifyContent: "center", border: "none", background: brandColor, color: "#fff", fontWeight: 800, fontSize: 18, boxShadow: "0 8px 24px rgba(0,0,0,0.25)", cursor: "pointer", }), shell: (size) => ({ position: "fixed", right: 16, bottom: 16, zIndex: 10000, width: size.width, height: size.height, maxWidth: "95vw", maxHeight: "85vh", background: "#fff", border: "1px solid #e5e7eb", borderRadius: 14, boxShadow: "0 24px 64px rgba(0,0,0,0.25)", display: "flex", flexDirection: "column", overflow: "hidden", }), header: (brandColor) => ({ height: 44, background: brandColor, color: "#fff", display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 10px", }), logo: { width: 22, height: 22, borderRadius: 6, background: "#16a34a", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, }, list: { flex: 1, minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column", gap: 10, padding: 12, background: "#f9fafb", }, userBubble: { maxWidth: "80%", background: "#111827", color: "#fff", borderRadius: 14, padding: "10px 12px", boxShadow: "0 6px 18px rgba(0,0,0,0.15)", }, agentBubble: (brandColor) => ({ maxWidth: "82%", background: "#ffffff", color: "#111827", borderRadius: 14, padding: "10px 12px", border: 1px solid ${brandColor}33, boxShadow: "0 6px 16px rgba(0,0,0,0.08)", }), suggestionsRow: { marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap", }, suggestionChip: { border: "1px solid #e5e7eb", background: "#ffffff", borderRadius: 999, padding: "6px 10px", fontSize: 12, cursor: "pointer", }, composerWrap: { display: "flex", alignItems: "flex-end", gap: 8, padding: 10, background: "#ffffff", borderTop: "1px solid #e5e7eb", }, textarea: { flex: 1, minHeight: 20, maxHeight: 120, resize: "none", outline: "none", borderRadius: 12, padding: "10px 12px", border: "1px solid #e5e7eb", fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial", }, sendBtn: { borderRadius: 12, padding: "10px 12px", border: "1px solid #111827", background: "#111827", color: "white", fontWeight: 700, cursor: "pointer", }, };
+
