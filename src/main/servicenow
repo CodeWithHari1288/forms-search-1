@@ -305,3 +305,48 @@ suggestionChip: {
     ))}
   </div>
 </div>
+
+
+
+
+
+contentWrap: {
+  flex: 1,
+  minHeight: 0,
+  overflowY: "auto",      // <-- vertical scrolling happens here
+  display: "flex",
+  flexDirection: "column",
+},
+
+banner: (bg, color) => ({
+  position: "sticky",
+  top: 0,                 // <-- sticks to the top of contentWrap
+  zIndex: 1,
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  padding: "8px 10px",
+  background: bg,
+  color,
+  borderBottom: "1px solid #e5e7eb",
+}),
+
+bannerClose: {
+  border: "1px solid #e5e7eb",
+  background: "#ffffff",
+  borderRadius: 8,
+  padding: "2px 8px",
+  cursor: "pointer",
+},
+
+// Tweak list so parent handles scrolling
+list: {
+  flex: 1,
+  minHeight: 0,
+  overflowY: "visible",   // <-- let contentWrap handle scrolling
+  display: "flex",
+  flexDirection: "column",
+  gap: 10,
+  padding: 12,
+  background: "#f9fafb",
+},
