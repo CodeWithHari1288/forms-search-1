@@ -1,0 +1,65 @@
+import React, { useEffect, useMemo, useRef, useState } from "react"; import ReactDOM from "react-dom";
+
+/**
+
+Chatbot365.jsx — Microsoft 365–style chat widget
+
+Plain CSS version (no Tailwind) */
+
+
+const timeStr = () => new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+function useAutoscroll(dep) { const ref = useRef(null); useEffect(() => { const el = ref.current; if (el) el.scrollTop = el.scrollHeight + 9999; }, [dep]); return ref; }
+
+function PopoutWindow({ title = "Chat", onClose, children }) { const containerEl = useMemo(() => document.createElement("div"), []); const winRef = useRef(null); useEffect(() => { winRef.current = window.open("", title, "width=420,height=640,menubar=no,toolbar=no"); const win = winRef.current; if (!win) return; win.document.title = title; win.document.body.style.margin = "0"; win.document.body.appendChild(containerEl); const handleBeforeUnload = () => onClose && onClose(); win.addEventListener("beforeunload", handleBeforeUnload); return () => { try { win.removeEventListener("beforeunload", handleBeforeUnload); win.close(); } catch {} }; }, [containerEl, onClose, title]); return ReactDOM.createPortal(children, containerEl); }
+
+function SuggestionPill({ label, onClick }) { return ( <button onClick={onClick} className="cb-suggestion"> {label} </button> ); }
+
+function Bubble({ role, text }) { const mine = role === "user"; return ( <div className={mine ? "cb-bubble-row right" : "cb-bubble-row left"}> <div className={mine ? "cb-bubble user" : "cb-bubble assistant"}> {text} <div className="cb-time">{timeStr()}</div> </div> </div> ); }
+
+export default function Chatbot365({ apiBase = "http://localhost:8000", title = "Workspace Copilot", subtitle = "Ask anything about your work", initialSuggestions = ["What changed today?", "Show my open tasks", "Draft a status update"], detachDefault = false, startOpen = true, }) { const [messages, setMessages] = useState([]); const [input, setInput] = useState(""); const [busy, setBusy] = useState(false); const [error, setError] = useState(""); const [suggestions, setSuggestions] = useState(initialSuggestions.map(s => ({ label: s, prompt: s }))); const [minimized, setMinimized] = useState(!startOpen); const [detached, setDetached] = useState(detachDefault); const scrollerRef = useAutoscroll(messages.length); const inputRef = useRef(null);
+
+const sendToAPI = async (finalText) => { setBusy(true); setError(""); try { const res = await fetch(${apiBase}/chat, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messages: messages.concat([{ role: "user", content: finalText }]) }), }); if (!res.ok) throw new Error(HTTP ${res.status}); const data = await res.json(); setMessages((prev) => prev.concat([{ role: "assistant", text: data.text || "(No reply)" }])); if (Array.isArray(data.suggestions)) setSuggestions(data.suggestions); } catch (e) { setError(e.message || String(e)); } finally { setBusy(false); } };
+
+const onSubmit = async (e) => { e.preventDefault(); const finalText = input.trim(); if (!finalText || busy) return; setMessages((prev) => prev.concat([{ role: "user", text: finalText }])); setInput(""); await sendToAPI(finalText); };
+
+const onSuggestion = async (prompt) => { if (!prompt || busy) return; setMessages((prev) => prev.concat([{ role: "user", text: prompt }])); setInput(""); await sendToAPI(prompt); };
+
+const body = ( <div className="cb-container"> <div className="cb-header"> <div> <div className="cb-title">{title}</div> <div className="cb-subtitle">{subtitle}</div> </div> <div> <button onClick={() => setDetached((d) => !d)} className="cb-btn"> {detached ? "Attach" : "Pop out"} </button> <button onClick={() => setMinimized((m) => !m)} className="cb-btn"> {minimized ? "Open" : "Minimize"} </button> </div> </div>
+
+{!minimized && (
+    <>
+      <div ref={scrollerRef} className="cb-messages">
+        {messages.length === 0 && <div className="cb-empty">Ask about your data…</div>}
+        {messages.map((m, i) => <Bubble key={i} role={m.role} text={m.text} />)}
+      </div>
+
+      <div className="cb-suggestions">
+        {suggestions.map((s, i) => (
+          <SuggestionPill key={i} label={s.label || s.prompt} onClick={() => onSuggestion(s.prompt || s.label)} />
+        ))}
+      </div>
+
+      <form onSubmit={onSubmit} className="cb-composer">
+        <textarea
+          ref={inputRef}
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          placeholder={busy ? "Thinking…" : "Type a message"}
+          disabled={busy}
+        />
+        <button type="submit" disabled={busy || !input.trim()} className="cb-send">Send</button>
+      </form>
+      {error && <div className="cb-error">{error}</div>}
+    </>
+  )}
+</div>
+
+);
+
+const container = <div className="cb-widget">{body}</div>;
+
+return detached ? ( <PopoutWindow title={title} onClose={() => setDetached(false)}> <div className="cb-widget full">{body}</div> </PopoutWindow> ) : container; }
+
+// CSS styles const style = document.createElement("style"); style.innerHTML = .cb-widget { position:fixed; bottom:20px; right:20px; width:360px; height:520px; border:1px solid #ccc; border-radius:12px; background:#fff; display:flex; flex-direction:column; resize:both; overflow:hidden; font-family:sans-serif; box-shadow:0 4px 16px rgba(0,0,0,0.2); } .cb-widget.full { position:static; width:100%; height:100%; } .cb-header { display:flex; justify-content:space-between; align-items:center; padding:8px; border-bottom:1px solid #ddd; background:#f8f8f8; } .cb-title { font-weight:bold; font-size:14px; } .cb-subtitle { font-size:11px; color:#666; } .cb-btn { margin-left:4px; padding:2px 6px; font-size:11px; border:1px solid #ccc; border-radius:6px; background:#fff; cursor:pointer; } .cb-btn:hover { background:#eee; } .cb-messages { flex:1; padding:8px; overflow-y:auto; background:#fafafa; } .cb-bubble-row { display:flex; margin-bottom:6px; } .cb-bubble-row.right { justify-content:flex-end; } .cb-bubble-row.left { justify-content:flex-start; } .cb-bubble { max-width:70%; padding:8px 12px; border-radius:16px; font-size:13px; line-height:1.4; } .cb-bubble.user { background:#0078d4; color:#fff; } .cb-bubble.assistant { background:#fff; border:1px solid #ddd; } .cb-time { font-size:10px; opacity:0.6; margin-top:4px; } .cb-empty { color:#888; text-align:center; margin-top:40%; font-size:12px; } .cb-suggestions { padding:6px; border-top:1px solid #ddd; display:flex; flex-wrap:wrap; } .cb-suggestion { margin:2px; padding:4px 8px; border:1px solid #ccc; border-radius:12px; background:#fff; font-size:12px; cursor:pointer; } .cb-suggestion:hover { background:#f0f0f0; } .cb-composer { display:flex; border-top:1px solid #ddd; padding:6px; } .cb-composer textarea { flex:1; resize:none; font-size:13px; border:1px solid #ccc; border-radius:8px; padding:6px; } .cb-send { margin-left:6px; padding:6px 10px; font-size:13px; background:#0078d4; color:#fff; border:none; border-radius:8px; cursor:pointer; } .cb-send:disabled { background:#aaa; } .cb-error { color:red; font-size:11px; padding:4px; }; document.head.appendChild(style);
+
