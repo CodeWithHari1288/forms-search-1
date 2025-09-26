@@ -117,3 +117,35 @@ const Composer = ({ value, onChange, onSend, disabled }) => {{ value, onChange, 
 
 // -------------------- Styles -------------------- const styles = { launcher: (brandColor) => ({ position: "fixed", right: 16, bottom: 16, zIndex: 9999, width: 48, height: 48, borderRadius: 999, display: "flex", alignItems: "center", justifyContent: "center", border: "none", background: brandColor, color: "#fff", fontWeight: 800, fontSize: 18, boxShadow: "0 8px 24px rgba(0,0,0,0.25)", cursor: "pointer", }), shell: (size) => ({ position: "fixed", right: 16, bottom: 16, zIndex: 10000, width: size.width, height: size.height, maxWidth: "95vw", maxHeight: "85vh", background: "#fff", border: "1px solid #e5e7eb", borderRadius: 14, boxShadow: "0 24px 64px rgba(0,0,0,0.25)", display: "flex", flexDirection: "column", overflow: "hidden", }), header: (brandColor) => ({ height: 44, background: brandColor, color: "#fff", display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 10px", }), logo: { width: 22, height: 22, borderRadius: 6, background: "#16a34a", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, }, list: { flex: 1, minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column", gap: 10, padding: 12, background: "#f9fafb", }, userBubble: { maxWidth: "80%", background: "#111827", color: "#fff", borderRadius: 14, padding: "10px 12px", boxShadow: "0 6px 18px rgba(0,0,0,0.15)", }, agentBubble: (brandColor) => ({ maxWidth: "82%", background: "#ffffff", color: "#111827", borderRadius: 14, padding: "10px 12px", border: 1px solid ${brandColor}33, boxShadow: "0 6px 16px rgba(0,0,0,0.08)", }), suggestionsRow: { marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap", }, suggestionChip: { border: "1px solid #e5e7eb", background: "#ffffff", borderRadius: 999, padding: "6px 10px", fontSize: 12, cursor: "pointer", }, composerWrap: { display: "flex", alignItems: "flex-end", gap: 8, padding: 10, background: "#ffffff", borderTop: "1px solid #e5e7eb", }, textarea: { flex: 1, minHeight: 20, maxHeight: 120, resize: "none", outline: "none", borderRadius: 12, padding: "10px 12px", border: "1px solid #e5e7eb", fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial", }, sendBtn: { borderRadius: 12, padding: "10px 12px", border: "1px solid #111827", background: "#111827", color: "white", fontWeight: 700, cursor: "pointer", }, };
 
+
+
+const Composer = ({ value, onChange, onSend, disabled }) => {
+  const onKeyDown = (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      onSend();
+    }
+  };
+
+  return (
+    <div style={styles.composerWrap}>
+      <textarea
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        onKeyDown={onKeyDown}
+        placeholder="Describe your issue or ask a question…"
+        rows={1}
+        disabled={disabled}
+        style={styles.textarea}
+      />
+      <button
+        onClick={onSend}
+        disabled={!value.trim() || !!disabled}
+        style={styles.sendBtn}
+        aria-label="Send"
+      >
+        ➤
+      </button>
+    </div>
+  );
+};
