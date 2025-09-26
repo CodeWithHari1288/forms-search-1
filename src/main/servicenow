@@ -263,3 +263,45 @@ suggestionChip: {
   fontSize: 12,
   cursor: "pointer",
 },
+
+
+
+
+
+
+
+
+
+
+{/* Scrollable content area with sticky banner */}
+<div style={styles.contentWrap}>
+  {bannerVisible && bannerText && (
+    <div style={styles.banner(bannerColor, bannerTextColor)}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span aria-hidden>{bannerIcon}</span>
+        <span>{bannerText}</span>
+      </div>
+      {bannerDismissible && (
+        <button
+          style={styles.bannerClose}
+          onClick={() => setBannerVisible(false)}
+          aria-label="Dismiss banner"
+        >
+          ✕
+        </button>
+      )}
+    </div>
+  )}
+
+  {/* Messages list scrolls beneath the sticky banner */}
+  <div ref={listRef} style={styles.list}>
+    {messages.map((m, i) => (
+      <MessageBubble
+        key={i}
+        msg={m}
+        brandColor={brandColor}
+        onPick={(s) => handleSend(s)}
+      />
+    ))}
+  </div>
+</div>
