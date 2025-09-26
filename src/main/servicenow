@@ -174,4 +174,72 @@ export default function Page() {
       }}
     />
   );
+
 }
+
+
+
+
+
+return (
+  <div>
+    {!isOpen && (
+      <button
+        style={styles.launcher(brandColor)}
+        onClick={() => setIsOpen(true)}
+        aria-label="Open chat"
+        title="Open chat"
+      >
+        💬
+      </button>
+    )}
+
+    {isOpen && (
+      <div style={styles.shell(size)}>
+        <Header
+          title={title}
+          brandColor={brandColor}
+          onClose={() => {
+            setIsOpen(false);
+            setIsExpanded(false);
+          }}
+          onExpand={() => setIsExpanded((v) => !v)}
+          isExpanded={isExpanded}
+        />
+
+        {/* Chat messages */}
+        <div ref={listRef} style={styles.list}>
+          {messages.map((m, i) => (
+            <MessageBubble
+              key={i}
+              msg={m}
+              brandColor={brandColor}
+              onPick={(s) => handleSend(s)}
+            />
+          ))}
+        </div>
+
+        {/* Default suggestions row (always visible at bottom) */}
+        <div style={styles.suggestionsRow}>
+          {defaultSuggestions().map((s, i) => (
+            <button
+              key={i}
+              style={styles.suggestionChip}
+              onClick={() => handleSend(s)}
+            >
+              {s}
+            </button>
+          ))}
+        </div>
+
+        {/* Composer */}
+        <Composer
+          value={input}
+          onChange={setInput}
+          onSend={() => handleSend()}
+          disabled={isBusy}
+        />
+      </div>
+    )}
+  </div>
+);
