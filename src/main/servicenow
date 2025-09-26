@@ -243,3 +243,23 @@ return (
     )}
   </div>
 );
+
+
+
+
+suggestionsRow: {
+  marginTop: 4,
+  marginBottom: 4,
+  display: "flex",
+  gap: 8,
+  flexWrap: "wrap",
+  padding: "0 10px",
+},
+suggestionChip: {
+  border: "1px solid #e5e7eb",
+  background: "#ffffff",
+  borderRadius: 999,
+  padding: "6px 10px",
+  fontSize: 12,
+  cursor: "pointer",
+},
