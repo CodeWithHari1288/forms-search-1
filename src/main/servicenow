@@ -123,3 +123,4 @@ const Composer: React.FC<{ value: string; onChange: (v: string) => void; onSend:
 
 export { ServiceNowStyleChat };
 
+
