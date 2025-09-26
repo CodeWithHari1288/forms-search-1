@@ -1,0 +1,186 @@
+import React, { useEffect, useMemo, useRef, useState } from "react"; import ReactDOM from "react-dom";
+
+/**
+
+Chatbot365.jsx — a Microsoft 365–style chat widget
+
+Plain JSX (no TS), works in any React app
+
+
+Clickable suggestions powered by your LangGraph Python API
+
+
+Resizable panel and detachable (open in separate window) with a React portal
+
+
+Usage:
+
+<Chatbot365
+
+apiBase="http://localhost:8000" // your FastAPI/LangGraph base
+
+title="GrowthTeam Copilot"
+
+subtitle="Knowledge • Actions • Insights"
+
+initialSuggestions={["Show open incidents", "Summarize today", "Create a task"]}
+
+detachDefault={false}
+
+/>
+
+Backend contract (example FastAPI response expected at POST {apiBase}/chat):
+
+{
+
+"text": "answer markdown/plaintext",
+
+"suggestions": [
+
+{ "label": "Create JIRA for outage", "prompt": "Create JIRA for ..." },
+
+{ "label": "Top 5 KB docs", "prompt": "List top 5 knowledge docs about ..." }
+
+]
+
+} */
+
+
+// ———————————————————————————————————————————————————————————————— // Utils // ———————————————————————————————————————————————————————————————— const classNames = (...xs) => xs.filter(Boolean).join(" ");
+
+const timeStr = () => new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+function useAutoscroll(dep) { const ref = useRef(null); useEffect(() => { const el = ref.current; if (!el) return; el.scrollTop = el.scrollHeight + 9999; }, [dep]); return ref; }
+
+// ———————————————————————————————————————————————————————————————— // Popout (separate window) using a Portal // ———————————————————————————————————————————————————————————————— function PopoutWindow({ title = "Chat", onClose, children }) { const containerEl = useMemo(() => document.createElement("div"), []); const winRef = useRef(null);
+
+useEffect(() => { winRef.current = window.open("", title, "width=420,height=640,menubar=no,toolbar=no"); const win = winRef.current; if (!win) return;
+
+// Basic document shell so Tailwind or app styles still cascade if using CSS variables.
+win.document.title = title;
+win.document.body.style.margin = "0";
+win.document.body.appendChild(containerEl);
+
+const handleBeforeUnload = () => onClose && onClose();
+win.addEventListener("beforeunload", handleBeforeUnload);
+
+return () => {
+  try {
+    win.removeEventListener("beforeunload", handleBeforeUnload);
+    win.close();
+  } catch (e) {}
+};
+
+}, [containerEl, onClose, title]);
+
+return ReactDOM.createPortal(children, containerEl); }
+
+// ———————————————————————————————————————————————————————————————— // Suggestion Pill // ———————————————————————————————————————————————————————————————— function SuggestionPill({ label, onClick }) { return ( <button
+onClick={onClick}
+className="mr-2 mb-2 inline-flex items-center gap-2 rounded-full border border-gray-300 px-3 py-1 text-sm hover:bg-gray-50 active:scale-[0.99]"
+> <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="opacity-70"> <path d="M22 12h-20"/><path d="M15 5l7 7-7 7"/> </svg> {label} </button> ); }
+
+// ———————————————————————————————————————————————————————————————— // Message Bubble // ———————————————————————————————————————————————————————————————— function Bubble({ role, text }) { const mine = role === "user"; return ( <div className={classNames("w-full flex", mine ? "justify-end" : "justify-start")} aria-label={mine ? "User message" : "Assistant message"}> <div className={classNames( "max-w-[80%] whitespace-pre-wrap leading-relaxed rounded-2xl px-4 py-2 shadow-sm", mine ? "bg-blue-600 text-white" : "bg-white border border-gray-200" )} > {text} <div className={classNames("mt-1 text-[10px] opacity-60", mine ? "text-white" : "text-gray-500")}>{timeStr()}</div> </div> </div> ); }
+
+// ———————————————————————————————————————————————————————————————— // Main Component // ———————————————————————————————————————————————————————————————— export default function Chatbot365({ apiBase = "http://localhost:8000", title = "Workspace Copilot", subtitle = "Ask anything about your work", initialSuggestions = ["What changed today?", "Show my open tasks", "Draft a status update"], detachDefault = false, startOpen = true, className = "", }) { const [messages, setMessages] = useState([]); // {role: 'user'|'assistant', text} const [input, setInput] = useState(""); const [busy, setBusy] = useState(false); const [error, setError] = useState(""); const [suggestions, setSuggestions] = useState(initialSuggestions.map(s => ({ label: s, prompt: s }))); const [minimized, setMinimized] = useState(!startOpen); const [detached, setDetached] = useState(detachDefault);
+
+const scrollerRef = useAutoscroll(messages.length); const inputRef = useRef(null);
+
+useEffect(() => { if (!minimized && inputRef.current) inputRef.current.focus(); }, [minimized]);
+
+const sendToAPI = async (finalText) => { setBusy(true); setError(""); try { const res = await fetch(${apiBase}/chat, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messages: messages.concat([{ role: "user", content: finalText }]), }), }); if (!res.ok) throw new Error(HTTP ${res.status}); const data = await res.json();
+
+const assistantText = data.text || "(No reply)";
+  const apiSuggestions = Array.isArray(data.suggestions) ? data.suggestions : [];
+
+  setMessages((prev) => prev.concat([{ role: "assistant", text: assistantText }]));
+  if (apiSuggestions.length) setSuggestions(apiSuggestions);
+} catch (e) {
+  setError(e.message || String(e));
+} finally {
+  setBusy(false);
+}
+
+};
+
+const onSubmit = async (e) => { e && e.preventDefault(); const finalText = input.trim(); if (!finalText || busy) return; setMessages((prev) => prev.concat([{ role: "user", text: finalText }])); setInput(""); await sendToAPI(finalText); };
+
+const onSuggestion = async (prompt) => { if (!prompt || busy) return; setMessages((prev) => prev.concat([{ role: "user", text: prompt }])); setInput(""); await sendToAPI(prompt); };
+
+const body = ( <div className={classNames("flex h-full w-full flex-col", className)}> {/* Banner */} <div className="flex items-center justify-between border-b border-gray-200 bg-gradient-to-r from-gray-50 to-white px-3 py-2"> <div className="flex items-center gap-2"> <div className="grid h-8 w-8 place-items-center rounded-xl bg-black text-white font-bold">C</div> <div> <div className="text-sm font-semibold">{title}</div> <div className="text-[11px] leading-3 text-gray-500">{subtitle}</div> </div> </div> <div className="flex items-center gap-2"> <button onClick={() => setDetached((d) => !d)} title={detached ? "Return to window" : "Open in new window"} className="rounded-lg border border-gray-300 px-2 py-1 text-xs hover:bg-gray-50" > {detached ? "Attach" : "Pop out"} </button> <button onClick={() => setMinimized((m) => !m)} className="rounded-lg border border-gray-300 px-2 py-1 text-xs hover:bg-gray-50" title={minimized ? "Expand" : "Minimize"} > {minimized ? "Open" : "Minimize"} </button> </div> </div>
+
+{/* Collapsible content */}
+  {!minimized && (
+    <>
+      {/* Messages */}
+      <div
+        ref={scrollerRef}
+        className="flex-1 overflow-y-auto bg-gray-50/60 p-3"
+      >
+        {messages.length === 0 && (
+          <div className="flex h-full items-center justify-center">
+            <div className="text-center text-sm text-gray-500">
+              Ask about your data, plans, documents…
+            </div>
+          </div>
+        )}
+        <div className="space-y-3">
+          {messages.map((m, i) => (
+            <Bubble key={i} role={m.role} text={m.text} />
+          ))}
+        </div>
+      </div>
+
+      {/* Suggestions */}
+      {suggestions && suggestions.length > 0 && (
+        <div className="border-t border-gray-200 bg-white px-3 py-2">
+          <div className="mb-1 text-xs font-medium text-gray-500">Suggestions</div>
+          <div className="flex flex-wrap">
+            {suggestions.map((s, i) => (
+              <SuggestionPill key={i} label={s.label || s.prompt} onClick={() => onSuggestion(s.prompt || s.label)} />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Composer */}
+      <form onSubmit={onSubmit} className="border-t border-gray-200 bg-white p-2">
+        <div className="flex items-end gap-2">
+          <textarea
+            ref={inputRef}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            placeholder={busy ? "Thinking…" : "Type a message"}
+            disabled={busy}
+            rows={1}
+            className="min-h-[44px] max-h-40 flex-1 resize-y rounded-xl border border-gray-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+          />
+          <button
+            type="submit"
+            disabled={busy || !input.trim()}
+            className={classNames(
+              "inline-flex h-[44px] items-center gap-2 rounded-xl px-3 text-sm font-medium text-white",
+              busy || !input.trim() ? "bg-blue-400" : "bg-blue-600 hover:bg-blue-700"
+            )}
+            aria-label="Send message"
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/>
+            </svg>
+            Send
+          </button>
+        </div>
+        {error && (
+          <div className="mt-2 text-xs text-red-600">{error}</div>
+        )}
+      </form>
+    </>
+  )}
+</div>
+
+);
+
+// —————————————————————————————————————————————— // Container: floating, resizable widget // —————————————————————————————————————————————— const container = ( <div className={classNames( "fixed bottom-4 right-4 z-50 flex h-[520px] w-[360px] flex-col overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-2xl", "[&]:backdrop-blur-sm", className )} style={{ resize: "both" }} // native resize handle role="dialog" aria-label="Chatbot" > {body} </div> );
+
+// Detached → render into new Window, else page return detached ? ( <PopoutWindow title={title} onClose={() => setDetached(false)}> <div className="h-screen w-screen overflow-hidden bg-white">{body}</div> </PopoutWindow> ) : ( container ); }
+
