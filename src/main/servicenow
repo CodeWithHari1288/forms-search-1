@@ -149,3 +149,29 @@ const Composer = ({ value, onChange, onSend, disabled }) => {
     </div>
   );
 };
+
+
+
+
+
+
+
+import ServiceNowStyleChat from "./ServiceNowStyleChat.jsx";
+
+export default function Page() {
+  return (
+    <ServiceNowStyleChat
+      title="Virtual Agent"
+      brandColor="#118a00"
+      onSend={async (messages) => {
+        const res = await fetch("http://localhost:8000/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messages }),
+        });
+        const data = await res.json(); // { answer, suggestions }
+        return { text: data.answer, suggestions: data.suggestions || [] };
+      }}
+    />
+  );
+}
