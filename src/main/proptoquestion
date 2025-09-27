@@ -1,94 +1,129 @@
 import java.nio.file.*;
 import java.util.*;
 import java.util.regex.*;
+
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.core.util.DefaultPrettyPrinter;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.ObjectWriter;
 
-public class RenameFromExportBlocksRobust {
+public class ExtractAndRenameDeep {
 
     public static void main(String[] args) throws Exception {
         // USAGE:
-        //   java RenameFromExportBlocksRobust blocks.txt records.json output.json
-        Path blocksPath  = Paths.get(args.length > 0 ? args[0] : "blocks.txt");
-        Path recordsPath = Paths.get(args.length > 1 ? args[1] : "records.json");
+        //   java ExtractAndRenameDeep blocks.txt records.json output.json
+        Path blocksPath  = Paths.get(args.length > 0 ? args[0] : "blocks.txt");   // file with export const sections
+        Path recordsPath = Paths.get(args.length > 1 ? args[1] : "records.json"); // JSON array
         Path outputPath  = Paths.get(args.length > 2 ? args[2] : "output.json");
 
-        String blocksText = new String(Files.readAllBytes(blocksPath), "UTF-8");
+        // 1) Build prop -> label (question) map
+        String blocks = new String(Files.readAllBytes(blocksPath), "UTF-8");
+        HashMap<String,String> propToLabel = extractPropToLabel(blocks);
 
-        // Build prop(lowercase) -> label map
-        Map<String,String> propToLabel = extractPropToLabel(blocksText);
-
-        System.out.println("Loaded mappings: " + propToLabel.size());
-        // Print a few samples for sanity
-        propToLabel.entrySet().stream().limit(5).forEach(e ->
-            System.out.println("  " + e.getKey() + " -> " + e.getValue())
-        );
+        System.out.println("Mappings found: " + propToLabel.size());
+        propToLabel.entrySet().stream().limit(5)
+            .forEach(e -> System.out.println("  " + e.getKey() + " -> " + e.getValue()));
         if (propToLabel.isEmpty()) {
-            System.err.println("No mappings found. Check your file formatting or keys.");
+            System.err.println("No mappings parsed. Check your blocks file formatting.");
             return;
         }
 
+        // 2) Read JSON array
         ObjectMapper om = new ObjectMapper();
-        // Preserve object key order
-        List<LinkedHashMap<String,Object>> rows = om.readValue(
-            Files.newBufferedReader(recordsPath),
-            new TypeReference<List<LinkedHashMap<String,Object>>>() {}
+        List<Object> rootArray = om.readValue(
+                Files.newBufferedReader(recordsPath),
+                new TypeReference<List<Object>>() {}
         );
 
-        // Rename top-level keys per mapping (case-insensitive on the prop)
-        List<Map<String,Object>> out = new ArrayList<>(rows.size());
-        for (LinkedHashMap<String,Object> row : rows) {
-            LinkedHashMap<String,Object> renamed = new LinkedHashMap<>();
-            for (Map.Entry<String,Object> e : row.entrySet()) {
-                String key = e.getKey();
-                Object val = e.getValue();
-                String label = propToLabel.get(key.toLowerCase(Locale.ROOT));
-                renamed.put((label != null && !label.isEmpty()) ? label : key, val);
-            }
-            out.add(renamed);
+        // 3) Deep rename across entire structure
+        List<Object> transformed = new ArrayList<>(rootArray.size());
+        for (Object node : rootArray) {
+            transformed.add(deepRename(node, propToLabel));
         }
 
+        // 4) Write output
         ObjectWriter writer = om.writer(new DefaultPrettyPrinter());
-        writer.writeValue(outputPath.toFile(), out);
-        System.out.println("Wrote " + out.size() + " records -> " + outputPath.toAbsolutePath());
+        writer.writeValue(outputPath.toFile(), transformed);
+        System.out.println("Wrote " + transformed.size() + " records -> " + outputPath.toAbsolutePath());
     }
 
-    /**
-     * Extracts Prop -> Label/Question from ANY {...} block in the file.
-     * Tolerant to whitespace, commas, single/double quotes, order, and extra fields.
-     */
-    private static Map<String,String> extractPropToLabel(String text) {
-        Map<String,String> map = new LinkedHashMap<>();
+    /* ==================== Deep renaming ==================== */
 
-        // Normalize smart quotes if present
+    @SuppressWarnings("unchecked")
+    private static Object deepRename(Object node, HashMap<String,String> propToLabel) {
+        if (node == null) return null;
+
+        if (node instanceof Map) {
+            // Preserve insertion order
+            LinkedHashMap<String,Object> input = new LinkedHashMap<>((Map<String,Object>) node);
+            LinkedHashMap<String,Object> out = new LinkedHashMap<>();
+
+            for (Map.Entry<String,Object> e : input.entrySet()) {
+                String key = e.getKey();
+                Object val = e.getValue();
+                // Recurse first so nested keys also get renamed
+                Object newVal = deepRename(val, propToLabel);
+
+                String mapped = propToLabel.get(key.toLowerCase(Locale.ROOT));
+                String newKey = (mapped != null && !mapped.isEmpty()) ? mapped : key;
+
+                // Collision policy: last wins. If you want "first wins", only put if absent.
+                out.put(newKey, newVal);
+            }
+            return out;
+        }
+
+        if (node instanceof List) {
+            List<?> list = (List<?>) node;
+            List<Object> out = new ArrayList<>(list.size());
+            for (Object item : list) {
+                out.add(deepRename(item, propToLabel));
+            }
+            return out;
+        }
+
+        // Primitive: leave as is
+        return node;
+    }
+
+    /* ==================== Mapping extraction ==================== */
+    /**
+     * Build HashMap<propLower, label> from export-const sections.
+     * Tolerant to formatting:
+     *  - scans ANY {...} block,
+     *  - accepts Label or Question,
+     *  - accepts Prop or Property,
+     *  - single/double quotes, any whitespace, any order.
+     */
+    private static HashMap<String,String> extractPropToLabel(String text) {
+        HashMap<String,String> map = new HashMap<>();
+
+        // Normalize smart quotes
         text = text.replace('“','"').replace('”','"').replace('’','\'').replace('‘','\'');
 
-        // Find any { ... } region; we’ll scan inside for fields
+        // Find any { ... } region
         Pattern braces = Pattern.compile("\\{(.*?)\\}", Pattern.DOTALL);
+
+        // Fields (case-insensitive)
+        Pattern pLabelOrQuestion = fieldPattern("(?:Label|Question)");
+        Pattern pProp            = fieldPattern("Prop(?:erty)?");
+
         Matcher mb = braces.matcher(text);
-
-        // Field regexes (case-insensitive, allow single/double quotes)
-        Pattern pLabel    = fieldPattern("(?:Label|Question)");
-        Pattern pProp     = fieldPattern("Prop(?:erty)?");
-
         while (mb.find()) {
             String body = mb.group(1);
 
-            String label = first(pLabel, body);
-            String prop  = first(pProp,  body);
+            String label = first(pLabelOrQuestion, body);
+            String prop  = first(pProp,            body);
 
             if (label != null && prop != null) {
-                String key = prop.trim().toLowerCase(Locale.ROOT);
-                map.put(key, label.trim());
+                map.put(prop.trim().toLowerCase(Locale.ROOT), label.trim());
             }
         }
         return map;
     }
 
     private static Pattern fieldPattern(String keyNameRegex) {
-        // Matches: KeyName : "value"  or  'value'  (value can span lines)
+        // Matches: KeyName : "value"  or  'value'
         return Pattern.compile("\\b" + keyNameRegex + "\\b\\s*:\\s*(['\"])(.*?)\\1",
                 Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
     }
