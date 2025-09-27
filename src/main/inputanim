@@ -1,0 +1,148 @@
+import React, { useState, useEffect } from "react";
+
+export default function ChatCopilot() {
+  const [messages, setMessages] = useState(() => {
+    // Load history from localStorage
+    const saved = localStorage.getItem("chatHistory");
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [input, setInput] = useState(""); // purely local state
+
+  // Sync history between tabs
+  useEffect(() => {
+    const onStorage = (e) => {
+      if (e.key === "chatHistory" && e.newValue) {
+        setMessages(JSON.parse(e.newValue));
+      }
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
+
+  // Send a message
+  const handleSend = () => {
+    if (!input.trim()) return;
+
+    const newMessage = { role: "user", content: input };
+    const updated = [...messages, newMessage];
+
+    setMessages(updated);
+    localStorage.setItem("chatHistory", JSON.stringify(updated));
+
+    setInput(""); // clear after send
+  };
+
+  // Open in new tab
+  const openInNewTab = () => {
+    window.open(window.location.href, "_blank");
+  };
+
+  return (
+    <div style={styles.container}>
+      {/* Header */}
+      <div style={styles.header}>
+        <span>ChatCopilot</span>
+        <button style={styles.newTabBtn} onClick={openInNewTab}>
+          Open in New Tab
+        </button>
+      </div>
+
+      {/* Chat history */}
+      <div style={styles.chatBox}>
+        {messages.map((msg, i) => (
+          <div
+            key={i}
+            style={{
+              ...styles.message,
+              alignSelf: msg.role === "user" ? "flex-end" : "flex-start",
+              backgroundColor: msg.role === "user" ? "#0078d4" : "#e1e1e1",
+              color: msg.role === "user" ? "white" : "black",
+            }}
+          >
+            {msg.content}
+          </div>
+        ))}
+      </div>
+
+      {/* Input row */}
+      <div style={styles.inputRow}>
+        <input
+          type="text"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          style={styles.input}
+          placeholder="Type a message..."
+          onKeyDown={(e) => e.key === "Enter" && handleSend()}
+        />
+        <button onClick={handleSend} style={styles.sendBtn}>
+          Send
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Inline Styles ---------- */
+const styles = {
+  container: {
+    display: "flex",
+    flexDirection: "column",
+    width: "400px",
+    height: "500px",
+    border: "1px solid #ccc",
+    borderRadius: "8px",
+    overflow: "hidden",
+    fontFamily: "Segoe UI, sans-serif",
+  },
+  header: {
+    background: "#0078d4",
+    color: "white",
+    padding: "10px",
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  newTabBtn: {
+    background: "white",
+    color: "#0078d4",
+    border: "none",
+    padding: "4px 8px",
+    borderRadius: "4px",
+    cursor: "pointer",
+  },
+  chatBox: {
+    flex: 1,
+    display: "flex",
+    flexDirection: "column",
+    padding: "10px",
+    overflowY: "auto",
+    background: "#f5f5f5",
+  },
+  message: {
+    padding: "8px 12px",
+    borderRadius: "12px",
+    marginBottom: "8px",
+    maxWidth: "70%",
+    wordWrap: "break-word",
+  },
+  inputRow: {
+    display: "flex",
+    borderTop: "1px solid #ccc",
+    padding: "8px",
+  },
+  input: {
+    flex: 1,
+    padding: "8px",
+    borderRadius: "4px",
+    border: "1px solid #ccc",
+  },
+  sendBtn: {
+    marginLeft: "8px",
+    background: "#0078d4",
+    color: "white",
+    border: "none",
+    padding: "8px 16px",
+    borderRadius: "4px",
+    cursor: "pointer",
+  },
+};
