@@ -1,191 +1,100 @@
 import java.nio.file.*;
-import java.io.IOException;
 import java.util.*;
 import java.util.regex.*;
-
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.core.util.DefaultPrettyPrinter;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.ObjectWriter;
 
-public class RenameFromExportBlocksNested {
+public class RenameFromExportBlocksRobust {
 
     public static void main(String[] args) throws Exception {
         // USAGE:
-        //   java RenameFromExportBlocksNested blocks.txt records.json output.json
+        //   java RenameFromExportBlocksRobust blocks.txt records.json output.json
         Path blocksPath  = Paths.get(args.length > 0 ? args[0] : "blocks.txt");
         Path recordsPath = Paths.get(args.length > 1 ? args[1] : "records.json");
         Path outputPath  = Paths.get(args.length > 2 ? args[2] : "output.json");
 
-        // 1) Build prop->label map (lowercased prop path -> label/question)
-        String blocks = new String(Files.readAllBytes(blocksPath), "UTF-8");
-        Map<String,String> propToLabel = parsePropToLabel(blocks);
+        String blocksText = new String(Files.readAllBytes(blocksPath), "UTF-8");
+
+        // Build prop(lowercase) -> label map
+        Map<String,String> propToLabel = extractPropToLabel(blocksText);
+
+        System.out.println("Loaded mappings: " + propToLabel.size());
+        // Print a few samples for sanity
+        propToLabel.entrySet().stream().limit(5).forEach(e ->
+            System.out.println("  " + e.getKey() + " -> " + e.getValue())
+        );
         if (propToLabel.isEmpty()) {
-            System.err.println("No mappings found (need Label/Question and Prop).");
+            System.err.println("No mappings found. Check your file formatting or keys.");
             return;
         }
-        System.out.println("Loaded mappings: " + propToLabel.size());
 
-        // 2) Read JSON array
         ObjectMapper om = new ObjectMapper();
+        // Preserve object key order
         List<LinkedHashMap<String,Object>> rows = om.readValue(
-                Files.newBufferedReader(recordsPath),
-                new TypeReference<List<LinkedHashMap<String,Object>>>() {}
+            Files.newBufferedReader(recordsPath),
+            new TypeReference<List<LinkedHashMap<String,Object>>>() {}
         );
 
-        // 3) Rename (supports dot paths + arrays)
-        for (Map<String,Object> row : rows) {
-            for (Map.Entry<String,String> e : propToLabel.entrySet()) {
-                String propPath = e.getKey();   // already lowercased
-                String label    = e.getValue();
-
-                renamePathIfPresent(row, propPath, label);
+        // Rename top-level keys per mapping (case-insensitive on the prop)
+        List<Map<String,Object>> out = new ArrayList<>(rows.size());
+        for (LinkedHashMap<String,Object> row : rows) {
+            LinkedHashMap<String,Object> renamed = new LinkedHashMap<>();
+            for (Map.Entry<String,Object> e : row.entrySet()) {
+                String key = e.getKey();
+                Object val = e.getValue();
+                String label = propToLabel.get(key.toLowerCase(Locale.ROOT));
+                renamed.put((label != null && !label.isEmpty()) ? label : key, val);
             }
+            out.add(renamed);
         }
 
-        // 4) Write output
         ObjectWriter writer = om.writer(new DefaultPrettyPrinter());
-        writer.writeValue(outputPath.toFile(), rows);
-        System.out.println("Wrote " + rows.size() + " records -> " + outputPath.toAbsolutePath());
+        writer.writeValue(outputPath.toFile(), out);
+        System.out.println("Wrote " + out.size() + " records -> " + outputPath.toAbsolutePath());
     }
 
-    /* ---------------- Mapping parser ----------------
-       - Tries full export-blocks first.
-       - Also falls back to scanning loose "Label/Question" + "Prop" inside braces.
-    */
-    private static Map<String,String> parsePropToLabel(String text) {
+    /**
+     * Extracts Prop -> Label/Question from ANY {...} block in the file.
+     * Tolerant to whitespace, commas, single/double quotes, order, and extra fields.
+     */
+    private static Map<String,String> extractPropToLabel(String text) {
         Map<String,String> map = new LinkedHashMap<>();
 
-        // Normalize smart quotes -> regular
+        // Normalize smart quotes if present
         text = text.replace('“','"').replace('”','"').replace('’','\'').replace('‘','\'');
 
-        // 1) Prefer proper export-const blocks
-        Pattern block = Pattern.compile(
-            "export\\s+const\\s+[A-Za-z0-9_$]+(?:\\s*:[^=]+)?\\s*=\\s*\\{(.*?)\\}",
-            Pattern.CASE_INSENSITIVE | Pattern.DOTALL
-        );
-        // 2) Fallback: any {...} group (be careful but helpful)
-        Pattern anyBraces = Pattern.compile("\\{(.*?)\\}", Pattern.DOTALL);
+        // Find any { ... } region; we’ll scan inside for fields
+        Pattern braces = Pattern.compile("\\{(.*?)\\}", Pattern.DOTALL);
+        Matcher mb = braces.matcher(text);
 
-        // Field captures (Label/Question + Prop/Property)
-        Pattern pQuestion = fieldPattern("Question");
-        Pattern pLabel    = fieldPattern("Label");
+        // Field regexes (case-insensitive, allow single/double quotes)
+        Pattern pLabel    = fieldPattern("(?:Label|Question)");
         Pattern pProp     = fieldPattern("Prop(?:erty)?");
 
-        boolean foundBlock = false;
-        Matcher mb = block.matcher(text);
         while (mb.find()) {
-            foundBlock = true;
-            extractOneMapping(map, mb.group(1), pQuestion, pLabel, pProp);
-        }
-        if (!foundBlock) {
-            // Try scanning any braces (helps if file lacks 'export const')
-            Matcher ma = anyBraces.matcher(text);
-            while (ma.find()) {
-                extractOneMapping(map, ma.group(1), pQuestion, pLabel, pProp);
+            String body = mb.group(1);
+
+            String label = first(pLabel, body);
+            String prop  = first(pProp,  body);
+
+            if (label != null && prop != null) {
+                String key = prop.trim().toLowerCase(Locale.ROOT);
+                map.put(key, label.trim());
             }
         }
         return map;
     }
 
     private static Pattern fieldPattern(String keyNameRegex) {
-        // Matches: KeyName : "value"   (single or double quotes; allows spaces)
+        // Matches: KeyName : "value"  or  'value'  (value can span lines)
         return Pattern.compile("\\b" + keyNameRegex + "\\b\\s*:\\s*(['\"])(.*?)\\1",
                 Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
-    }
-
-    private static void extractOneMapping(
-            Map<String,String> out,
-            String body,
-            Pattern pQuestion, Pattern pLabel, Pattern pProp
-    ) {
-        String label = first(pQuestion, body);
-        if (label == null) label = first(pLabel, body);
-        String prop  = first(pProp, body);
-
-        if (label != null && prop != null) {
-            String key = prop.trim().toLowerCase(Locale.ROOT);
-            out.put(key, label.trim());
-        }
     }
 
     private static String first(Pattern p, String s) {
         Matcher m = p.matcher(s);
         return m.find() ? m.group(2) : null;
-    }
-
-    /* ---------------- Renamer with dot-path support ----------------
-       propPath is lowercased. We traverse case-insensitively per segment.
-       Supports arrays: e.g., orders.0.amount
-    */
-    @SuppressWarnings("unchecked")
-    private static void renamePathIfPresent(Map<String,Object> root, String propPathLower, String newKeyLabel) {
-        String[] parts = propPathLower.split("\\.");
-
-        Object cur = root;
-        Map<String,Object> parentMap = null;
-        List<?> parentList = null;
-        String finalSegFound = null;  // original-cased key actually present
-        int finalIndex = -1;
-
-        for (int i = 0; i < parts.length; i++) {
-            String segLower = parts[i];
-
-            if (cur instanceof Map) {
-                Map<String,Object> map = (Map<String,Object>) cur;
-                // case-insensitive lookup for seg
-                String actualKey = findKeyCaseInsensitive(map, segLower);
-                if (actualKey == null) return; // path not present -> nothing to rename
-                Object next = map.get(actualKey);
-
-                // If this is the last segment, we will rename this key in 'map'
-                if (i == parts.length - 1) {
-                    parentMap = map;
-                    finalSegFound = actualKey;
-                    break;
-                }
-                cur = next;
-
-            } else if (cur instanceof List) {
-                Integer idx = tryParseInt(segLower);
-                if (idx == null) return;
-                List<?> list = (List<?>) cur;
-                if (idx < 0 || idx >= list.size()) return;
-
-                // If last segment, you can't rename inside a list directly — so we stop.
-                if (i == parts.length - 1) {
-                    parentList = list;
-                    finalIndex = idx;
-                    break;
-                }
-                cur = list.get(idx);
-
-            } else {
-                // primitive or null encountered before path ends
-                return;
-            }
-        }
-
-        // If final is inside a map -> rename key
-        if (parentMap != null && finalSegFound != null) {
-            if (!newKeyLabel.equals(finalSegFound)) {
-                Object val = parentMap.remove(finalSegFound);
-                // collision policy: last wins
-                parentMap.put(newKeyLabel, val);
-            }
-        }
-        // If final is a list index, there isn't a "key" to rename. No-op (by design).
-    }
-
-    private static String findKeyCaseInsensitive(Map<String,Object> map, String keyLower) {
-        if (map.containsKey(keyLower)) return keyLower;
-        for (String k : map.keySet()) {
-            if (k.equalsIgnoreCase(keyLower)) return k;
-        }
-        return null;
-    }
-
-    private static Integer tryParseInt(String s) {
-        try { return Integer.valueOf(s); } catch (Exception e) { return null; }
     }
 }
