@@ -1,0 +1,115 @@
+import java.io.IOException;
+import java.nio.file.*;
+import java.util.*;
+import java.util.regex.*;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.core.util.DefaultPrettyPrinter;
+import com.fasterxml.jackson.databind.ObjectWriter;
+
+public class ReplacePropWithQuestionKeepUnmapped {
+
+    static class Mapping {
+        String question;
+        String prop;
+        Mapping(String q, String p) { question = q; prop = p; }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Path mappingsPath = Paths.get(args.length > 0 ? args[0] : "mappings.txt");
+        Path recordsPath  = Paths.get(args.length > 1 ? args[1] : "records.json");
+        Path outputPath   = Paths.get(args.length > 2 ? args[2] : "output.json");
+
+        String mappingsText = new String(Files.readAllBytes(mappingsPath), "UTF-8");
+        List<Mapping> maps = parseMappings(mappingsText);
+
+        ObjectMapper om = new ObjectMapper();
+        List<Map<String, Object>> rows = om.readValue(
+                Files.newBufferedReader(recordsPath),
+                new TypeReference<List<Map<String,Object>>>() {}
+        );
+
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Map<String, Object> row : rows) {
+            Map<String, Object> out = new LinkedHashMap<>();
+
+            // copy all fields first
+            out.putAll(row);
+
+            // apply mappings
+            for (Mapping m : maps) {
+                Object val = getByPath(row, m.prop);
+                if (val != null) {
+                    // remove the old prop key if it's a top-level match
+                    if (row.containsKey(m.prop)) out.remove(m.prop);
+                    out.put(m.question, val);
+                }
+            }
+
+            result.add(out);
+        }
+
+        ObjectWriter writer = om.writer(new DefaultPrettyPrinter());
+        writer.writeValue(outputPath.toFile(), result);
+        System.out.println("Wrote " + result.size() + " records -> " + outputPath.toAbsolutePath());
+    }
+
+    // -------- parse mappings file --------
+    private static List<Mapping> parseMappings(String text) {
+        List<Mapping> list = new ArrayList<>();
+        Pattern block = Pattern.compile(
+            "export\\s+const\\s+[A-Za-z0-9_$]+\\s*=\\s*\\{(.*?)\\}",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL
+        );
+        Pattern pQuestion = Pattern.compile("\\bQuestion\\b\\s*:\\s*(['\"])(.*?)\\1",
+                Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+        Pattern pLabel = Pattern.compile("\\bLabel\\b\\s*:\\s*(['\"])(.*?)\\1",
+                Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+        Pattern pProp = Pattern.compile("\\bProp(?:erty)?\\b\\s*:\\s*(['\"])(.*?)\\1",
+                Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+
+        Matcher m = block.matcher(text);
+        while (m.find()) {
+            String body = m.group(1);
+            String q = first(pQuestion, body);
+            if (q == null) q = first(pLabel, body);
+            String p = first(pProp, body);
+            if (q != null && p != null) {
+                list.add(new Mapping(q.trim(), p.trim()));
+            }
+        }
+        return list;
+    }
+
+    private static String first(Pattern p, String s) {
+        Matcher m = p.matcher(s);
+        return m.find() ? m.group(2) : null;
+    }
+
+    // -------- simple JSON path helper --------
+    @SuppressWarnings("unchecked")
+    private static Object getByPath(Object root, String path) {
+        if (root == null || path == null || path.isEmpty()) return null;
+        String[] parts = path.split("\\.");
+        Object cur = root;
+        for (String part : parts) {
+            if (cur == null) return null;
+            if (cur instanceof Map) {
+                cur = ((Map<String,Object>) cur).get(part);
+            } else if (cur instanceof List) {
+                try {
+                    int idx = Integer.parseInt(part);
+                    List<?> list = (List<?>) cur;
+                    if (idx < 0 || idx >= list.size()) return null;
+                    cur = list.get(idx);
+                } catch (NumberFormatException e) {
+                    return null;
+                }
+            } else {
+                return null;
+            }
+        }
+        return cur;
+    }
+}
