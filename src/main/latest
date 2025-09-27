@@ -1,0 +1,451 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import ReactDOM from "react-dom";
+
+/**
+ * ChatCopilot.jsx
+ * - Docked chat widget (bottom-right)
+ * - Minimize / Restore / Pop-out (maximize) to a new window
+ * - Clickable suggestions
+ * - Ready to wire with your LangGraph Python API (see sendMessage)
+ */
+
+export default function ChatCopilot() {
+  const [minimized, setMinimized] = useState(false);
+  const [poppedOut, setPoppedOut] = useState(false);
+  const [messages, setMessages] = useState([
+    { role: "assistant", text: "Hi! I’m your Copilot. How can I help today?" },
+  ]);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  // Suggestions (you can fetch these from your LangGraph API too)
+  const suggestions = useMemo(
+    () => [
+      "Summarize the latest sprint notes",
+      "Draft an email to the customer about release status",
+      "What’s our revenue by month this quarter?",
+      "Find docs on ‘data ingestion pipeline’",
+    ],
+    []
+  );
+
+  // ---------- POP-OUT WINDOW (maximize) ----------
+  const popupRef = useRef(null);
+  const containerRef = useRef(null); // DOM node that we portal into (in popup headless doc)
+
+  const openPopup = () => {
+    // Try to open a centered window
+    const width = Math.min(980, window.screen.availWidth - 80);
+    const height = Math.min(720, window.screen.availHeight - 80);
+    const left = Math.max(20, (window.screen.availWidth - width) / 2);
+    const top = Math.max(20, (window.screen.availHeight - height) / 2);
+
+    const win = window.open(
+      "",
+      "CopilotChatWindow",
+      `width=${width},height=${height},left=${left},top=${top},resizable=yes,scrollbars=yes`
+    );
+    if (!win || win.closed) {
+      // Popup blocked — fallback: full-screen overlay (we'll just undock style)
+      alert("Popup blocked by the browser. Allow popups for this site to use Maximize.");
+      return;
+    }
+    win.document.title = "Copilot";
+    // Basic stylesheet injection for the popup to look the same
+    const styleEl = win.document.createElement("style");
+    styleEl.textContent = baseCSSForExternalWindow();
+    win.document.head.appendChild(styleEl);
+
+    // Create a mount point for the portal
+    const mount = win.document.createElement("div");
+    mount.id = "copilot-root";
+    win.document.body.appendChild(mount);
+
+    // Track and clean up
+    popupRef.current = win;
+    containerRef.current = mount;
+
+    // When user closes the popout, restore docked view
+    const onBeforeUnload = () => {
+      setPoppedOut(false);
+    };
+    win.addEventListener("beforeunload", onBeforeUnload);
+
+    setPoppedOut(true);
+  };
+
+  useEffect(() => {
+    // Cleanup if parent unmounts while popup is open
+    return () => {
+      try {
+        if (popupRef.current && !popupRef.current.closed) {
+          popupRef.current.close();
+        }
+      } catch (_) {}
+    };
+  }, []);
+
+  // ---------- CHAT SEND ----------
+  const sendMessage = async (text) => {
+    if (!text.trim()) return;
+    const userMsg = { role: "user", text };
+    setMessages((m) => [...m, userMsg]);
+    setInput("");
+    setLoading(true);
+
+    try {
+      // TODO: replace with your LangGraph API endpoint
+      // Example POST to FastAPI:
+      // const res = await fetch("http://localhost:8000/chat", {
+      //   method: "POST",
+      //   headers: { "Content-Type": "application/json" },
+      //   body: JSON.stringify({ question: text }),
+      // });
+      // const data = await res.json();
+      // const botText = data.answer || "(no answer)";
+      // Demo response (remove when wiring up):
+      const botText = demoResponder(text);
+
+      setMessages((m) => [...m, { role: "assistant", text: botText }]);
+    } catch (e) {
+      setMessages((m) => [
+        ...m,
+        { role: "assistant", text: "Sorry, I hit an error reaching the backend." },
+      ]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const onSuggestionClick = (s) => sendMessage(s);
+
+  const ChatUI = (
+    <div style={styles.shell} aria-live="polite" role="dialog" aria-label="Copilot chat">
+      <Header
+        poppedOut={poppedOut}
+        minimized={minimized}
+        onMinimize={() => setMinimized((v) => !v)}
+        onMaximize={openPopup}
+        onRestore={() => {
+          try {
+            if (popupRef.current && !popupRef.current.closed) {
+              popupRef.current.close();
+            }
+          } catch (_) {}
+          setPoppedOut(false);
+          setMinimized(false);
+        }}
+      />
+      {!minimized && (
+        <>
+          <MessagesList messages={messages} loading={loading} />
+          <SuggestionsRow suggestions={suggestions} onPick={onSuggestionClick} />
+          <Composer
+            value={input}
+            onChange={setInput}
+            onSend={() => sendMessage(input)}
+            disabled={loading}
+          />
+        </>
+      )}
+    </div>
+  );
+
+  // If popped out, render into the external window via a portal
+  if (poppedOut && containerRef.current && popupRef.current && !popupRef.current.closed) {
+    return ReactDOM.createPortal(ChatUI, containerRef.current);
+  }
+
+  // Docked chat (bottom-right)
+  return (
+    <div style={styles.dock}>
+      {ChatUI}
+    </div>
+  );
+}
+
+/* ---------- Subcomponents ---------- */
+
+function Header({ poppedOut, minimized, onMinimize, onMaximize, onRestore }) {
+  return (
+    <div style={styles.header}>
+      <div style={styles.headerLeft}>
+        <div style={styles.logoCircle} aria-hidden />
+        <div>
+          <div style={styles.title}>Copilot</div>
+          <div style={styles.subtitle}>Ready to help</div>
+        </div>
+      </div>
+      <div style={styles.headerActions}>
+        <button
+          title={minimized ? "Restore" : "Minimize"}
+          onClick={onMinimize}
+          style={styles.iconBtn}
+          aria-label={minimized ? "Restore chat" : "Minimize chat"}
+        >
+          {minimized ? "▣" : "—"}
+        </button>
+        {!poppedOut ? (
+          <button
+            title="Maximize (open in new window)"
+            onClick={onMaximize}
+            style={styles.iconBtn}
+            aria-label="Open chat in new window"
+          >
+            ⤢
+          </button>
+        ) : (
+          <button
+            title="Return to docked window"
+            onClick={onRestore}
+            style={styles.iconBtn}
+            aria-label="Return chat to this window"
+          >
+            ⤡
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function MessagesList({ messages, loading }) {
+  const listRef = useRef(null);
+  useEffect(() => {
+    if (listRef.current) {
+      listRef.current.scrollTop = listRef.current.scrollHeight;
+    }
+  }, [messages, loading]);
+
+  return (
+    <div ref={listRef} style={styles.messages}>
+      {messages.map((m, i) => (
+        <div
+          key={i}
+          style={{ ...styles.msgRow, justifyContent: m.role === "user" ? "flex-end" : "flex-start" }}
+        >
+          {m.role === "assistant" && <div style={styles.avatar} aria-hidden />}
+          <div
+            style={{
+              ...styles.bubble,
+              ...(m.role === "user" ? styles.bubbleUser : styles.bubbleAssistant),
+            }}
+          >
+            {m.text}
+          </div>
+        </div>
+      ))}
+      {loading && (
+        <div style={{ ...styles.msgRow, justifyContent: "flex-start" }}>
+          <div style={styles.avatar} aria-hidden />
+          <div style={{ ...styles.bubble, ...styles.bubbleAssistant }}>
+            <TypingDots />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SuggestionsRow({ suggestions, onPick }) {
+  return (
+    <div style={styles.suggestions}>
+      {suggestions.map((s, idx) => (
+        <button key={idx} style={styles.suggestionBtn} onClick={() => onPick(s)}>
+          {s}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function Composer({ value, onChange, onSend, disabled }) {
+  const onKeyDown = (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      onSend();
+    }
+  };
+  return (
+    <div style={styles.composer}>
+      <textarea
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        onKeyDown={onKeyDown}
+        placeholder="Ask me anything..."
+        rows={1}
+        style={styles.textarea}
+        disabled={disabled}
+        aria-label="Type your message"
+      />
+      <button style={styles.sendBtn} onClick={onSend} disabled={disabled || !value.trim()}>
+        Send
+      </button>
+    </div>
+  );
+}
+
+function TypingDots() {
+  const [dot, setDot] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setDot((d) => (d + 1) % 3), 400);
+    return () => clearInterval(t);
+  }, []);
+  return <span>{["•", "••", "•••"][dot]}</span>;
+}
+
+/* ---------- Styles (JS-in-JS, stays in JSX) ---------- */
+
+const styles = {
+  dock: {
+    position: "fixed",
+    right: 16,
+    bottom: 16,
+    zIndex: 9999,
+  },
+  shell: {
+    width: 380,
+    maxHeight: "70vh",
+    display: "flex",
+    flexDirection: "column",
+    borderRadius: 16,
+    border: "1px solid rgba(0,0,0,0.08)",
+    boxShadow:
+      "0 10px 15px rgba(0,0,0,0.08), 0 4px 6px rgba(0,0,0,0.05)",
+    background: "linear-gradient(180deg, #ffffff, #fafbff)",
+    overflow: "hidden",
+    fontFamily:
+      'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji"',
+  },
+  header: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+    padding: "10px 12px",
+    borderBottom: "1px solid rgba(0,0,0,0.06)",
+    background: "linear-gradient(180deg, #f5f7ff, #eef2ff)",
+  },
+  headerLeft: { display: "flex", alignItems: "center", gap: 10 },
+  logoCircle: {
+    width: 28,
+    height: 28,
+    borderRadius: "50%",
+    background:
+      "conic-gradient(from 180deg at 50% 50%, #2563eb, #7c3aed, #06b6d4, #2563eb)",
+    boxShadow: "0 0 0 2px rgba(255,255,255,0.8)",
+  },
+  title: { fontWeight: 700, fontSize: 14, color: "#0f172a" },
+  subtitle: { fontSize: 12, color: "#475569" },
+  headerActions: { display: "flex", gap: 6 },
+  iconBtn: {
+    border: "none",
+    background: "transparent",
+    padding: "6px 8px",
+    borderRadius: 8,
+    cursor: "pointer",
+    fontSize: 16,
+    lineHeight: 1,
+  },
+  messages: {
+    flex: 1,
+    overflowY: "auto",
+    padding: 12,
+    background:
+      "radial-gradient(1200px 400px at 100% 0, rgba(99,102,241,0.06), transparent), #fff",
+  },
+  msgRow: { display: "flex", gap: 8, marginBottom: 10 },
+  avatar: {
+    width: 28,
+    height: 28,
+    borderRadius: "50%",
+    background:
+      "conic-gradient(from 180deg at 50% 50%, #2563eb, #7c3aed, #06b6d4, #2563eb)",
+    marginTop: 2,
+    flexShrink: 0,
+  },
+  bubble: {
+    maxWidth: "75%",
+    padding: "8px 12px",
+    borderRadius: 12,
+    fontSize: 14,
+    lineHeight: 1.4,
+    whiteSpace: "pre-wrap",
+    wordBreak: "break-word",
+  },
+  bubbleAssistant: {
+    background: "#f1f5f9",
+    color: "#0f172a",
+    borderTopLeftRadius: 4,
+  },
+  bubbleUser: {
+    background: "#2563eb",
+    color: "#fff",
+    borderTopRightRadius: 4,
+  },
+  suggestions: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 8,
+    padding: "6px 12px 0",
+  },
+  suggestionBtn: {
+    border: "1px solid rgba(37,99,235,0.2)",
+    background: "rgba(37,99,235,0.06)",
+    color: "#1e3a8a",
+    padding: "6px 10px",
+    borderRadius: 12,
+    cursor: "pointer",
+    fontSize: 12,
+  },
+  composer: {
+    display: "flex",
+    gap: 8,
+    padding: 12,
+    borderTop: "1px solid rgba(0,0,0,0.06)",
+    background: "#fff",
+  },
+  textarea: {
+    flex: 1,
+    resize: "none",
+    border: "1px solid #e2e8f0",
+    borderRadius: 10,
+    padding: "10px 12px",
+    fontSize: 14,
+    outline: "none",
+  },
+  sendBtn: {
+    border: "none",
+    background: "#2563eb",
+    color: "#fff",
+    padding: "10px 14px",
+    borderRadius: 10,
+    cursor: "pointer",
+    fontWeight: 600,
+  },
+};
+
+/* ---------- (Optional) CSS for the external window ---------- */
+function baseCSSForExternalWindow() {
+  // Mirrors the inlined styles to ensure fonts/scrolling look good in popup
+  return `
+    html, body { margin: 0; padding: 0; height: 100%; background: #fff; }
+    ::-webkit-scrollbar { width: 10px; height: 10px; }
+    ::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.2); border-radius: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    button, textarea { font-family: inherit; }
+  `;
+}
+
+/* ---------- Demo responder (remove when wiring API) ---------- */
+function demoResponder(text) {
+  // Simulate routing: DB-ish vs KB-ish
+  const lower = text.toLowerCase();
+  if (/(sum|total|count|average|avg|by month|group)/.test(lower)) {
+    return "I can generate an SQL query against your schema and summarize the results. (Wire me to your LangGraph SQL path.)";
+  }
+  if (/(doc|policy|help|how)/.test(lower)) {
+    return "I’ll search your knowledge base and cite top passages. (Wire me to your Chroma retriever.)";
+  }
+  return "Got it. I’ll pick the best tool based on your question and bring back an answer.";
+}
