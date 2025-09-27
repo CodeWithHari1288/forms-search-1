@@ -1,45 +1,48 @@
 import java.nio.file.*;
 import java.io.IOException;
 import java.util.*;
+import java.util.regex.*;
+
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.core.util.DefaultPrettyPrinter;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.ObjectWriter;
 
-public class RenameKeysFromSimpleMappings {
+public class RenameFromExportBlocks {
 
     public static void main(String[] args) throws Exception {
         // USAGE:
-        //   java RenameKeysFromSimpleMappings mappings.txt records.json output.json
-        Path mappingsPath = Paths.get(args.length > 0 ? args[0] : "mappings.txt");
-        Path recordsPath  = Paths.get(args.length > 1 ? args[1] : "records.json");
-        Path outputPath   = Paths.get(args.length > 2 ? args[2] : "output.json");
+        //   java RenameFromExportBlocks blocks.txt records.json output.json
+        Path blocksPath  = Paths.get(args.length > 0 ? args[0] : "blocks.txt");   // export const ... blocks
+        Path recordsPath = Paths.get(args.length > 1 ? args[1] : "records.json"); // JSON array of objects
+        Path outputPath  = Paths.get(args.length > 2 ? args[2] : "output.json");
 
-        // 1) Read mappings: "Question: prop" per line
-        Map<String, String> propToQuestion = readMappings(mappingsPath);
-        if (propToQuestion.isEmpty()) {
-            System.err.println("No valid mappings found. Expected lines like: Question1: prop1");
+        // 1) Build Prop -> Label/Question map from blocks file
+        String blocks = new String(Files.readAllBytes(blocksPath), "UTF-8");
+        Map<String,String> propToLabel = parsePropToLabel(blocks); // key: lower(prop) -> label
+        if (propToLabel.isEmpty()) {
+            System.err.println("No mappings found in export blocks. Need Label/Question and Prop.");
             return;
         }
+        System.out.println("Loaded mappings: " + propToLabel.size());
 
-        // 2) Read JSON array (preserve insertion order)
+        // 2) Read JSON array (preserve insertion order of keys)
         ObjectMapper om = new ObjectMapper();
         List<LinkedHashMap<String,Object>> rows = om.readValue(
                 Files.newBufferedReader(recordsPath),
                 new TypeReference<List<LinkedHashMap<String,Object>>>() {}
         );
 
-        // 3) Rename keys per object (top-level only)
+        // 3) Rename keys per object (top-level only). Unmapped keys stay.
         List<Map<String,Object>> out = new ArrayList<>(rows.size());
         for (LinkedHashMap<String,Object> row : rows) {
             LinkedHashMap<String,Object> renamed = new LinkedHashMap<>();
             for (Map.Entry<String,Object> e : row.entrySet()) {
                 String key = e.getKey();
                 Object val = e.getValue();
-                // Case-insensitive match on prop name
-                String q = propToQuestion.get(key.toLowerCase(Locale.ROOT));
-                String newKey = (q != null && !q.isEmpty()) ? q : key;
-                // If multiple props map to same question, last one wins; change if needed.
+                String label = propToLabel.get(key.toLowerCase(Locale.ROOT));
+                String newKey = (label != null && !label.isEmpty()) ? label : key;
+                // If two props map to same label in one object, last wins; change policy if needed.
                 renamed.put(newKey, val);
             }
             out.add(renamed);
@@ -51,26 +54,39 @@ public class RenameKeysFromSimpleMappings {
         System.out.println("Wrote " + out.size() + " records -> " + outputPath.toAbsolutePath());
     }
 
-    private static Map<String,String> readMappings(Path mappingsPath) throws IOException {
-        // map: lower(prop) -> question
-        Map<String,String> m = new LinkedHashMap<>();
-        List<String> lines = Files.readAllLines(mappingsPath);
-        for (String raw : lines) {
-            String line = raw.trim();
-            if (line.isEmpty()) continue;
-            // allow comments with // or #
-            if (line.startsWith("//") || line.startsWith("#")) continue;
+    /* ---------------- Parse `export const Name = { ... }` blocks ---------------- */
+    private static Map<String,String> parsePropToLabel(String text) {
+        Map<String,String> map = new LinkedHashMap<>();
 
-            int idx = line.indexOf(':');
-            if (idx < 0) continue;
+        // Match whole blocks: export const <Key> = { ... }
+        Pattern block = Pattern.compile(
+            "export\\s+const\\s+[A-Za-z0-9_$]+\\s*=\\s*\\{(.*?)\\}",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL
+        );
 
-            String question = line.substring(0, idx).trim();
-            String prop     = line.substring(idx + 1).trim();
+        // Inside block: Label / Question and Prop / Property (quoted values)
+        Pattern pQuestion = Pattern.compile("\\bQuestion\\b\\s*:\\s*(['\"])(.*?)\\1",
+                Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+        Pattern pLabel    = Pattern.compile("\\bLabel\\b\\s*:\\s*(['\"])(.*?)\\1",
+                Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+        Pattern pProp     = Pattern.compile("\\bProp(?:erty)?\\b\\s*:\\s*(['\"])(.*?)\\1",
+                Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
 
-            if (!question.isEmpty() && !prop.isEmpty()) {
-                m.put(prop.toLowerCase(Locale.ROOT), question);
+        Matcher m = block.matcher(text);
+        while (m.find()) {
+            String body = m.group(1);
+            String label = first(pQuestion, body);
+            if (label == null) label = first(pLabel, body);
+            String prop = first(pProp, body);
+            if (label != null && prop != null && !prop.isEmpty()) {
+                map.put(prop.trim().toLowerCase(Locale.ROOT), label.trim());
             }
         }
-        return m;
+        return map;
+    }
+
+    private static String first(Pattern p, String s) {
+        Matcher m = p.matcher(s);
+        return m.find() ? m.group(2) : null;
     }
 }
