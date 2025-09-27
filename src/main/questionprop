@@ -1,0 +1,40 @@
+import java.io.*;
+import java.nio.file.*;
+import java.util.*;
+import java.util.regex.*;
+
+public class ExtractProps {
+    public static void main(String[] args) throws IOException {
+        // Input and output file paths
+        Path inputPath = Paths.get("input.txt");   // file containing export const blocks
+        Path outputPath = Paths.get("output.txt"); // result file
+
+        // Regex patterns
+        Pattern labelPattern = Pattern.compile("Label\\s*[:=]\\s*\"?([^\"]+)\"?");
+        Pattern propPattern  = Pattern.compile("Property\\s*[:=]\\s*\"?([^\"]+)\"?");
+
+        List<String> lines = Files.readAllLines(inputPath);
+        List<String> output = new ArrayList<>();
+
+        String currentLabel = null;
+        String currentProp  = null;
+
+        for (String line : lines) {
+            Matcher m1 = labelPattern.matcher(line);
+            if (m1.find()) currentLabel = m1.group(1);
+
+            Matcher m2 = propPattern.matcher(line);
+            if (m2.find()) currentProp = m2.group(1);
+
+            // Once both are found in a block, write them out
+            if (currentLabel != null && currentProp != null) {
+                output.add("Label: " + currentLabel + " | Property: " + currentProp);
+                currentLabel = null;
+                currentProp  = null;
+            }
+        }
+
+        Files.write(outputPath, output, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        System.out.println("Extracted " + output.size() + " entries to " + outputPath);
+    }
+}
