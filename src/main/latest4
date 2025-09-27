@@ -4,13 +4,17 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
  * ChatCopilot.jsx
  * - Docked widget in-page
  * - "Open in new tab" -> full-page with LEFT history sidebar
- * - Live sync across tabs via BroadcastChannel (storage fallback)
+ * - Live sync across tabs WITHOUT blinking (instanceId + suppressBroadcast + debounce)
  */
 
 export default function ChatCopilot() {
   const params = new URLSearchParams(window.location.search);
   const isFull = params.get("copilot") === "1";
   const sidParam = params.get("sid");
+
+  // --- identity to avoid echo loops ---
+  const instanceId = useRef(cryptoRandomId());     // unique per tab
+  const suppressBroadcast = useRef(false);         // true while applying remote state
 
   const [minimized, setMinimized] = useState(false);
   const [messages, setMessages] = useState(() => [
@@ -29,7 +33,7 @@ export default function ChatCopilot() {
     []
   );
 
-  // -------- Cross-tab sync --------
+  // -------- Cross-tab sync (no flicker) --------
   const channelRef = useRef(null);
   useEffect(() => {
     try { channelRef.current = new BroadcastChannel("copilot-chat"); }
@@ -37,17 +41,25 @@ export default function ChatCopilot() {
 
     const onMsg = (ev) => {
       const data = ev.data || ev;
-      if (data?.type === "STATE_SYNC" && data?.payload) {
-        const { messages: ms, minimized: mi, input: ip } = data.payload;
-        setMessages((prev) => (JSON.stringify(prev) !== JSON.stringify(ms) ? ms : prev));
-        setMinimized((prev) => (prev !== mi ? mi : prev));
-        setInput((prev) => (prev !== ip ? ip : prev));
-      }
+      if (data?.type !== "STATE_SYNC" || !data?.payload) return;
+      // Ignore my own messages
+      if (data.from === instanceId.current) return;
+
+      const { messages: ms, minimized: mi, input: ip } = data.payload;
+
+      // Apply remote state without re-broadcasting
+      suppressBroadcast.current = true;
+      if (Array.isArray(ms)) setMessages(ms);
+      if (typeof mi === "boolean") setMinimized(mi);
+      if (typeof ip === "string") setInput(ip);
+      // allow paint before re-enabling broadcast
+      queueMicrotask(() => { suppressBroadcast.current = false; });
     };
 
     if (channelRef.current) {
       channelRef.current.onmessage = onMsg;
     } else {
+      // storage fallback
       const onStorage = (e) => {
         if (e.key === "copilot:sync" && e.newValue) {
           try { onMsg(JSON.parse(e.newValue)); } catch {}
@@ -60,14 +72,23 @@ export default function ChatCopilot() {
     return () => { try { channelRef.current && channelRef.current.close(); } catch {} };
   }, []);
 
+  // Debounced broadcast
+  const debTimer = useRef(null);
   const broadcast = (payload) => {
-    const msg = { type: "STATE_SYNC", payload };
-    if (channelRef.current) channelRef.current.postMessage(msg);
-    else {
-      localStorage.setItem("copilot:sync", JSON.stringify(msg));
-      setTimeout(() => localStorage.removeItem("copilot:sync"), 0);
-    }
+    if (suppressBroadcast.current) return; // don’t echo remote updates
+    const msg = { type: "STATE_SYNC", from: instanceId.current, payload };
+    // debounce to coalesce rapid state changes (e.g., typing)
+    clearTimeout(debTimer.current);
+    debTimer.current = setTimeout(() => {
+      if (channelRef.current) channelRef.current.postMessage(msg);
+      else {
+        localStorage.setItem("copilot:sync", JSON.stringify(msg));
+        setTimeout(() => localStorage.removeItem("copilot:sync"), 0);
+      }
+    }, 80);
   };
+
+  // Broadcast on local state changes only
   useEffect(() => { broadcast({ messages, minimized, input }); }, [messages, minimized, input]);
 
   // hydrate on full tab open
@@ -77,9 +98,11 @@ export default function ChatCopilot() {
       if (raw) {
         try {
           const snap = JSON.parse(raw);
+          suppressBroadcast.current = true;
           if (snap.messages) setMessages(snap.messages);
           if (typeof snap.minimized === "boolean") setMinimized(snap.minimized);
           if (typeof snap.input === "string") setInput(snap.input);
+          queueMicrotask(() => { suppressBroadcast.current = false; });
         } catch {}
       }
     }
@@ -101,7 +124,7 @@ export default function ChatCopilot() {
 
   const onSuggestionClick = (s) => sendMessage(s);
 
-  // -------- open in new tab (full-page with LEFT history) --------
+  // -------- open in new tab (LEFT history layout) --------
   const openInNewTab = () => {
     const sid = cryptoRandomId();
     const snapKey = `copilot:snapshot:${sid}`;
@@ -114,7 +137,6 @@ export default function ChatCopilot() {
 
   // -------- UI containers --------
   if (isFull) {
-    // FULL-PAGE SPLIT: LEFT history, RIGHT chat
     return (
       <div style={styles.fullGrid}>
         <Sidebar messages={messages} onPick={(t) => sendMessage(t)} />
@@ -137,7 +159,6 @@ export default function ChatCopilot() {
     );
   }
 
-  // Docked widget
   return (
     <div style={styles.dock}>
       <ChatShell
@@ -226,7 +247,6 @@ function Header({ isFull, minimized, onMinimize, onOpenTab }) {
 }
 
 function Sidebar({ messages, onPick }) {
-  // Recent user prompts as "history"
   const items = useMemo(() => {
     const users = messages.filter((m) => m.role === "user").slice(-50).reverse();
     return users.map((m, idx) => ({
@@ -334,43 +354,26 @@ function TypingDots() {
 /* ---------------- Styles ---------------- */
 
 const styles = {
-  // In-page docked widget
   dock: { position: "fixed", right: 16, bottom: 16, zIndex: 9999 },
 
-  // Full-page split (LEFT history, RIGHT chat)
   fullGrid: {
-    position: "fixed",
-    inset: 0,
-    display: "grid",
-    gridTemplateColumns: "300px 1fr",
-    gridTemplateRows: "1fr",
-    background: "#fff",
+    position: "fixed", inset: 0, display: "grid",
+    gridTemplateColumns: "300px 1fr", gridTemplateRows: "1fr", background: "#fff",
   },
   fullMain: { display: "flex", alignItems: "center", justifyContent: "center", padding: 16 },
 
-  // Sidebar
   sidebar: {
-    borderRight: "1px solid #e5e7eb",
-    padding: 12,
-    display: "flex",
-    flexDirection: "column",
-    gap: 8,
-    minWidth: 0,
+    borderRight: "1px solid #e5e7eb", padding: 12,
+    display: "flex", flexDirection: "column", gap: 8, minWidth: 0,
   },
   sidebarHeader: { fontWeight: 700, fontSize: 14, color: "#0f172a", padding: "2px 4px" },
   sidebarList: { overflowY: "auto", flex: 1, display: "flex", flexDirection: "column", gap: 6 },
   sidebarEmpty: { color: "#64748b", fontSize: 13, padding: "8px 4px" },
   sidebarItem: {
-    textAlign: "left",
-    padding: "8px 10px",
-    borderRadius: 8,
-    border: "1px solid #e5e7eb",
-    background: "#fff",
-    cursor: "pointer",
-    fontSize: 13,
+    textAlign: "left", padding: "8px 10px", borderRadius: 8,
+    border: "1px solid #e5e7eb", background: "#fff", cursor: "pointer", fontSize: 13,
   },
 
-  // Chat shells
   shellDock: {
     width: 380, maxHeight: "70vh", height: "auto",
     display: "flex", flexDirection: "column",
@@ -382,14 +385,11 @@ const styles = {
       'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji"',
   },
   shellFull: {
-    width: "min(980px, 92vw)",
-    height: "min(90vh, 960px)",
-    borderRadius: 16,
-    border: "1px solid rgba(0,0,0,0.08)",
+    width: "min(980px, 92vw)", height: "min(90vh, 960px)",
+    borderRadius: 16, border: "1px solid rgba(0,0,0,0.08)",
     boxShadow: "0 10px 15px rgba(0,0,0,0.08), 0 4px 6px rgba(0,0,0,0.05)",
     background: "linear-gradient(180deg, #ffffff, #fafbff)",
-    display: "flex", flexDirection: "column",
-    overflow: "hidden",
+    display: "flex", flexDirection: "column", overflow: "hidden",
     fontFamily:
       'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji"',
   },
@@ -401,8 +401,8 @@ const styles = {
   },
   headerLeft: { display: "flex", alignItems: "center", gap: 10 },
   logoCircle: {
-    width: 28, height: 28, borderRadius: "50%",
-    background: "conic-gradient(from 180deg at 50% 50%, #2563eb, #7c3aed, #06b6d4, #2563eb)",
+    width: 28, height: 28, borderRadius: "50%", background:
+      "conic-gradient(from 180deg at 50% 50%, #2563eb, #7c3aed, #06b6d4, #2563eb)",
     boxShadow: "0 0 0 2px rgba(255,255,255,0.8)",
   },
   title: { fontWeight: 700, fontSize: 14, color: "#0f172a" },
@@ -419,8 +419,8 @@ const styles = {
   },
   msgRow: { display: "flex", gap: 8, marginBottom: 10 },
   avatar: {
-    width: 28, height: 28, borderRadius: "50%",
-    background: "conic-gradient(from 180deg at 50% 50%, #2563eb, #7c3aed, #06b6d4, #2563eb)",
+    width: 28, height: 28, borderRadius: "50%", background:
+      "conic-gradient(from 180deg at 50% 50%, #2563eb, #7c3aed, #06b6d4, #2563eb)",
     marginTop: 2, flexShrink: 0,
   },
   bubble: {
@@ -432,9 +432,8 @@ const styles = {
 
   suggestions: { display: "flex", flexWrap: "wrap", gap: 8, padding: "6px 12px 0" },
   suggestionBtn: {
-    border: "1px solid rgba(37,99,235,0.2)",
-    background: "rgba(37,99,235,0.06)", color: "#1e3a8a",
-    padding: "6px 10px", borderRadius: 12, cursor: "pointer", fontSize: 12,
+    border: "1px solid rgba(37,99,235,0.2)", background: "rgba(37,99,235,0.06)",
+    color: "#1e3a8a", padding: "6px 10px", borderRadius: 12, cursor: "pointer", fontSize: 12,
   },
 
   composer: { display: "flex", gap: 8, padding: 12, borderTop: "1px solid rgba(0,0,0,0.06)", background: "#fff" },
