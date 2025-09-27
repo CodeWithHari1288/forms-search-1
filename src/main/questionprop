@@ -1,40 +1,52 @@
-import java.io.*;
 import java.nio.file.*;
-import java.util.*;
+import java.io.IOException;
 import java.util.regex.*;
+import java.util.*;
 
-public class ExtractProps {
+public class ExtractLabelProp {
     public static void main(String[] args) throws IOException {
-        // Input and output file paths
-        Path inputPath = Paths.get("input.txt");   // file containing export const blocks
-        Path outputPath = Paths.get("output.txt"); // result file
+        // USAGE: java ExtractLabelProp [inputFile] [outputFile]
+        Path in  = Paths.get(args.length > 0 ? args[0] : "input.txt");
+        Path out = Paths.get(args.length > 1 ? args[1] : "output.txt");
 
-        // Regex patterns
-        Pattern labelPattern = Pattern.compile("Label\\s*[:=]\\s*\"?([^\"]+)\"?");
-        Pattern propPattern  = Pattern.compile("Property\\s*[:=]\\s*\"?([^\"]+)\"?");
+        String text = new String(Files.readAllBytes(in), "UTF-8");
 
-        List<String> lines = Files.readAllLines(inputPath);
-        List<String> output = new ArrayList<>();
+        // Match: export const <key> = { ... }
+        Pattern block = Pattern.compile(
+            "export\\s+const\\s+[A-Za-z0-9_$]+\\s*=\\s*\\{(.*?)\\}",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL
+        );
 
-        String currentLabel = null;
-        String currentProp  = null;
+        // Inside each block, find Label: "..."   and Prop: "..."
+        // Handles single/double quotes and whitespace/newlines.
+        Pattern pLabel = Pattern.compile("\\bLabel\\b\\s*:\\s*(['\"])(.*?)\\1",
+                Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+        Pattern pProp  = Pattern.compile("\\bProp\\b\\s*:\\s*(['\"])(.*?)\\1",
+                Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
 
-        for (String line : lines) {
-            Matcher m1 = labelPattern.matcher(line);
-            if (m1.find()) currentLabel = m1.group(1);
+        Matcher m = block.matcher(text);
+        List<String> lines = new ArrayList<>();
+        int count = 0;
 
-            Matcher m2 = propPattern.matcher(line);
-            if (m2.find()) currentProp = m2.group(1);
+        while (m.find()) {
+            String body = m.group(1);
 
-            // Once both are found in a block, write them out
-            if (currentLabel != null && currentProp != null) {
-                output.add("Label: " + currentLabel + " | Property: " + currentProp);
-                currentLabel = null;
-                currentProp  = null;
+            String label = matchFirst(pLabel, body);
+            String prop  = matchFirst(pProp,  body);
+
+            if (label != null && prop != null) {
+                lines.add("Label: " + label + " | Prop: " + prop);
+                count++;
             }
         }
 
-        Files.write(outputPath, output, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-        System.out.println("Extracted " + output.size() + " entries to " + outputPath);
+        Files.write(out, lines, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        System.out.println("Extracted " + count + " entries -> " + out.toAbsolutePath());
+    }
+
+    private static String matchFirst(Pattern p, String s) {
+        Matcher m = p.matcher(s);
+        if (m.find()) return m.group(2).trim();
+        return null;
     }
 }
