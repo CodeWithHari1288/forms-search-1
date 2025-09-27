@@ -1,0 +1,86 @@
+import java.io.IOException;
+import java.nio.file.*;
+import java.util.*;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.core.util.DefaultPrettyPrinter;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.ObjectWriter;
+
+public class PropToQuestionDeepCI {
+
+    public static void main(String[] args) throws Exception {
+        // Usage: java PropToQuestionDeepCI mappings.txt input.json output.json
+        Path mappingsPath = Paths.get(args.length > 0 ? args[0] : "mappings.txt");
+        Path inputPath    = Paths.get(args.length > 1 ? args[1] : "input.json");
+        Path outputPath   = Paths.get(args.length > 2 ? args[2] : "output.json");
+
+        // 1. Load mappings (stored in lowercase)
+        Map<String, String> propToQuestion = loadMappings(mappingsPath);
+        System.out.println("Loaded " + propToQuestion.size() + " mappings.");
+
+        // 2. Read JSON array
+        ObjectMapper mapper = new ObjectMapper();
+        List<Object> records = mapper.readValue(
+            Files.newBufferedReader(inputPath),
+            new TypeReference<List<Object>>() {}
+        );
+
+        // 3. Transform recursively
+        List<Object> transformed = new ArrayList<>();
+        for (Object record : records) {
+            transformed.add(renameRecursive(record, propToQuestion));
+        }
+
+        // 4. Write output JSON
+        ObjectWriter writer = mapper.writer(new DefaultPrettyPrinter());
+        writer.writeValue(outputPath.toFile(), transformed);
+        System.out.println("Wrote " + transformed.size() + " records -> " + outputPath.toAbsolutePath());
+    }
+
+    /** Recursively rename keys using case-insensitive matching */
+    @SuppressWarnings("unchecked")
+    private static Object renameRecursive(Object node, Map<String,String> propToQuestion) {
+        if (node instanceof Map) {
+            Map<String,Object> map = (Map<String,Object>) node;
+            Map<String,Object> renamed = new LinkedHashMap<>();
+            for (Map.Entry<String,Object> e : map.entrySet()) {
+                String key = e.getKey();
+                Object val = e.getValue();
+
+                String mapped = propToQuestion.get(key.toLowerCase(Locale.ROOT));
+                String newKey = (mapped != null) ? mapped : key;
+
+                renamed.put(newKey, renameRecursive(val, propToQuestion));
+            }
+            return renamed;
+        } else if (node instanceof List) {
+            List<?> list = (List<?>) node;
+            List<Object> renamedList = new ArrayList<>();
+            for (Object item : list) {
+                renamedList.add(renameRecursive(item, propToQuestion));
+            }
+            return renamedList;
+        } else {
+            return node; // primitive
+        }
+    }
+
+    /** Read mappings.txt with lines like 'prop: question' */
+    private static Map<String,String> loadMappings(Path path) throws IOException {
+        Map<String,String> map = new HashMap<>();
+        for (String line : Files.readAllLines(path)) {
+            String trimmed = line.trim();
+            if (trimmed.isEmpty() || trimmed.startsWith("#")) continue;
+            int idx = trimmed.indexOf(':');
+            if (idx < 0) continue;
+
+            String prop = trimmed.substring(0, idx).trim();
+            String question = trimmed.substring(idx + 1).trim();
+
+            if (!prop.isEmpty() && !question.isEmpty()) {
+                map.put(prop.toLowerCase(Locale.ROOT), question);
+            }
+        }
+        return map;
+    }
+}
