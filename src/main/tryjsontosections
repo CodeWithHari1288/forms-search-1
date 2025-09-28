@@ -1,0 +1,212 @@
+import json
+import re
+from datetime import date
+from typing import Any, Dict, List, Tuple, Union
+import pandas as pd
+
+# --- Utilities ---
+def camel_to_words(s: str) -> str:
+    s = re.sub(r"[_\-]+", " ", s)
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.lower()
+
+def title_case_words(s: str) -> str:
+    return " ".join(w.capitalize() for w in s.split())
+
+def short_value(v: Any, maxlen: int = 120) -> str:
+    if isinstance(v, (dict, list)):
+        return json.dumps(v)[:maxlen] + ("…" if len(json.dumps(v)) > maxlen else "")
+    s = str(v)
+    return s[:maxlen] + ("…" if len(s) > maxlen else "")
+
+# --- Statement Builder ---
+Statement = Dict[str, Any]
+
+def make_statements(record_id: str, obj: Any, base_subject: str, section: str, path: List[Union[str, int]]) -> List[Statement]:
+    statements: List[Statement] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            key_words = camel_to_words(k)
+            child_subject = f"{base_subject} {key_words}".strip()
+            new_path = path + [k]
+            if isinstance(v, (dict, list)):
+                statements.append({
+                    "record_id": record_id,
+                    "section": section,
+                    "subject": base_subject,
+                    "predicate": "relates to",
+                    "object": key_words,
+                    "path": "/".join(map(str, new_path)),
+                    "in_list": False,
+                    "list_index": None,
+                    "list_length": None
+                })
+                statements.extend(make_statements(record_id, v, child_subject, section, new_path))
+            else:
+                statements.append({
+                    "record_id": record_id,
+                    "section": section,
+                    "subject": base_subject,
+                    "predicate": f"has {key_words}",
+                    "object": v,
+                    "path": "/".join(map(str, new_path)),
+                    "in_list": False,
+                    "list_index": None,
+                    "list_length": None
+                })
+    elif isinstance(obj, list):
+        # Count of list
+        statements.append({
+            "record_id": record_id,
+            "section": section,
+            "subject": base_subject,
+            "predicate": "has count",
+            "object": len(obj),
+            "path": "/".join(map(str, path)),
+            "in_list": True,
+            "list_index": None,
+            "list_length": len(obj),
+        })
+        for i, v in enumerate(obj):
+            idx_subject = f"{base_subject} item"
+            new_path = path + [i]
+            if isinstance(v, (dict, list)):
+                statements.append({
+                    "record_id": record_id,
+                    "section": section,
+                    "subject": base_subject,
+                    "predicate": "relates to item",
+                    "object": i,
+                    "path": "/".join(map(str, new_path)),
+                    "in_list": True,
+                    "list_index": i,
+                    "list_length": len(obj),
+                })
+                statements.extend(make_statements(record_id, v, idx_subject, section, new_path))
+            else:
+                statements.append({
+                    "record_id": record_id,
+                    "section": section,
+                    "subject": base_subject,
+                    "predicate": "has item",
+                    "object": v,
+                    "path": "/".join(map(str, new_path)),
+                    "in_list": True,
+                    "list_index": i,
+                    "list_length": len(obj),
+                })
+    else:
+        # Scalar fallback
+        statements.append({
+            "record_id": record_id,
+            "section": section,
+            "subject": base_subject,
+            "predicate": "has value",
+            "object": obj,
+            "path": "/".join(map(str, path)),
+            "in_list": False,
+            "list_index": None,
+            "list_length": None
+        })
+    return statements
+
+# --- Sections Builder ---
+def make_sections_text(record_id: str, contract: Dict[str, Any]) -> Tuple[str, List[Statement]]:
+    lines: List[str] = []
+    all_statements: List[Statement] = []
+
+    header = contract.get("header", {})
+    parties = header.get("parties", {})
+    contract_subject = f"contract {record_id}"
+    today_str = str(date.today())
+
+    # Title
+    lines.append(f"# Contract {record_id}: {header.get('title', 'Untitled Contract')}")
+    lines.append(f"Effective date: {header.get('effectiveDate','unknown')} | Governing law: {header.get('governingLaw','unknown')} | Generated: {today_str}")
+
+    # Parties
+    lines.append("\n## Parties")
+    if isinstance(parties, dict):
+        for role, name in parties.items():
+            lines.append(f"- {title_case_words(role)}: {name}")
+    all_statements += make_statements(record_id, header, f"{contract_subject} header", "header", ["header"])
+
+    # Scenarios
+    scenarios = contract.get("scenarios", [])
+    lines.append("\n## Scenarios Overview")
+    lines.append(f"- Total scenarios: {len(scenarios)}")
+    all_statements += make_statements(record_id, scenarios, f"{contract_subject} scenarios", "scenarios", ["scenarios"])
+
+    for idx, sc in enumerate(scenarios, start=1):
+        s_title = sc.get("title", f"Scenario {idx}")
+        lines.append(f"\n### Scenario {idx}: {s_title}")
+        desc = sc.get("description", "")
+        if desc:
+            lines.append(f"{desc}")
+        # Key counts
+        approvers = sc.get("approvers", [])
+        ids_list = sc.get("ids", [])
+        obligations = sc.get("obligations", [])
+        lines.append(f"- IDs: {len(ids_list)} item(s)")
+        lines.append(f"- Approvers: {len(approvers)} person(s)")
+        lines.append(f"- Obligations: {len(obligations)} item(s)")
+
+        # Payment terms
+        pt = sc.get("paymentTerms", {})
+        if isinstance(pt, dict) and pt:
+            freq = pt.get("frequency", "unspecified")
+            method = pt.get("method", "unspecified")
+            lines.append(f"- Payment terms: {freq}, method {method}")
+
+        # Obligations summary
+        if obligations:
+            lines.append("**Obligations (summary):**")
+            for j, ob in enumerate(obligations, start=1):
+                who = ob.get("party", "Unknown party")
+                what = short_value(ob.get("action", ""))
+                when = ob.get("when", "unspecified timing")
+                lines.append(f"  {j}. {who} must {what} (when: {when})")
+
+        # Statements for this scenario
+        all_statements += make_statements(record_id, sc, f"{contract_subject} scenario {idx}", f"scenario {idx}", ["scenarios", idx-1])
+
+    # Approval matrix
+    lines.append("\n## Approval Matrix (All Scenarios)")
+    approval_rows = []
+    for idx, sc in enumerate(scenarios, start=1):
+        for ap in sc.get("approvers", []):
+            approval_rows.append((idx, ap.get("role",""), ap.get("name",""), ap.get("department","")))
+    if approval_rows:
+        lines.append("| Scenario | Role | Name | Department |")
+        lines.append("|---|---|---|---|")
+        for row in approval_rows:
+            lines.append(f"| {row[0]} | {row[1]} | {row[2]} | {row[3]} |")
+
+    lines.append(f"\n--- End of Record {record_id} ---")
+    return "\n".join(lines), all_statements
+
+# --- Example Usage ---
+contracts = [...]  # <== place the JSON I showed you earlier here
+
+sections_texts = []
+all_records_statements: List[pd.DataFrame] = []
+
+for c in contracts:
+    rec_id = c.get("id", "UNKNOWN")
+    text, statements = make_sections_text(rec_id, c)
+    sections_texts.append(text)
+
+    df = pd.DataFrame(statements)
+    df["statement_idx"] = df.groupby(["record_id","section"]).cumcount() + 1
+    all_records_statements.append(df)
+
+statements_df = pd.concat(all_records_statements, ignore_index=True)
+
+# Save sections text for embeddings
+with open("contract_sections_for_embeddings.txt", "w", encoding="utf-8") as f:
+    f.write("\n\n".join(sections_texts))
+
+print("✅ Generated sections text + statements")
+print("Statements shape:", statements_df.shape)
+print(sections_texts[0][:500])  # preview
