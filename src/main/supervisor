@@ -1,0 +1,264 @@
+# langgraph_supervisor_fanout.py
+from typing import TypedDict, Dict, Any, List, Literal
+from typing_extensions import NotRequired
+from langgraph.graph import StateGraph, END
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import httpx, os, json
+
+# -------------------------
+# Config
+# -------------------------
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+DEFAULT_TIMEOUT = 15.0
+LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "60"))
+
+# -------------------------
+# State
+# -------------------------
+class GraphState(TypedDict):
+    query: str
+    messages: NotRequired[List[Dict[str, Any]]]
+
+    # Supervisor outputs
+    routes: NotRequired[List[Literal["api", "llm"]]]   # e.g. ["api"], ["llm"], or ["api","llm"]
+    reason: NotRequired[str]
+    error: NotRequired[str]
+
+    # Route outputs
+    api_request: NotRequired[Dict[str, Any]]
+    api_response: NotRequired[Dict[str, Any]]
+    llm_response: NotRequired[str]
+
+# -------------------------
+# Ollama client (OpenAI-compatible /chat/completions)
+# -------------------------
+def ollama_chat(messages: List[Dict[str, str]], model: str = OLLAMA_MODEL, timeout: float = LLM_TIMEOUT) -> str:
+    payload = {"model": model, "messages": messages, "stream": False}
+    with httpx.Client(timeout=timeout) as client:
+        r = client.post(f"{OLLAMA_HOST}/v1/chat/completions", json=payload)
+        r.raise_for_status()
+        data = r.json()
+        return data["choices"][0]["message"]["content"]
+
+# -------------------------
+# Supervisor
+# -------------------------
+SUPERVISOR_SYSTEM = """You are a routing supervisor.
+Return STRICT JSON with keys:
+- "routes": array with any of ["api","llm"] in the order you recommend (non-empty)
+- "reason": short string
+- optional "api_request": {method,url,params?,json?,headers?,timeout?} if you choose "api".
+Rules:
+- If prompt clearly requires fetching from a service (e.g., Jira, ServiceNow, "call this api", URLs), include "api".
+- If prompt is general Q&A/reasoning, include "llm".
+- If unclear or mixed, include BOTH: ["api","llm"].
+Return only JSON, no extra text."""
+
+def supervisor(state: GraphState) -> GraphState:
+    q = state.get("query","")
+    messages = [
+        {"role":"system","content": SUPERVISOR_SYSTEM},
+        {"role":"user","content": q}
+    ]
+    try:
+        raw = ollama_chat(messages)
+        try:
+            decision = json.loads(raw)
+        except json.JSONDecodeError:
+            # crude bracket extraction if model adds framing
+            s, e = raw.find("{"), raw.rfind("}")
+            if s != -1 and e != -1 and e > s:
+                decision = json.loads(raw[s:e+1])
+            else:
+                raise
+
+        routes = decision.get("routes") or []
+        if not isinstance(routes, list) or not routes:
+            # fallback: if nothing returned, run both
+            routes = ["api","llm"]
+
+        # keep only supported values and unique while preserving order
+        norm = []
+        for r in routes:
+            if r in ("api","llm") and r not in norm:
+                norm.append(r)
+        if not norm:
+            norm = ["api","llm"]
+
+        state["routes"] = norm
+        state["reason"] = str(decision.get("reason",""))[:400]
+
+        api_req = decision.get("api_request")
+        if isinstance(api_req, dict):
+            state["api_request"] = api_req
+
+    except Exception as e:
+        # heuristic fallback
+        ql = q.lower()
+        triggers = ["http:", "https:", "api ", "jira", "servicenow", "endpoint", "curl", "get ", "post "]
+        if any(t in ql for t in triggers):
+            state["routes"] = ["api","llm"]   # mixed: fetch + explain
+            state["reason"] = "fallback heuristic (api+llm)"
+        else:
+            state["routes"] = ["llm"]
+            state["reason"] = "fallback heuristic (llm-only)"
+        state["error"] = f"Supervisor parse error: {type(e).__name__}: {e}"
+    return state
+
+# -------------------------
+# API caller
+# -------------------------
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=0.6, min=0.5, max=4),
+    retry=retry_if_exception_type(httpx.HTTPError),
+)
+def _do_http_call(req: Dict[str, Any]) -> Dict[str, Any]:
+    method = (req.get("method") or "GET").upper()
+    url    = req["url"]
+    timeout= req.get("timeout", DEFAULT_TIMEOUT)
+    headers= req.get("headers") or {}
+
+    # env var interpolation like {"X-API-Key":"${API_KEY}"}
+    for k,v in list(headers.items()):
+        if isinstance(v,str) and v.startswith("${") and v.endswith("}"):
+            headers[k] = os.getenv(v[2:-1], "")
+
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        resp = client.request(method, url,
+                              params=req.get("params"),
+                              json=req.get("json"),
+                              data=req.get("data"),
+                              headers=headers)
+    out = {"status_code": resp.status_code, "headers": dict(resp.headers)}
+    ctype = resp.headers.get("content-type","").lower()
+    if "application/json" in ctype:
+        try:
+            out["json"] = resp.json()
+        except json.JSONDecodeError:
+            out["text"] = resp.text
+    else:
+        out["text"] = resp.text
+    return out
+
+def build_default_request(query: str) -> Dict[str,Any]:
+    return {
+        "method": "GET",
+        "url": "https://postman-echo.com/get",
+        "params": {"q": query},
+        "headers": {"User-Agent": "LangGraph/SupervisorFanout"},
+        "timeout": DEFAULT_TIMEOUT
+    }
+
+def api_call(state: GraphState) -> GraphState:
+    req = state.get("api_request") or build_default_request(state.get("query",""))
+    try:
+        resp = _do_http_call(req)
+        state["api_response"] = resp
+    except Exception as e:
+        state["api_response"] = {"error": f"{type(e).__name__}: {e}"}
+    return state
+
+# -------------------------
+# LLM call
+# -------------------------
+LLM_SYSTEM = "You are a concise assistant. Answer helpfully in up to 8 sentences unless code is requested."
+
+def llm_call(state: GraphState) -> GraphState:
+    msgs = state.get("messages") or [
+        {"role":"system","content": LLM_SYSTEM},
+        {"role":"user","content": state.get("query","")}
+    ]
+    if msgs[0]["role"] != "system":
+        msgs = [{"role":"system","content": LLM_SYSTEM}] + msgs
+    try:
+        text = ollama_chat(msgs)
+        state["llm_response"] = text
+    except Exception as e:
+        state["llm_response"] = f"LLM error: {type(e).__name__}: {e}"
+    return state
+
+# -------------------------
+# Run-all dispatcher
+# Executes each route in order and aggregates.
+# -------------------------
+def run_all(state: GraphState) -> GraphState:
+    routes = state.get("routes", ["llm"])
+    for r in routes:
+        if r == "api":
+            state = api_call(state)
+        elif r == "llm":
+            state = llm_call(state)
+    return state
+
+# -------------------------
+# Final answer aggregator
+# -------------------------
+def answer(state: GraphState) -> GraphState:
+    parts = [f"Supervisor routes: {state.get('routes')} (reason: {state.get('reason','')})"]
+
+    api_resp = state.get("api_response")
+    if api_resp:
+        if isinstance(api_resp, dict) and "error" in api_resp:
+            parts.append(f"\n[API] Error: {api_resp['error']}")
+        else:
+            code = api_resp.get("status_code")
+            payload = api_resp.get("json") if isinstance(api_resp, dict) and "json" in api_resp else {"text": (api_resp or {}).get("text","")[:800]}
+            parts.append(f"\n[API] Status: {code}\n[API] Payload (truncated): {json.dumps(payload)[:800]}")
+
+    llm_txt = state.get("llm_response")
+    if llm_txt:
+        parts.append(f"\n[LLM]\n{llm_txt}")
+
+    summary = "\n".join(parts)
+    msgs = state.get("messages", [])
+    msgs.append({"role":"assistant","content": summary})
+    state["messages"] = msgs
+    return state
+
+# -------------------------
+# Build the graph
+# -------------------------
+def build_graph():
+    builder = StateGraph(GraphState)
+    builder.add_node("supervisor", supervisor)
+    builder.add_node("run_all", run_all)
+    builder.add_node("answer", answer)
+
+    builder.set_entry_point("supervisor")
+    # Single hop: supervisor -> run_all -> answer
+    builder.add_edge("supervisor", "run_all")
+    builder.add_edge("run_all", "answer")
+    builder.add_edge("answer", END)
+    return builder.compile()
+
+graph = build_graph()
+
+# -------------------------
+# Demos
+# -------------------------
+if __name__ == "__main__":
+    # Likely llm only
+    out1 = graph.invoke({"query": "Explain pseudonymization vs anonymization in healthcare data."})
+    print("---- DEMO 1 ----")
+    print(out1["messages"][-1]["content"])
+
+    # Likely api+llm (supervisor may choose both)
+    out2 = graph.invoke({"query": "Call an API to fetch weather for Bengaluru and summarize it for me."})
+    print("---- DEMO 2 ----")
+    print(out2["messages"][-1]["content"])
+
+    # Force only API by hinting, but still allow both if supervisor wants
+    out3 = graph.invoke({
+        "query": "Create a P2 ticket via API then explain what happened.",
+        "api_request": {
+            "method": "POST",
+            "url": "https://postman-echo.com/post",
+            "json": {"summary":"Create ticket", "priority":"P2"},
+            "headers": {"X-API-Key": "${API_KEY}"}
+        }
+    })
+    print("---- DEMO 3 ----")
+    print(out3["messages"][-1]["content"])
