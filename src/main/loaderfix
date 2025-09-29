@@ -52,3 +52,29 @@ experiments: { topLevelAwait: true }
 
 
 node -e "require('@copilotkit/react-core'); console.log('CopilotKit OK')"
+
+
+
+
+
+
+// babel.config.js (ROOT)
+module.exports = {
+  // allow per-package .babelrc files too
+  babelrcRoots: ['.', 'packages/*', 'apps/*'],
+
+  presets: [
+    ['@babel/preset-env', { useBuiltIns: 'usage', corejs: 3 }],
+    ['@babel/preset-react', { runtime: 'automatic', development: false }]
+  ],
+  plugins: [
+    ['@babel/plugin-transform-runtime', { helpers: true, regenerator: true }]
+  ],
+  // so ESM deps like CopilotKit .mjs don’t choke
+  overrides: [
+    {
+      test: ['**/*.mjs'],
+      sourceType: 'unambiguous'
+    }
+  ]
+};
