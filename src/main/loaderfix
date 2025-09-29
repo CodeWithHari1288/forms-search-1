@@ -1,0 +1,54 @@
+# Babel + React 18 JSX runtime
+npm i -D @babel/core @babel/preset-env @babel/preset-react @babel/plugin-transform-runtime babel-loader
+
+# Runtime helpers/polyfills
+npm i @babel/runtime core-js
+
+# React 18 (CopilotKit requires this)
+npm i react@18 react-dom@18
+
+
+{
+  "presets": [
+    ["@babel/preset-env", {
+      "useBuiltIns": "usage",
+      "corejs": 3
+    }],
+    ["@babel/preset-react", {
+      "runtime": "automatic",
+      "development": false
+    }]
+  ],
+  "plugins": [
+    ["@babel/plugin-transform-runtime", {
+      "helpers": true,
+      "regenerator": true
+    }]
+  ],
+  "overrides": [
+    {
+      "test": ["**/*.mjs"],
+      "sourceType": "unambiguous"
+    }
+  ]
+}
+
+
+
+experiments: { topLevelAwait: true }
+
+
+{
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "module": "ESNext",
+    "target": "ES2020",
+    "moduleResolution": "Bundler",
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  }
+}
+
+
+node -e "require('@copilotkit/react-core'); console.log('CopilotKit OK')"
