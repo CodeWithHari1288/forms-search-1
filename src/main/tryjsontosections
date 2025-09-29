@@ -1,212 +1,405 @@
+# generic_json_to_sections.py
+# Generic ANY-JSON -> sections text (for embeddings) + statements CSV (S/P/O with metadata)
+#
+# Usage:
+#   python generic_json_to_sections.py input.json --id-key id --record-id REC-001
+#
+# Writes:
+#   - sections_for_embeddings.txt
+#   - statements.csv
+#
+# Features:
+# - No schema assumptions. Walks dicts/lists of arbitrary depth.
+# - For lists of objects, creates a subsection per item with a human label (name/title/id/…).
+# - Records list counts, item indices, JSON paths.
+# - De-camel-cases keys for more readable text.
+# - Produces stable “statement_idx” within each section.
+
 import json
 import re
+import argparse
 from datetime import date
-from typing import Any, Dict, List, Tuple, Union
+from pathlib import Path
+from typing import Any, Dict, List, Tuple, Union, Iterable, Optional
 import pandas as pd
 
-# --- Utilities ---
+Scalar = Union[str, int, float, bool, None]
+Statement = Dict[str, Any]
+
+# ----------------- Config / Heuristics -----------------
+
+# Candidate fields we attempt to use as an item's display label inside lists of objects
+LABEL_FIELDS = [
+    "name", "title", "id", "code", "key", "identifier", "uid", "uuid",
+    "label", "displayName", "shortName", "slug",
+    "addressLine1", "line1", "siteId"
+]
+
+# If a list key ends with any of these, we’ll try a friendlier singular for item headings
+SINGULAR_HINTS = {
+    "addresses": "address",
+    "subContracts": "sub contract",
+    "subcontracts": "sub contract",
+    "scenarios": "scenario",
+    "approvers": "approver",
+    "items": "item",
+    "entries": "entry",
+    "records": "record",
+    "locations": "location",
+    "contacts": "contact",
+}
+
+# How many characters to keep when inlining scalar values into sections
+INLINE_VALUE_LIMIT = 160
+
+# ----------------- Tiny utils -----------------
+
 def camel_to_words(s: str) -> str:
     s = re.sub(r"[_\-]+", " ", s)
     s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s.lower()
 
-def title_case_words(s: str) -> str:
+def title_words(s: str) -> str:
     return " ".join(w.capitalize() for w in s.split())
 
-def short_value(v: Any, maxlen: int = 120) -> str:
+def short_str(v: Any, limit: int = INLINE_VALUE_LIMIT) -> str:
     if isinstance(v, (dict, list)):
-        return json.dumps(v)[:maxlen] + ("…" if len(json.dumps(v)) > maxlen else "")
-    s = str(v)
-    return s[:maxlen] + ("…" if len(s) > maxlen else "")
-
-# --- Statement Builder ---
-Statement = Dict[str, Any]
-
-def make_statements(record_id: str, obj: Any, base_subject: str, section: str, path: List[Union[str, int]]) -> List[Statement]:
-    statements: List[Statement] = []
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            key_words = camel_to_words(k)
-            child_subject = f"{base_subject} {key_words}".strip()
-            new_path = path + [k]
-            if isinstance(v, (dict, list)):
-                statements.append({
-                    "record_id": record_id,
-                    "section": section,
-                    "subject": base_subject,
-                    "predicate": "relates to",
-                    "object": key_words,
-                    "path": "/".join(map(str, new_path)),
-                    "in_list": False,
-                    "list_index": None,
-                    "list_length": None
-                })
-                statements.extend(make_statements(record_id, v, child_subject, section, new_path))
-            else:
-                statements.append({
-                    "record_id": record_id,
-                    "section": section,
-                    "subject": base_subject,
-                    "predicate": f"has {key_words}",
-                    "object": v,
-                    "path": "/".join(map(str, new_path)),
-                    "in_list": False,
-                    "list_index": None,
-                    "list_length": None
-                })
-    elif isinstance(obj, list):
-        # Count of list
-        statements.append({
-            "record_id": record_id,
-            "section": section,
-            "subject": base_subject,
-            "predicate": "has count",
-            "object": len(obj),
-            "path": "/".join(map(str, path)),
-            "in_list": True,
-            "list_index": None,
-            "list_length": len(obj),
-        })
-        for i, v in enumerate(obj):
-            idx_subject = f"{base_subject} item"
-            new_path = path + [i]
-            if isinstance(v, (dict, list)):
-                statements.append({
-                    "record_id": record_id,
-                    "section": section,
-                    "subject": base_subject,
-                    "predicate": "relates to item",
-                    "object": i,
-                    "path": "/".join(map(str, new_path)),
-                    "in_list": True,
-                    "list_index": i,
-                    "list_length": len(obj),
-                })
-                statements.extend(make_statements(record_id, v, idx_subject, section, new_path))
-            else:
-                statements.append({
-                    "record_id": record_id,
-                    "section": section,
-                    "subject": base_subject,
-                    "predicate": "has item",
-                    "object": v,
-                    "path": "/".join(map(str, new_path)),
-                    "in_list": True,
-                    "list_index": i,
-                    "list_length": len(obj),
-                })
+        try:
+            s = json.dumps(v, ensure_ascii=False)
+        except Exception:
+            s = str(v)
     else:
-        # Scalar fallback
-        statements.append({
-            "record_id": record_id,
-            "section": section,
-            "subject": base_subject,
-            "predicate": "has value",
-            "object": obj,
-            "path": "/".join(map(str, path)),
-            "in_list": False,
-            "list_index": None,
-            "list_length": None
-        })
-    return statements
+        s = str(v)
+    return s if len(s) <= limit else s[:limit] + "…"
 
-# --- Sections Builder ---
-def make_sections_text(record_id: str, contract: Dict[str, Any]) -> Tuple[str, List[Statement]]:
+def is_scalar(v: Any) -> bool:
+    return isinstance(v, (str, int, float, bool)) or v is None
+
+def list_is_homogeneous_objs(lst: list) -> bool:
+    return len(lst) > 0 and all(isinstance(x, dict) for x in lst)
+
+def choose_item_label(d: Dict[str, Any]) -> Optional[str]:
+    # Prefer common label-ish fields
+    for k in LABEL_FIELDS:
+        if k in d and is_scalar(d[k]) and str(d[k]).strip():
+            return str(d[k]).strip()
+    # Otherwise pick first scalar field
+    for k, v in d.items():
+        if is_scalar(v) and str(v).strip():
+            return f"{camel_to_words(k)}: {str(v).strip()}"
+    return None
+
+def singularize(key: str) -> str:
+    key_l = key.lower()
+    if key in SINGULAR_HINTS:
+        return SINGULAR_HINTS[key]
+    if key_l in SINGULAR_HINTS:
+        return SINGULAR_HINTS[key_l]
+    # naive singular: strip trailing 's'
+    return key[:-1] if key.endswith("s") and len(key) > 1 else key
+
+# ----------------- Statement builder (generic) -----------------
+
+def add_statement(
+    out: List[Statement],
+    *,
+    record_id: str,
+    section: str,
+    subject: str,
+    predicate: str,
+    obj: Any,
+    path: List[Union[str, int]],
+    in_list: bool,
+    list_index: Optional[int],
+    list_length: Optional[int],
+) -> None:
+    out.append({
+        "record_id": record_id,
+        "section": section,
+        "subject": subject,
+        "predicate": predicate,
+        "object": obj,
+        "path": "/".join(map(str, path)),
+        "in_list": in_list,
+        "list_index": list_index,
+        "list_length": list_length,
+    })
+
+# ----------------- Section generator (generic) -----------------
+
+def walk_json_to_sections(
+    record_id: str,
+    obj: Any,
+    key_name: Optional[str],
+    path: List[Union[str, int]],
+    lines: List[str],
+    statements: List[Statement],
+    subject_root: str,
+    section_stack: List[str],
+    heading_level: int,
+) -> None:
+    """
+    Recursively emits:
+      - human-friendly section headings + bullets in `lines`
+      - SPO statements with metadata in `statements`
+
+    Heuristics:
+      - Dict: create a section for this object (if key_name present).
+      - List of dicts: section for the list, then a subsection per item with chosen label.
+      - List of scalars: inline bullets + count.
+    """
+
+    # Compute section & subject names
+    key_words = camel_to_words(key_name) if key_name else ""
+    section_title = title_words(key_words) if key_words else None
+    subject_here = f"{subject_root} {key_words}".strip() if key_words else subject_root
+    section_name = " / ".join(filter(None, section_stack + ([key_words] if key_words else []))) or "root"
+
+    # Dict branch
+    if isinstance(obj, dict):
+        # open section heading if we have a key (avoid repeating "root" at top)
+        if section_title:
+            lines.append(f"{'#' * min(6, heading_level)} {section_title}")
+        # Emit statements for each field
+        for k, v in obj.items():
+            kw = camel_to_words(k)
+            new_path = path + [k]
+            if is_scalar(v):
+                # scalar leaf => "has <field>"
+                add_statement(
+                    statements,
+                    record_id=record_id,
+                    section=section_name,
+                    subject=subject_here,
+                    predicate=f"has {kw}",
+                    obj=v,
+                    path=new_path,
+                    in_list=False,
+                    list_index=None,
+                    list_length=None,
+                )
+                # inline for human text
+                lines.append(f"- {title_words(kw)}: {short_str(v)}")
+            elif isinstance(v, list):
+                # list count
+                add_statement(
+                    statements,
+                    record_id=record_id,
+                    section=section_name,
+                    subject=subject_here,
+                    predicate=f"relates to {kw}",
+                    obj="list",
+                    path=new_path,
+                    in_list=False,
+                    list_index=None,
+                    list_length=len(v),
+                )
+                # Recurse to list handler with a subheading
+                lines.append(f"- {title_words(kw)}: {len(v)} item(s)")
+                walk_json_to_sections(
+                    record_id, v, k, new_path, lines, statements,
+                    subject_here, section_stack + [kw], heading_level + 1
+                )
+            else:
+                # nested object
+                add_statement(
+                    statements,
+                    record_id=record_id,
+                    section=section_name,
+                    subject=subject_here,
+                    predicate="relates to",
+                    obj=kw,
+                    path=new_path,
+                    in_list=False,
+                    list_index=None,
+                    list_length=None,
+                )
+                walk_json_to_sections(
+                    record_id, v, k, new_path, lines, statements,
+                    subject_here, section_stack + [kw], heading_level + 1
+                )
+
+    # List branch
+    elif isinstance(obj, list):
+        list_key = key_name or "list"
+        list_words = camel_to_words(list_key)
+        list_title = title_words(list_words)
+        singular = title_words(camel_to_words(singularize(list_key)))
+        section_name = " / ".join(filter(None, section_stack + [list_words]))
+        # List heading (only if we arrived from a key)
+        if key_name:
+            lines.append(f"{'#' * min(6, heading_level)} {list_title} ({len(obj)} item(s))")
+        # Count statement
+        add_statement(
+            statements,
+            record_id=record_id,
+            section=section_name,
+            subject=subject_here,
+            predicate="has count",
+            obj=len(obj),
+            path=path,
+            in_list=True,
+            list_index=None,
+            list_length=len(obj),
+        )
+        if not obj:
+            lines.append("_(empty list)_")
+            return
+
+        if list_is_homogeneous_objs(obj):
+            # One subsection per object item
+            for i, item in enumerate(obj):
+                label = choose_item_label(item) or f"{singular} #{i+1}"
+                lines.append(f"{'#' * min(6, heading_level+1)} {singular}: {label}")
+                add_statement(
+                    statements,
+                    record_id=record_id,
+                    section=section_name,
+                    subject=subject_here,
+                    predicate="relates to item",
+                    obj=label,
+                    path=path + [i],
+                    in_list=True,
+                    list_index=i,
+                    list_length=len(obj),
+                )
+                walk_json_to_sections(
+                    record_id, item, singular, path + [i], lines, statements,
+                    f"{subject_here} {singular}", section_stack + [list_words, f"{singular} {i+1}"], heading_level + 2
+                )
+        else:
+            # List of scalars or mixed types
+            for i, item in enumerate(obj):
+                if is_scalar(item):
+                    lines.append(f"- {short_str(item)}")
+                    add_statement(
+                        statements,
+                        record_id=record_id,
+                        section=section_name,
+                        subject=subject_here,
+                        predicate="has item",
+                        obj=item,
+                        path=path + [i],
+                        in_list=True,
+                        list_index=i,
+                        list_length=len(obj),
+                    )
+                else:
+                    # nested list/dict item
+                    lines.append(f"{'#' * min(6, heading_level+1)} {singular} #{i+1}")
+                    add_statement(
+                        statements,
+                        record_id=record_id,
+                        section=section_name,
+                        subject=subject_here,
+                        predicate="relates to item",
+                        obj=i,
+                        path=path + [i],
+                        in_list=True,
+                        list_index=i,
+                        list_length=len(obj),
+                    )
+                    walk_json_to_sections(
+                        record_id, item, singular, path + [i], lines, statements,
+                        f"{subject_here} {singular}", section_stack + [list_words, f"{singular} {i+1}"], heading_level + 2
+                    )
+
+    # Scalar branch (rare—usually handled above)
+    else:
+        add_statement(
+            statements,
+            record_id=record_id,
+            section=" / ".join(section_stack) or "root",
+            subject=subject_here,
+            predicate="has value",
+            obj=obj,
+            path=path,
+            in_list=False,
+            list_index=None,
+            list_length=None,
+        )
+        lines.append(f"- {short_str(obj)}")
+
+# ----------------- Orchestrator -----------------
+
+def json_to_sections_and_statements(
+    data: Any,
+    record_id: str = "RECORD-1",
+    top_title: Optional[str] = None,
+) -> Tuple[str, List[Statement]]:
     lines: List[str] = []
-    all_statements: List[Statement] = []
+    statements: List[Statement] = []
 
-    header = contract.get("header", {})
-    parties = header.get("parties", {})
-    contract_subject = f"contract {record_id}"
-    today_str = str(date.today())
+    today = str(date.today())
+    title = top_title or f"Record {record_id}"
+    lines.append(f"# {title}")
+    lines.append(f"Generated: {today}\n")
 
-    # Title
-    lines.append(f"# Contract {record_id}: {header.get('title', 'Untitled Contract')}")
-    lines.append(f"Effective date: {header.get('effectiveDate','unknown')} | Governing law: {header.get('governingLaw','unknown')} | Generated: {today_str}")
-
-    # Parties
-    lines.append("\n## Parties")
-    if isinstance(parties, dict):
-        for role, name in parties.items():
-            lines.append(f"- {title_case_words(role)}: {name}")
-    all_statements += make_statements(record_id, header, f"{contract_subject} header", "header", ["header"])
-
-    # Scenarios
-    scenarios = contract.get("scenarios", [])
-    lines.append("\n## Scenarios Overview")
-    lines.append(f"- Total scenarios: {len(scenarios)}")
-    all_statements += make_statements(record_id, scenarios, f"{contract_subject} scenarios", "scenarios", ["scenarios"])
-
-    for idx, sc in enumerate(scenarios, start=1):
-        s_title = sc.get("title", f"Scenario {idx}")
-        lines.append(f"\n### Scenario {idx}: {s_title}")
-        desc = sc.get("description", "")
-        if desc:
-            lines.append(f"{desc}")
-        # Key counts
-        approvers = sc.get("approvers", [])
-        ids_list = sc.get("ids", [])
-        obligations = sc.get("obligations", [])
-        lines.append(f"- IDs: {len(ids_list)} item(s)")
-        lines.append(f"- Approvers: {len(approvers)} person(s)")
-        lines.append(f"- Obligations: {len(obligations)} item(s)")
-
-        # Payment terms
-        pt = sc.get("paymentTerms", {})
-        if isinstance(pt, dict) and pt:
-            freq = pt.get("frequency", "unspecified")
-            method = pt.get("method", "unspecified")
-            lines.append(f"- Payment terms: {freq}, method {method}")
-
-        # Obligations summary
-        if obligations:
-            lines.append("**Obligations (summary):**")
-            for j, ob in enumerate(obligations, start=1):
-                who = ob.get("party", "Unknown party")
-                what = short_value(ob.get("action", ""))
-                when = ob.get("when", "unspecified timing")
-                lines.append(f"  {j}. {who} must {what} (when: {when})")
-
-        # Statements for this scenario
-        all_statements += make_statements(record_id, sc, f"{contract_subject} scenario {idx}", f"scenario {idx}", ["scenarios", idx-1])
-
-    # Approval matrix
-    lines.append("\n## Approval Matrix (All Scenarios)")
-    approval_rows = []
-    for idx, sc in enumerate(scenarios, start=1):
-        for ap in sc.get("approvers", []):
-            approval_rows.append((idx, ap.get("role",""), ap.get("name",""), ap.get("department","")))
-    if approval_rows:
-        lines.append("| Scenario | Role | Name | Department |")
-        lines.append("|---|---|---|---|")
-        for row in approval_rows:
-            lines.append(f"| {row[0]} | {row[1]} | {row[2]} | {row[3]} |")
+    # Start walking from root
+    walk_json_to_sections(
+        record_id=record_id,
+        obj=data,
+        key_name=None,
+        path=[],
+        lines=lines,
+        statements=statements,
+        subject_root=f"record {record_id}",
+        section_stack=[],
+        heading_level=2,
+    )
 
     lines.append(f"\n--- End of Record {record_id} ---")
-    return "\n".join(lines), all_statements
+    return "\n".join(lines), statements
 
-# --- Example Usage ---
-contracts = [...]  # <== place the JSON I showed you earlier here
+# ----------------- CLI -----------------
 
-sections_texts = []
-all_records_statements: List[pd.DataFrame] = []
+def main():
+    ap = argparse.ArgumentParser(description="Generic ANY-JSON → sections + statements")
+    ap.add_argument("input", type=str, help="Input JSON file (object or array)")
+    ap.add_argument("--id-key", default=None, help="Key to use as record_id if present (e.g., 'id')")
+    ap.add_argument("--record-id", default=None, help="Fallback record_id if id-key missing")
+    ap.add_argument("--title", default=None, help="Top title for sections file")
+    ap.add_argument("--out-text", default="sections_for_embeddings.txt")
+    ap.add_argument("--out-csv", default="statements.csv")
+    args = ap.parse_args()
 
-for c in contracts:
-    rec_id = c.get("id", "UNKNOWN")
-    text, statements = make_sections_text(rec_id, c)
-    sections_texts.append(text)
+    data = json.loads(Path(args.input).read_text(encoding="utf-8"))
 
-    df = pd.DataFrame(statements)
-    df["statement_idx"] = df.groupby(["record_id","section"]).cumcount() + 1
-    all_records_statements.append(df)
+    # If top-level is an array, process each element as a record; else treat whole JSON as one record.
+    if isinstance(data, list):
+        all_text: List[str] = []
+        frames: List[pd.DataFrame] = []
+        for idx, item in enumerate(data, start=1):
+            rid = None
+            if args.id_key and isinstance(item, dict) and args.id_key in item:
+                rid = str(item[args.id_key])
+            rid = rid or args.record_id or f"REC-{idx:04d}"
 
-statements_df = pd.concat(all_records_statements, ignore_index=True)
+            text, sts = json_to_sections_and_statements(item, record_id=rid, top_title=args.title)
+            all_text.append(text)
 
-# Save sections text for embeddings
-with open("contract_sections_for_embeddings.txt", "w", encoding="utf-8") as f:
-    f.write("\n\n".join(sections_texts))
+            df = pd.DataFrame(sts)
+            df["statement_idx"] = df.groupby(["record_id","section"]).cumcount() + 1
+            frames.append(df)
 
-print("✅ Generated sections text + statements")
-print("Statements shape:", statements_df.shape)
-print(sections_texts[0][:500])  # preview
+        Path(args.out_text).write_text("\n\n".join(all_text), encoding="utf-8")
+        pd.concat(frames, ignore_index=True).to_csv(args.out_csv, index=False)
+    else:
+        rid = None
+        if args.id_key and isinstance(data, dict) and args.id_key in data:
+            rid = str(data[args.id_key])
+        rid = rid or args.record_id or "REC-0001"
+
+        text, sts = json_to_sections_and_statements(data, record_id=rid, top_title=args.title)
+        Path(args.out_text).write_text(text, encoding="utf-8")
+        df = pd.DataFrame(sts)
+        df["statement_idx"] = df.groupby(["record_id","section"]).cumcount() + 1
+        df.to_csv(args.out_csv, index=False)
+
+    print("✅ Wrote:")
+    print(" -", args.out_text)
+    print(" -", args.out_csv)
+
+if __name__ == "__main__":
+    main()
