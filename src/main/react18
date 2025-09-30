@@ -162,3 +162,24 @@ customElements.define("react-subapp", ReactSubApp);
   "include": ["src"],
   "exclude": ["node_modules", "dist"]
 }
+
+
+
+
+
+
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>My CRA Host</title>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+
+    <!-- Load React 18 sub-app as a web component -->
+    <script src="%PUBLIC_URL%/subapp/react-subapp.js"></script>
+  </body>
+</html>
