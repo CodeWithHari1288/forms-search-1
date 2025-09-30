@@ -1,0 +1,146 @@
+{
+  "name": "subapp-webcomponent",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "watch": "vite build --watch",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "@copilotkit/react-ui": "^0.1.39",
+    "@copilotkit/react-core": "^0.1.39"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.5",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "typescript": "^5.6.0",
+    "vite": "^5.4.0"
+  }
+}
+
+
+
+
+
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [react()],
+  build: {
+    lib: {
+      entry: "src/define-subapp-element.tsx",
+      name: "ReactSubApp",
+      formats: ["iife"],                 // single self-executing file
+      fileName: () => "react-subapp.js"
+    },
+    rollupOptions: {
+      external: []                       // bundle React + CopilotKit inside
+    }
+  }
+});
+
+
+
+
+
+import React from "react";
+import { CopilotChat } from "@copilotkit/react-ui";
+
+type Props = {
+  runtimeUrl: string;     // e.g. "/api/copilot" served by your host
+  title?: string;         // optional chat title
+  instructions?: string;  // optional system prompt
+};
+
+export default function App({ runtimeUrl, title, instructions }: Props) {
+  return (
+    <div style={{ padding: 12, fontFamily: "system-ui, sans-serif" }}>
+      <CopilotChat
+        // Point to your Python/Node backend that implements CopilotKit runtime
+        runtimeUrl={runtimeUrl}
+
+        // Optional labeling
+        labels={{
+          title: title ?? "Copilot",
+          initial: "Ask me anything about your data or tools.",
+          inputPlaceholder: "Type your question…"
+        }}
+
+        // Optional system / instructions for the assistant
+        instructions={
+          instructions ??
+          "You are a helpful assistant. Keep answers concise and actionable."
+        }
+
+        // Optional: start with a few conversation-starter messages
+        initialMessages={[
+          { role: "assistant", content: "Hi! How can I help today?" }
+        ]}
+
+        // UI options (tweak to taste)
+        showResponseLatency={true}
+        showShareButton={false}
+        showTitle={true}
+        // If your backend streams tokens, CopilotChat will stream by default.
+      />
+    </div>
+  );
+}
+
+
+
+
+import React from "react";
+import { createRoot } from "react-dom/client";
+import App from "./App";
+
+class ReactSubApp extends HTMLElement {
+  private root?: ReturnType<typeof createRoot>;
+
+  connectedCallback() {
+    const shadow = this.attachShadow({ mode: "open" });
+
+    // Basic (scoped) style to make the chat fill the container
+    const style = document.createElement("style");
+    style.textContent = `
+      :host { display: block; }
+      .mount { min-height: 480px; }
+    `;
+    shadow.appendChild(style);
+
+    const mount = document.createElement("div");
+    mount.className = "mount";
+    shadow.appendChild(mount);
+
+    const runtimeUrl =
+      this.getAttribute("runtime-url") || "/api/copilot";
+    const title = this.getAttribute("title") || undefined;
+    const instructions = this.getAttribute("instructions") || undefined;
+
+    this.root = createRoot(mount);
+    this.root.render(
+      <App
+        runtimeUrl={runtimeUrl}
+        title={title}
+        instructions={instructions}
+      />
+    );
+  }
+
+  disconnectedCallback() {
+    this.root?.unmount?.();
+  }
+}
+
+customElements.define("react-subapp", ReactSubApp);
+
+
+
+
+
