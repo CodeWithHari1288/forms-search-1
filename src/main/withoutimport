@@ -1,77 +1,33 @@
-
 {
-  "name": "subapp-with-copilotkit",
+  "name": "subapp-copilot",
   "private": true,
-  "type": "module",
+  "version": "1.0.0",
   "dependencies": {
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "@copilotkit/react-core": "^1.8.12",
     "@copilotkit/react-ui": "^1.8.12"
   },
-  "devDependencies": {
-    "rollup": "^4.21.0",
-    "@rollup/plugin-node-resolve": "^15.2.3",
-    "@rollup/plugin-commonjs": "^25.0.7",
-    "@rollup/plugin-babel": "^6.0.4",
-    "@babel/core": "^7.25.0",
-    "@babel/preset-env": "^7.25.0",
-    "@babel/preset-react": "^7.24.7"
-  },
   "scripts": {
-    "build": "rollup -c"
+    "start": "react-scripts start",   // if CRA
+    "build": "react-scripts build"    // if CRA
   }
 }
 
 
-
-
-
-import resolve from "@rollup/plugin-node-resolve";
-import commonjs from "@rollup/plugin-commonjs";
-import babel from "@rollup/plugin-babel";
-
-export default {
-  input: "src/entry-umd.jsx",
-  output: {
-    file: "dist/subapp.umd.js",
-    format: "umd",
-    name: "SubApp",          // exposes window.SubApp
-    sourcemap: true
-  },
-  external: [],              // bundle react & deps inside to isolate versions
-  plugins: [
-    resolve({
-      browser: true,
-      extensions: [".mjs", ".js", ".jsx", ".json"]
-    }),
-    commonjs(),
-    babel({
-      babelHelpers: "bundled",
-      extensions: [".js", ".jsx"],
-      presets: [
-        ["@babel/preset-env", { targets: ">0.25%, not dead" }],
-        ["@babel/preset-react", { runtime: "automatic" }]
-      ],
-      sourceMaps: true
-    })
-  ]
-};
-
-
-
-
-
 import React from "react";
 import { CopilotKitProvider } from "@copilotkit/react-core";
-import { CopilotChat /*, CopilotSidebar*/ } from "@copilotkit/react-ui";
+import { CopilotChat } from "@copilotkit/react-ui";
 
-export default function App({ runtimeUrl = "http://localhost:8000/copilot" }) {
+export default function App() {
   return (
-    <CopilotKitProvider runtimeUrl={runtimeUrl}>
-      {/* Keep CopilotKit defaults */}
-      <CopilotChat placeholder="Ask me anything…" />
-      {/* or <CopilotSidebar defaultOpen /> */}
+    <CopilotKitProvider runtimeUrl="http://localhost:8000/copilot">
+      <div style={{ height: "100vh", width: "100%", display: "flex", flexDirection: "column" }}>
+        <h2 style={{ margin: "16px", fontFamily: "sans-serif" }}>Copilot Sub-app</h2>
+        <div style={{ flex: 1, overflow: "auto", borderTop: "1px solid #e5e7eb" }}>
+          <CopilotChat placeholder="Ask me anything…" />
+        </div>
+      </div>
     </CopilotKitProvider>
   );
 }
@@ -82,284 +38,52 @@ export default function App({ runtimeUrl = "http://localhost:8000/copilot" }) {
 
 import React from "react";
 import { createRoot } from "react-dom/client";
-import App from "./App.jsx";
+import App from "./App";
 
-/**
- * Mounts the subapp into a provided HTMLElement (light DOM).
- * Returns an unmount() cleanup function.
- */
-export function mount(el, opts = {}) {
-  const { runtimeUrl } = opts;
-
-  const container = document.createElement("div");
-  container.style.height = "100%";
-  el.appendChild(container);
-
-  const root = createRoot(container);
-  root.render(<App runtimeUrl={runtimeUrl} />);
-
-  return () => {
-    root.unmount();
-    container.remove();
-  };
-}
+const container = document.getElementById("root");
+const root = createRoot(container);
+root.render(<App />);
 
 
-
-
-import React, { useEffect, useRef, useState } from "react";
-
-// Load the UMD once and provide clear error text (not [object Event])
-function loadScriptOnce(src) {
-  return new Promise((resolve, reject) => {
-    const existing = document.querySelector(`script[src="${src}"]`);
-    if (existing) {
-      if (existing.dataset.ready === "1") return resolve();
-      existing.addEventListener("load", () => resolve());
-      existing.addEventListener("error", () => reject(new Error(`Failed to load ${src}`)));
-      return;
-    }
-    const s = document.createElement("script");
-    s.src = src;
-    s.async = true;
-    s.crossOrigin = "anonymous";
-    s.onload = () => { s.dataset.ready = "1"; resolve(); };
-    s.onerror = () => reject(new Error(`Failed to load ${src}`));
-    document.head.appendChild(s);
-  });
-}
-
-/**
- * Bottom-right floating container that hosts the sub-app in light DOM.
- * We don't inject styles inside; CopilotKit uses its own defaults.
- */
-export default function SubappFloatingNoShadow({
-  runtimeUrl = "http://localhost:8000/copilot",
-  defaultOpen = true,
-  width = 420,
-  height = 600,
-}) {
-  const hostRef = useRef(null);
-  const mountPointRef = useRef(null);
-  const [open, setOpen] = useState(defaultOpen);
-  const [mountedOnce, setMountedOnce] = useState(false);
-  const [error, setError] = useState("");
-
-  useEffect(() => {
-    if (!open || mountedOnce) return;
-    let unmount;
-
-    (async () => {
-      try {
-        const host = hostRef.current;
-        if (!host) return;
-
-        // Create a mount point in light DOM
-        const mountPoint = document.createElement("div");
-        mountPoint.style.height = "100%";
-        host.appendChild(mountPoint);
-        mountPointRef.current = mountPoint;
-
-        // Load subapp bundle from CRA public/
-        const src = `/subapp/subapp.umd.js`; // or `${process.env.PUBLIC_URL}/subapp/subapp.umd.js`
-        await loadScriptOnce(src);
-
-        if (!window.SubApp?.mount) {
-          throw new Error("window.SubApp.mount not found (is subapp.umd.js copied to /public/subapp/?)");
-        }
-
-        // Mount it
-        unmount = window.SubApp.mount(mountPoint, { runtimeUrl });
-        setMountedOnce(true);
-      } catch (e) {
-        setError(e?.message || String(e));
-      }
-    })();
-
-    return () => {
-      try { unmount?.(); } catch {}
-    };
-  }, [open, mountedOnce, runtimeUrl]);
-
-  return (
-    <>
-      {/* Toggle button */}
-      <button
-        onClick={() => setOpen(v => !v)}
-        style={{
-          position: "fixed",
-          right: 20,
-          bottom: open ? height + 32 : 20,
-          zIndex: 2147483647,
-          border: "1px solid #e5e7eb",
-          background: "#111827",
-          color: "#fff",
-          padding: "10px 14px",
-          borderRadius: 999,
-          boxShadow: "0 6px 24px rgba(0,0,0,0.15)",
-          cursor: "pointer",
-          fontFamily: "system-ui, sans-serif",
-        }}
-        aria-expanded={open}
-        aria-controls="subapp-chat-widget"
-      >
-        {open ? "Hide Copilot" : "Open Copilot"}
-      </button>
-
-      {/* Floating host box */}
-      <div
-        id="subapp-chat-widget"
-        ref={hostRef}
-        style={{
-          position: "fixed",
-          right: 20,
-          bottom: 20,
-          width,
-          height,
-          border: "1px solid #e5e7eb",
-          borderRadius: 14,
-          overflow: "hidden",
-          background: "#fff",
-          boxShadow: "0 16px 48px rgba(0,0,0,0.18)",
-          zIndex: 2147483646,
-          transition: "transform 160ms ease, opacity 160ms ease",
-          transform: open ? "translateY(0)" : "translateY(12px)",
-          opacity: open ? 1 : 0,
-          pointerEvents: open ? "auto" : "none",
-        }}
-      />
-
-      {error && (
-        <div
-          style={{
-            position: "fixed",
-            right: 20,
-            bottom: height + 64,
-            zIndex: 2147483647,
-            background: "#fee2e2",
-            color: "#991b1b",
-            padding: "8px 12px",
-            border: "1px solid #fecaca",
-            borderRadius: 10,
-            fontFamily: "system-ui, sans-serif"
-          }}
-        >
-          Subapp error: {error}
-        </div>
-      )}
-    </>
-  );
-}
-
-
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Copilot Subapp</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>
 
 
 
 
 import React from "react";
-import SubappFloatingNoShadow from "./SubappFloatingNoShadow";
 
-export default function App() {
+export default function SubappFrame({ height = 600 }) {
   return (
-    <div style={{ padding: 24, minHeight: "120vh" }}>
-      <h1>Main App (React 14)</h1>
-
-      <SubappFloatingNoShadow
-        runtimeUrl="http://localhost:8000/copilot"
-        defaultOpen={true}
-        width={420}
-        height={600}
+    <div
+      style={{
+        position: "fixed",
+        right: 20,
+        bottom: 20,
+        width: 420,
+        height,
+        border: "1px solid #e5e7eb",
+        borderRadius: 12,
+        overflow: "hidden",
+        boxShadow: "0 16px 48px rgba(0,0,0,0.18)",
+        background: "#fff",
+        zIndex: 9999
+      }}
+    >
+      <iframe
+        title="copilot"
+        src="/copilot/index.html"
+        style={{ width: "100%", height: "100%", border: "none" }}
       />
     </div>
   );
 }
-
-
-
-
-
-
-import React from "react";
-import { createRoot } from "react-dom/client";
-import App from "./App";
-
-createRoot(document.getElementById("root")).render(<App />);
-
-
-
-
-
-
-
-import resolve from "@rollup/plugin-node-resolve";
-import commonjs from "@rollup/plugin-commonjs";
-import babel from "@rollup/plugin-babel";
-import replace from "@rollup/plugin-replace";
-
-/**
- * Strip "use client" / "use server" directives so bundling doesn't break.
- * Safe here because we're not using RSC; we just need a browser bundle.
- */
-function stripUseClient() {
-  return {
-    name: "strip-use-client",
-    transform(code, id) {
-      // Only touch relevant files (your src and CopilotKit deps)
-      if (
-        id.includes("/src/") ||
-        id.includes("@copilotkit/") // widen/narrow as needed
-      ) {
-        const stripped = code
-          .replace(/^\s*['"]use client['"];\s*/m, "")
-          .replace(/^\s*['"]use server['"];\s*/m, "");
-        return { code: stripped, map: null };
-      }
-      return null;
-    },
-  };
-}
-
-export default {
-  input: "src/entry-umd.jsx",
-  output: {
-    file: "dist/subapp.umd.js",
-    format: "umd",
-    name: "SubApp",        // -> window.SubApp
-    sourcemap: true,
-    strict: false          // avoid automatic "use strict" preamble
-  },
-  // Bundle everything to isolate versions (react, copilotkit, etc.)
-  external: [],
-  plugins: [
-    // 1) Remove client/server directives safely
-    stripUseClient(),
-    replace({
-      preventAssignment: true,
-      // Double safety: nuke directives even if plugin misses a file
-      values: {
-        '"use client";': "",
-        "'use client';": "",
-        '"use server";': "",
-        "'use server';": "",
-      },
-    }),
-
-    // 2) Usual pipeline
-    resolve({ browser: true, extensions: [".mjs", ".js", ".jsx", ".json"] }),
-    commonjs(),
-    babel({
-      babelHelpers: "bundled",
-      extensions: [".js", ".jsx"],
-      presets: [
-        ["@babel/preset-env", { targets: ">0.25%, not dead" }],
-        ["@babel/preset-react", { runtime: "automatic" }],
-      ],
-      sourceMaps: true,
-    }),
-  ],
-  // optional: keep tree-shaking conservative
-  treeshake: { moduleSideEffects: true },
-};
-
-
-
