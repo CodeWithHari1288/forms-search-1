@@ -1,0 +1,173 @@
+{
+  "name": "subapp-with-copilotkit",
+  "private": true,
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "@copilotkit/react-core": "^1.8.12",
+    "@copilotkit/react-ui": "^1.8.12"
+  },
+  "devDependencies": {
+    "rollup": "^4.21.0",
+    "@rollup/plugin-node-resolve": "^15.2.3",
+    "@rollup/plugin-commonjs": "^25.0.7",
+    "@rollup/plugin-babel": "^6.0.4",
+    "@babel/core": "^7.25.0",
+    "@babel/preset-env": "^7.25.0",
+    "@babel/preset-react": "^7.24.7"
+  },
+  "scripts": {
+    "build": "rollup -c"
+  }
+}
+
+
+
+
+
+import resolve from "@rollup/plugin-node-resolve";
+import commonjs from "@rollup/plugin-commonjs";
+import babel from "@rollup/plugin-babel";
+
+export default {
+  input: "src/entry-umd.jsx",
+  output: {
+    file: "dist/subapp.umd.js",
+    format: "umd",
+    name: "SubApp", // exposed as window.SubApp
+    sourcemap: true
+  },
+  external: [],
+  plugins: [
+    resolve({ browser: true }),
+    commonjs(),
+    babel({
+      babelHelpers: "bundled",
+      presets: [
+        ["@babel/preset-env", { targets: ">0.25%, not dead" }],
+        ["@babel/preset-react", { runtime: "automatic" }]
+      ]
+    })
+  ]
+};
+
+
+
+
+import React from "react";
+import { CopilotKitProvider } from "@copilotkit/react-core";
+import { CopilotChat } from "@copilotkit/react-ui";
+
+export default function App({ runtimeUrl = "http://localhost:8000/copilot" }) {
+  return (
+    <CopilotKitProvider runtimeUrl={runtimeUrl}>
+      <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
+        <header style={{ padding: "8px", borderBottom: "1px solid #ddd", background: "#fff" }}>
+          <strong>Copilot Sub-App</strong>
+        </header>
+        <main style={{ flex: 1, padding: "8px" }}>
+          <CopilotChat placeholder="Ask me anything..." />
+        </main>
+      </div>
+    </CopilotKitProvider>
+  );
+}
+
+
+
+import React from "react";
+import { createRoot } from "react-dom/client";
+import App from "./App";
+
+export function mount(el, opts = {}) {
+  const { runtimeUrl } = opts;
+
+  const container = document.createElement("div");
+  el.appendChild(container);
+
+  const root = createRoot(container);
+  root.render(<App runtimeUrl={runtimeUrl} />);
+
+  return () => {
+    root.unmount();
+    if (container.parentNode) container.parentNode.removeChild(container);
+  };
+}
+
+
+
+
+import React, { useEffect, useRef, useState } from "react";
+
+function loadScriptOnce(src) {
+  return new Promise((resolve, reject) => {
+    if (document.querySelector(`script[src="${src}"]`)) return resolve();
+    const s = document.createElement("script");
+    s.src = src;
+    s.async = true;
+    s.onload = resolve;
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+}
+
+export default function SubappShadow({ height = 600, runtimeUrl }) {
+  const hostRef = useRef(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let unmount;
+    let shadow;
+
+    (async () => {
+      try {
+        if (!hostRef.current) return;
+        shadow = hostRef.current.attachShadow({ mode: "open" });
+
+        const src = `${process.env.PUBLIC_URL}/subapp/subapp.umd.js`;
+        await loadScriptOnce(src);
+
+        if (!window.SubApp?.mount) throw new Error("SubApp.mount not found");
+        unmount = window.SubApp.mount(shadow, { runtimeUrl });
+      } catch (e) {
+        setError(e.message);
+      }
+    })();
+
+    return () => unmount?.();
+  }, [runtimeUrl]);
+
+  return (
+    <div
+      ref={hostRef}
+      style={{ width: "100%", height, border: "1px solid #ddd", borderRadius: 8 }}
+    >
+      {error && <div style={{ color: "red", padding: 8 }}>Error: {error}</div>}
+    </div>
+  );
+}
+
+
+
+
+import React from "react";
+import SubappShadow from "./SubappShadow";
+
+export default function App() {
+  return (
+    <div style={{ padding: 24 }}>
+      <h1>Main App (React 14)</h1>
+      <SubappShadow runtimeUrl="http://localhost:8000/copilot" height={700} />
+    </div>
+  );
+}
+
+
+
+import React from "react";
+import { createRoot } from "react-dom/client";
+import App from "./App";
+
+createRoot(document.getElementById("root")).render(<App />);
+
+
