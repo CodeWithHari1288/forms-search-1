@@ -171,3 +171,81 @@ import App from "./App";
 createRoot(document.getElementById("root")).render(<App />);
 
 
+
+
+
+
+import React, { useEffect, useRef, useState } from "react";
+
+// ✅ helper to load the subapp UMD bundle only once
+function loadScriptOnce(src) {
+  return new Promise((resolve, reject) => {
+    const existing = document.querySelector(`script[src="${src}"]`);
+    if (existing) {
+      if (existing.dataset.ready === "1") return resolve(); // already loaded
+      existing.addEventListener("load", () => resolve());
+      existing.addEventListener("error", (e) => reject(e));
+      return;
+    }
+    const s = document.createElement("script");
+    s.src = src;
+    s.async = true;
+    s.onload = () => {
+      s.dataset.ready = "1";
+      resolve();
+    };
+    s.onerror = (e) => reject(e);
+    document.head.appendChild(s);
+  });
+}
+
+export default function SubappShadow({
+  height = 720,
+  runtimeUrl = "http://localhost:8000/copilot"
+}) {
+  const hostRef = useRef(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let unmount;
+    let shadow;
+
+    (async () => {
+      try {
+        if (!hostRef.current) return;
+        shadow = hostRef.current.attachShadow({ mode: "open" });
+
+        // load the subapp UMD bundle
+        const src = `/subapp/subapp.umd.js`; // or `${process.env.PUBLIC_URL}/subapp/subapp.umd.js`
+        await loadScriptOnce(src);
+
+        if (!window.SubApp?.mount) {
+          throw new Error("window.SubApp.mount not found – UMD bundle not loaded?");
+        }
+
+        // mount the sub-app inside the shadow root
+        unmount = window.SubApp.mount(shadow, { runtimeUrl });
+      } catch (e) {
+        setError(e.message || String(e));
+      }
+    })();
+
+    return () => unmount?.();
+  }, [runtimeUrl]);
+
+  return (
+    <div
+      ref={hostRef}
+      style={{
+        width: "100%",
+        height,
+        border: "1px solid #ddd",
+        borderRadius: 8,
+        overflow: "hidden",
+        background: "#fff"
+      }}
+    >
+      {error && <div style={{ color: "red", padding: 8 }}>Error: {error}</div>}
+    </div>
+  );
+}
