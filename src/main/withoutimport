@@ -541,3 +541,155 @@ export default function SubappShadowFloating({
     </>
   );
 }
+
+
+
+
+
+
+
+
+import React, { useEffect, useRef, useState } from "react";
+
+// Load the subapp UMD bundle once via <script> and surface a useful error
+function loadScriptOnce(src) {
+  return new Promise((resolve, reject) => {
+    const existing = document.querySelector(`script[src="${src}"]`);
+    if (existing) {
+      if (existing.dataset.ready === "1") return resolve();
+      existing.addEventListener("load", () => resolve());
+      existing.addEventListener("error", () => reject(new Error(`Failed to load ${src}`)));
+      return;
+    }
+    const s = document.createElement("script");
+    s.src = src;
+    s.async = true;
+    s.onload = () => { s.dataset.ready = "1"; resolve(); };
+    s.onerror = () => reject(new Error(`Failed to load ${src}`));
+    document.head.appendChild(s);
+  });
+}
+
+/**
+ * Bottom-right floating container that hosts the sub-app in the *light* DOM
+ * (no ShadowRoot) so CopilotKit's default styles work out-of-the-box.
+ */
+export default function SubappFloatingNoShadow({
+  runtimeUrl = "http://localhost:8000/copilot",
+  defaultOpen = true,
+  width = 420,
+  height = 600,
+}) {
+  const hostRef = useRef(null);
+  const mountPointRef = useRef(null);
+  const [open, setOpen] = useState(defaultOpen);
+  const [mountedOnce, setMountedOnce] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!open || mountedOnce) return;
+    let unmount;
+    (async () => {
+      try {
+        if (!hostRef.current) return;
+
+        // 1) Create a mount point in light DOM (NOT shadow)
+        const mountPoint = document.createElement("div");
+        mountPoint.style.height = "100%";
+        hostRef.current.appendChild(mountPoint);
+        mountPointRef.current = mountPoint;
+
+        // 2) Load sub-app UMD from /public/subapp
+        const src = `/subapp/subapp.umd.js`; // or `${process.env.PUBLIC_URL}/subapp/subapp.umd.js`
+        await loadScriptOnce(src);
+
+        if (!window.SubApp?.mount) {
+          throw new Error("window.SubApp.mount not found (is subapp.umd.js copied to /public/subapp/?)");
+        }
+
+        // 3) Mount sub-app (it renders into mountPoint)
+        unmount = window.SubApp.mount(mountPoint, { runtimeUrl });
+        setMountedOnce(true);
+      } catch (e) {
+        setError(e?.message || String(e));
+      }
+    })();
+
+    return () => {
+      try { unmount?.(); } catch {}
+      // keep the mountPoint to avoid repeated mounts unless you want to clean it:
+      // mountPointRef.current?.remove();
+      // mountPointRef.current = null;
+    };
+  }, [open, mountedOnce, runtimeUrl]);
+
+  return (
+    <>
+      {/* Toggle button */}
+      <button
+        onClick={() => setOpen(v => !v)}
+        style={{
+          position: "fixed",
+          right: 20,
+          bottom: open ? height + 32 : 20,
+          zIndex: 2147483647,
+          border: "1px solid #e5e7eb",
+          background: "#111827",
+          color: "#fff",
+          padding: "10px 14px",
+          borderRadius: 999,
+          boxShadow: "0 6px 24px rgba(0,0,0,0.15)",
+          cursor: "pointer",
+          fontFamily: "system-ui, sans-serif",
+        }}
+        aria-expanded={open}
+        aria-controls="subapp-chat-widget"
+      >
+        {open ? "Hide Copilot" : "Open Copilot"}
+      </button>
+
+      {/* Floating host (no ShadowRoot) */}
+      <div
+        id="subapp-chat-widget"
+        ref={hostRef}
+        style={{
+          position: "fixed",
+          right: 20,
+          bottom: 20,
+          width,
+          height,
+          border: "1px solid #e5e7eb",
+          borderRadius: 14,
+          overflow: "hidden",
+          background: "#fff",
+          boxShadow: "0 16px 48px rgba(0,0,0,0.18)",
+          zIndex: 2147483646,
+          transition: "transform 160ms ease, opacity 160ms ease",
+          transform: open ? "translateY(0)" : "translateY(12px)",
+          opacity: open ? 1 : 0,
+          pointerEvents: open ? "auto" : "none",
+        }}
+      />
+
+      {/* Visible error (if any) */}
+      {error && (
+        <div
+          style={{
+            position: "fixed",
+            right: 20,
+            bottom: height + 64,
+            zIndex: 2147483647,
+            background: "#fee2e2",
+            color: "#991b1b",
+            padding: "8px 12px",
+            border: "1px solid #fecaca",
+            borderRadius: 10,
+            fontFamily: "system-ui, sans-serif"
+          }}
+        >
+          Subapp error: {error}
+        </div>
+      )}
+    </>
+  );
+}
