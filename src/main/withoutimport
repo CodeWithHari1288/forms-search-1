@@ -16,6 +16,8 @@
 }
 
 
+
+
 <!DOCTYPE html>
 <html lang="en">
   <head>
@@ -27,6 +29,8 @@
     <div id="root"></div>
   </body>
 </html>
+
+
 
 
 
@@ -51,7 +55,6 @@ export default function App() {
     </CopilotKitProvider>
   );
 }
-
 
 
 
@@ -94,6 +97,28 @@ export default function SubappFrame({ height = 600, width = 420 }) {
     </div>
   );
 }
+
+
+
+
+
+
+
+import React from "react";
+import SubappFrame from "./SubappFrame";
+
+export default function App() {
+  return (
+    <div style={{ padding: 24 }}>
+      <h1>Main App (React 14)</h1>
+      <p>Your main app content.</p>
+
+      {/* Bottom-right floating Copilot subapp */}
+      <SubappFrame height={600} width={420} />
+    </div>
+  );
+}
+
 
 
 
