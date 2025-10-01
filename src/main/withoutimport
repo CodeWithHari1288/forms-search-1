@@ -693,3 +693,27 @@ export default function SubappFloatingNoShadow({
     </>
   );
 }
+
+
+
+
+
+import React from "react";
+import { createRoot } from "react-dom/client";
+import App from "./App";
+
+// Mount into a provided element (light DOM)
+export function mount(el, opts = {}) {
+  const { runtimeUrl } = opts;
+  const container = document.createElement("div");
+  container.style.height = "100%";
+  el.appendChild(container);
+
+  const root = createRoot(container);
+  root.render(<App runtimeUrl={runtimeUrl} />);
+
+  return () => {
+    root.unmount();
+    container.remove();
+  };
+}
