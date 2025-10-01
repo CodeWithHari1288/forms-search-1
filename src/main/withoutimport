@@ -288,3 +288,78 @@ createRoot(document.getElementById("root")).render(<App />);
 
 
 
+
+
+
+import resolve from "@rollup/plugin-node-resolve";
+import commonjs from "@rollup/plugin-commonjs";
+import babel from "@rollup/plugin-babel";
+import replace from "@rollup/plugin-replace";
+
+/**
+ * Strip "use client" / "use server" directives so bundling doesn't break.
+ * Safe here because we're not using RSC; we just need a browser bundle.
+ */
+function stripUseClient() {
+  return {
+    name: "strip-use-client",
+    transform(code, id) {
+      // Only touch relevant files (your src and CopilotKit deps)
+      if (
+        id.includes("/src/") ||
+        id.includes("@copilotkit/") // widen/narrow as needed
+      ) {
+        const stripped = code
+          .replace(/^\s*['"]use client['"];\s*/m, "")
+          .replace(/^\s*['"]use server['"];\s*/m, "");
+        return { code: stripped, map: null };
+      }
+      return null;
+    },
+  };
+}
+
+export default {
+  input: "src/entry-umd.jsx",
+  output: {
+    file: "dist/subapp.umd.js",
+    format: "umd",
+    name: "SubApp",        // -> window.SubApp
+    sourcemap: true,
+    strict: false          // avoid automatic "use strict" preamble
+  },
+  // Bundle everything to isolate versions (react, copilotkit, etc.)
+  external: [],
+  plugins: [
+    // 1) Remove client/server directives safely
+    stripUseClient(),
+    replace({
+      preventAssignment: true,
+      // Double safety: nuke directives even if plugin misses a file
+      values: {
+        '"use client";': "",
+        "'use client';": "",
+        '"use server";': "",
+        "'use server';": "",
+      },
+    }),
+
+    // 2) Usual pipeline
+    resolve({ browser: true, extensions: [".mjs", ".js", ".jsx", ".json"] }),
+    commonjs(),
+    babel({
+      babelHelpers: "bundled",
+      extensions: [".js", ".jsx"],
+      presets: [
+        ["@babel/preset-env", { targets: ">0.25%, not dead" }],
+        ["@babel/preset-react", { runtime: "automatic" }],
+      ],
+      sourceMaps: true,
+    }),
+  ],
+  // optional: keep tree-shaking conservative
+  treeshake: { moduleSideEffects: true },
+};
+
+
+
