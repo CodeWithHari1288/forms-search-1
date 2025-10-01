@@ -67,3 +67,96 @@ module.exports = {
 }
 
 
+
+
+
+import React, { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+
+export default function SubappDock({
+  src = "http://localhost:3001",     // sub-app URL
+  width = 420,
+  height = 600,
+  right = 20,
+  bottom = 20,
+  defaultOpen = true,
+  zIndex = 2147483646,               // above most UI
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  const mountRef = useRef(null);
+
+  // Create a host element attached to <body>
+  useEffect(() => {
+    const host = document.createElement("div");
+    // Make sure nothing inherited affects it
+    host.style.all = "initial";
+    host.style.position = "fixed";
+    host.style.right = `${right}px`;
+    host.style.bottom = `${bottom}px`;
+    host.style.width = `${width}px`;
+    host.style.height = `${height}px`;
+    host.style.border = "1px solid #e5e7eb";
+    host.style.borderRadius = "12px";
+    host.style.overflow = "hidden";
+    host.style.background = "#fff";
+    host.style.boxShadow = "0 16px 48px rgba(0,0,0,0.18)";
+    host.style.zIndex = String(zIndex);
+    host.style.transition = "transform 160ms ease, opacity 160ms ease";
+    host.style.transform = open ? "translateY(0)" : "translateY(12px)";
+    host.style.opacity = open ? "1" : "0";
+    host.style.pointerEvents = open ? "auto" : "none";
+    // Respect mobile safe areas
+    host.style.right = `max(${right}px, env(safe-area-inset-right))`;
+    host.style.bottom = `max(${bottom}px, env(safe-area-inset-bottom))`;
+
+    document.body.appendChild(host);
+    mountRef.current = host;
+    return () => {
+      try { document.body.removeChild(host); } catch {}
+    };
+  }, [right, bottom, width, height, zIndex, open]);
+
+  // Toggle button (also in a portal so it’s fixed to viewport)
+  const toggleBtn = (
+    <button
+      onClick={() => setOpen(v => !v)}
+      style={{
+        position: "fixed",
+        right: `max(${right}px, env(safe-area-inset-right))`,
+        bottom: open ? `calc(${bottom}px + ${height}px + 12px)` : `max(${bottom}px, env(safe-area-inset-bottom))`,
+        zIndex: zIndex + 1,
+        border: "1px solid #e5e7eb",
+        background: "#111827",
+        color: "#fff",
+        padding: "10px 14px",
+        borderRadius: 999,
+        boxShadow: "0 6px 24px rgba(0,0,0,0.15)",
+        cursor: "pointer",
+        fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, 'Helvetica Neue', Arial, sans-serif",
+      }}
+      aria-expanded={open}
+      aria-controls="copilot-iframe"
+      title={open ? "Hide Copilot" : "Open Copilot"}
+    >
+      {open ? "Close Copilot" : "Open Copilot"}
+    </button>
+  );
+
+  const iframeEl = mountRef.current ? createPortal(
+    <iframe
+      id="copilot-iframe"
+      title="copilot"
+      src={src}
+      style={{ width: "100%", height: "100%", border: "none", display: "block" }}
+    />,
+    mountRef.current
+  ) : null;
+
+  return (
+    <>
+      {toggleBtn}
+      {iframeEl}
+    </>
+  );
+}
+
