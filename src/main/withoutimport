@@ -160,3 +160,28 @@ export default function SubappDock({
   );
 }
 
+
+
+
+
+import React from "react";
+import SubappDock from "./SubappDock";
+
+export default function App() {
+  return (
+    <div style={{ minHeight: "200vh", padding: 24 }}>
+      <h1>Main App (React 14)</h1>
+      <p>Scroll around; the Copilot sub-app stays bottom-right.</p>
+
+      <SubappDock
+        src="http://localhost:3001"   // CRA/Vite dev server for sub-app
+        width={420}
+        height={600}
+        right={20}
+        bottom={20}
+        defaultOpen={true}
+      />
+    </div>
+  );
+}
+
