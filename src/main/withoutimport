@@ -249,3 +249,140 @@ export default function SubappShadow({
     </div>
   );
 }
+
+
+
+
+import React, { useEffect, useRef, useState } from "react";
+
+// Load the subapp UMD bundle once via <script>
+function loadScriptOnce(src) {
+  return new Promise((resolve, reject) => {
+    const existing = document.querySelector(`script[src="${src}"]`);
+    if (existing) {
+      if (existing.dataset.ready === "1") return resolve();
+      existing.addEventListener("load", () => resolve());
+      existing.addEventListener("error", reject);
+      return;
+    }
+    const s = document.createElement("script");
+    s.src = src;
+    s.async = true;
+    s.addEventListener("load", () => { s.dataset.ready = "1"; resolve(); });
+    s.addEventListener("error", reject);
+    document.head.appendChild(s);
+  });
+}
+
+/**
+ * Bottom-right floating container that hosts the sub-app in a ShadowRoot.
+ * We DON'T inject styles inside shadow; CopilotKit keeps its own defaults.
+ */
+export default function SubappShadowFloating({
+  runtimeUrl = "http://localhost:8000/copilot",
+  defaultOpen = true,
+  width = 420,
+  height = 600,
+}) {
+  const hostRef = useRef(null);
+  const [open, setOpen] = useState(defaultOpen);
+  const [mountedOnce, setMountedOnce] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!open || mountedOnce) return;
+    let unmount;
+    (async () => {
+      try {
+        if (!hostRef.current) return;
+
+        // 1) Create ShadowRoot on the floating host
+        const shadow = hostRef.current.attachShadow({ mode: "open" });
+
+        // 2) Load the UMD bundle the main app serves from /public/subapp
+        const src = `/subapp/subapp.umd.js`; // or `${process.env.PUBLIC_URL}/subapp/subapp.umd.js`
+        await loadScriptOnce(src);
+
+        if (!window.SubApp?.mount) throw new Error("window.SubApp.mount not found");
+
+        // 3) Mount the sub-app directly into the ShadowRoot
+        unmount = window.SubApp.mount(shadow, { runtimeUrl });
+        setMountedOnce(true);
+      } catch (e) {
+        setError(e?.message || String(e));
+      }
+    })();
+
+    return () => { try { unmount?.(); } catch {} };
+  }, [open, mountedOnce, runtimeUrl]);
+
+  return (
+    <>
+      {/* Toggle button */}
+      <button
+        onClick={() => setOpen(v => !v)}
+        style={{
+          position: "fixed",
+          right: 20,
+          bottom: open ? height + 32 : 20,
+          zIndex: 2147483647,
+          border: "1px solid #e5e7eb",
+          background: "#111827",
+          color: "#fff",
+          padding: "10px 14px",
+          borderRadius: 999,
+          boxShadow: "0 6px 24px rgba(0,0,0,0.15)",
+          cursor: "pointer",
+          fontFamily: "system-ui, sans-serif",
+        }}
+        aria-expanded={open}
+        aria-controls="subapp-chat-widget"
+      >
+        {open ? "Hide Copilot" : "Open Copilot"}
+      </button>
+
+      {/* Floating host that holds the ShadowRoot (no inner styles) */}
+      <div
+        id="subapp-chat-widget"
+        ref={hostRef}
+        style={{
+          position: "fixed",
+          right: 20,
+          bottom: 20,
+          width,
+          height,
+          border: "1px solid #e5e7eb",
+          borderRadius: 14,
+          overflow: "hidden",
+          background: "#fff",
+          boxShadow: "0 16px 48px rgba(0,0,0,0.18)",
+          zIndex: 2147483646,
+          transition: "transform 160ms ease, opacity 160ms ease",
+          transform: open ? "translateY(0)" : "translateY(12px)",
+          opacity: open ? 1 : 0,
+          pointerEvents: open ? "auto" : "none",
+        }}
+      />
+
+      {/* Visible error (outside shadow) */}
+      {error && (
+        <div
+          style={{
+            position: "fixed",
+            right: 20,
+            bottom: height + 64,
+            zIndex: 2147483647,
+            background: "#fee2e2",
+            color: "#991b1b",
+            padding: "8px 12px",
+            border: "1px solid #fecaca",
+            borderRadius: 10,
+            fontFamily: "system-ui, sans-serif"
+          }}
+        >
+          Subapp error: {error}
+        </div>
+      )}
+    </>
+  );
+}
