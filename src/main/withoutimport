@@ -3,29 +3,49 @@
   "private": true,
   "version": "1.0.0",
   "dependencies": {
+    "@copilotkit/react-core": "^1.8.12",
+    "@copilotkit/react-ui": "^1.8.12",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "@copilotkit/react-core": "^1.8.12",
-    "@copilotkit/react-ui": "^1.8.12"
+    "react-scripts": "5.0.1"
   },
   "scripts": {
-    "start": "react-scripts start",   // if CRA
-    "build": "react-scripts build"    // if CRA
+    "start": "react-scripts start",
+    "build": "react-scripts build"
   }
 }
 
 
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Copilot Subapp</title>
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>
+
+
+
 import React from "react";
 import { CopilotKitProvider } from "@copilotkit/react-core";
-import { CopilotChat } from "@copilotkit/react-ui";
+import { CopilotChat /* or CopilotSidebar */ } from "@copilotkit/react-ui";
 
 export default function App() {
   return (
     <CopilotKitProvider runtimeUrl="http://localhost:8000/copilot">
+      {/* Keep CopilotKit defaults (no custom CSS needed) */}
       <div style={{ height: "100vh", width: "100%", display: "flex", flexDirection: "column" }}>
-        <h2 style={{ margin: "16px", fontFamily: "sans-serif" }}>Copilot Sub-app</h2>
-        <div style={{ flex: 1, overflow: "auto", borderTop: "1px solid #e5e7eb" }}>
+        <h2 style={{ margin: 16, fontFamily: "system-ui, sans-serif" }}>Copilot</h2>
+        <div style={{ flex: 1, minHeight: 0, borderTop: "1px solid #e5e7eb" }}>
           <CopilotChat placeholder="Ask me anything…" />
+          {/*
+            If you prefer a sidebar:
+            <CopilotSidebar defaultOpen />
+          */}
         </div>
       </div>
     </CopilotKitProvider>
@@ -36,46 +56,33 @@ export default function App() {
 
 
 
+
 import React from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
 
-const container = document.getElementById("root");
-const root = createRoot(container);
+const root = createRoot(document.getElementById("root"));
 root.render(<App />);
-
-
-<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <title>Copilot Subapp</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-  </head>
-  <body>
-    <div id="root"></div>
-  </body>
-</html>
 
 
 
 
 import React from "react";
 
-export default function SubappFrame({ height = 600 }) {
+export default function SubappFrame({ height = 600, width = 420 }) {
   return (
     <div
       style={{
         position: "fixed",
         right: 20,
         bottom: 20,
-        width: 420,
+        width,
         height,
         border: "1px solid #e5e7eb",
         borderRadius: 12,
         overflow: "hidden",
-        boxShadow: "0 16px 48px rgba(0,0,0,0.18)",
         background: "#fff",
+        boxShadow: "0 16px 48px rgba(0,0,0,0.18)",
         zIndex: 9999
       }}
     >
@@ -87,3 +94,6 @@ export default function SubappFrame({ height = 600 }) {
     </div>
   );
 }
+
+
+
