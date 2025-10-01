@@ -1,6 +1,8 @@
+
 {
   "name": "subapp-with-copilotkit",
   "private": true,
+  "type": "module",
   "dependencies": {
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
@@ -34,19 +36,24 @@ export default {
   output: {
     file: "dist/subapp.umd.js",
     format: "umd",
-    name: "SubApp", // exposed as window.SubApp
+    name: "SubApp",          // exposes window.SubApp
     sourcemap: true
   },
-  external: [],
+  external: [],              // bundle react & deps inside to isolate versions
   plugins: [
-    resolve({ browser: true }),
+    resolve({
+      browser: true,
+      extensions: [".mjs", ".js", ".jsx", ".json"]
+    }),
     commonjs(),
     babel({
       babelHelpers: "bundled",
+      extensions: [".js", ".jsx"],
       presets: [
         ["@babel/preset-env", { targets: ">0.25%, not dead" }],
         ["@babel/preset-react", { runtime: "automatic" }]
-      ]
+      ],
+      sourceMaps: true
     })
   ]
 };
@@ -54,35 +61,38 @@ export default {
 
 
 
+
 import React from "react";
 import { CopilotKitProvider } from "@copilotkit/react-core";
-import { CopilotChat } from "@copilotkit/react-ui";
+import { CopilotChat /*, CopilotSidebar*/ } from "@copilotkit/react-ui";
 
 export default function App({ runtimeUrl = "http://localhost:8000/copilot" }) {
   return (
     <CopilotKitProvider runtimeUrl={runtimeUrl}>
-      <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
-        <header style={{ padding: "8px", borderBottom: "1px solid #ddd", background: "#fff" }}>
-          <strong>Copilot Sub-App</strong>
-        </header>
-        <main style={{ flex: 1, padding: "8px" }}>
-          <CopilotChat placeholder="Ask me anything..." />
-        </main>
-      </div>
+      {/* Keep CopilotKit defaults */}
+      <CopilotChat placeholder="Ask me anything…" />
+      {/* or <CopilotSidebar defaultOpen /> */}
     </CopilotKitProvider>
   );
 }
 
 
 
+
+
 import React from "react";
 import { createRoot } from "react-dom/client";
-import App from "./App";
+import App from "./App.jsx";
 
+/**
+ * Mounts the subapp into a provided HTMLElement (light DOM).
+ * Returns an unmount() cleanup function.
+ */
 export function mount(el, opts = {}) {
   const { runtimeUrl } = opts;
 
   const container = document.createElement("div");
+  container.style.height = "100%";
   el.appendChild(container);
 
   const root = createRoot(container);
@@ -90,7 +100,7 @@ export function mount(el, opts = {}) {
 
   return () => {
     root.unmount();
-    if (container.parentNode) container.parentNode.removeChild(container);
+    container.remove();
   };
 }
 
@@ -99,459 +109,7 @@ export function mount(el, opts = {}) {
 
 import React, { useEffect, useRef, useState } from "react";
 
-function loadScriptOnce(src) {
-  return new Promise((resolve, reject) => {
-    if (document.querySelector(`script[src="${src}"]`)) return resolve();
-    const s = document.createElement("script");
-    s.src = src;
-    s.async = true;
-    s.onload = resolve;
-    s.onerror = reject;
-    document.head.appendChild(s);
-  });
-}
-
-export default function SubappShadow({ height = 600, runtimeUrl }) {
-  const hostRef = useRef(null);
-  const [error, setError] = useState("");
-
-  useEffect(() => {
-    let unmount;
-    let shadow;
-
-    (async () => {
-      try {
-        if (!hostRef.current) return;
-        shadow = hostRef.current.attachShadow({ mode: "open" });
-
-        const src = `${process.env.PUBLIC_URL}/subapp/subapp.umd.js`;
-        await loadScriptOnce(src);
-
-        if (!window.SubApp?.mount) throw new Error("SubApp.mount not found");
-        unmount = window.SubApp.mount(shadow, { runtimeUrl });
-      } catch (e) {
-        setError(e.message);
-      }
-    })();
-
-    return () => unmount?.();
-  }, [runtimeUrl]);
-
-  return (
-    <div
-      ref={hostRef}
-      style={{ width: "100%", height, border: "1px solid #ddd", borderRadius: 8 }}
-    >
-      {error && <div style={{ color: "red", padding: 8 }}>Error: {error}</div>}
-    </div>
-  );
-}
-
-
-
-
-import React from "react";
-import SubappShadow from "./SubappShadow";
-
-export default function App() {
-  return (
-    <div style={{ padding: 24 }}>
-      <h1>Main App (React 14)</h1>
-      <SubappShadow runtimeUrl="http://localhost:8000/copilot" height={700} />
-    </div>
-  );
-}
-
-
-
-import React from "react";
-import { createRoot } from "react-dom/client";
-import App from "./App";
-
-createRoot(document.getElementById("root")).render(<App />);
-
-
-
-
-
-
-import React, { useEffect, useRef, useState } from "react";
-
-// ✅ helper to load the subapp UMD bundle only once
-function loadScriptOnce(src) {
-  return new Promise((resolve, reject) => {
-    const existing = document.querySelector(`script[src="${src}"]`);
-    if (existing) {
-      if (existing.dataset.ready === "1") return resolve(); // already loaded
-      existing.addEventListener("load", () => resolve());
-      existing.addEventListener("error", (e) => reject(e));
-      return;
-    }
-    const s = document.createElement("script");
-    s.src = src;
-    s.async = true;
-    s.onload = () => {
-      s.dataset.ready = "1";
-      resolve();
-    };
-    s.onerror = (e) => reject(e);
-    document.head.appendChild(s);
-  });
-}
-
-export default function SubappShadow({
-  height = 720,
-  runtimeUrl = "http://localhost:8000/copilot"
-}) {
-  const hostRef = useRef(null);
-  const [error, setError] = useState("");
-
-  useEffect(() => {
-    let unmount;
-    let shadow;
-
-    (async () => {
-      try {
-        if (!hostRef.current) return;
-        shadow = hostRef.current.attachShadow({ mode: "open" });
-
-        // load the subapp UMD bundle
-        const src = `/subapp/subapp.umd.js`; // or `${process.env.PUBLIC_URL}/subapp/subapp.umd.js`
-        await loadScriptOnce(src);
-
-        if (!window.SubApp?.mount) {
-          throw new Error("window.SubApp.mount not found – UMD bundle not loaded?");
-        }
-
-        // mount the sub-app inside the shadow root
-        unmount = window.SubApp.mount(shadow, { runtimeUrl });
-      } catch (e) {
-        setError(e.message || String(e));
-      }
-    })();
-
-    return () => unmount?.();
-  }, [runtimeUrl]);
-
-  return (
-    <div
-      ref={hostRef}
-      style={{
-        width: "100%",
-        height,
-        border: "1px solid #ddd",
-        borderRadius: 8,
-        overflow: "hidden",
-        background: "#fff"
-      }}
-    >
-      {error && <div style={{ color: "red", padding: 8 }}>Error: {error}</div>}
-    </div>
-  );
-}
-
-
-
-
-import React, { useEffect, useRef, useState } from "react";
-
-// Load the subapp UMD bundle once via <script>
-function loadScriptOnce(src) {
-  return new Promise((resolve, reject) => {
-    const existing = document.querySelector(`script[src="${src}"]`);
-    if (existing) {
-      if (existing.dataset.ready === "1") return resolve();
-      existing.addEventListener("load", () => resolve());
-      existing.addEventListener("error", reject);
-      return;
-    }
-    const s = document.createElement("script");
-    s.src = src;
-    s.async = true;
-    s.addEventListener("load", () => { s.dataset.ready = "1"; resolve(); });
-    s.addEventListener("error", reject);
-    document.head.appendChild(s);
-  });
-}
-
-/**
- * Bottom-right floating container that hosts the sub-app in a ShadowRoot.
- * We DON'T inject styles inside shadow; CopilotKit keeps its own defaults.
- */
-export default function SubappShadowFloating({
-  runtimeUrl = "http://localhost:8000/copilot",
-  defaultOpen = true,
-  width = 420,
-  height = 600,
-}) {
-  const hostRef = useRef(null);
-  const [open, setOpen] = useState(defaultOpen);
-  const [mountedOnce, setMountedOnce] = useState(false);
-  const [error, setError] = useState("");
-
-  useEffect(() => {
-    if (!open || mountedOnce) return;
-    let unmount;
-    (async () => {
-      try {
-        if (!hostRef.current) return;
-
-        // 1) Create ShadowRoot on the floating host
-        const shadow = hostRef.current.attachShadow({ mode: "open" });
-
-        // 2) Load the UMD bundle the main app serves from /public/subapp
-        const src = `/subapp/subapp.umd.js`; // or `${process.env.PUBLIC_URL}/subapp/subapp.umd.js`
-        await loadScriptOnce(src);
-
-        if (!window.SubApp?.mount) throw new Error("window.SubApp.mount not found");
-
-        // 3) Mount the sub-app directly into the ShadowRoot
-        unmount = window.SubApp.mount(shadow, { runtimeUrl });
-        setMountedOnce(true);
-      } catch (e) {
-        setError(e?.message || String(e));
-      }
-    })();
-
-    return () => { try { unmount?.(); } catch {} };
-  }, [open, mountedOnce, runtimeUrl]);
-
-  return (
-    <>
-      {/* Toggle button */}
-      <button
-        onClick={() => setOpen(v => !v)}
-        style={{
-          position: "fixed",
-          right: 20,
-          bottom: open ? height + 32 : 20,
-          zIndex: 2147483647,
-          border: "1px solid #e5e7eb",
-          background: "#111827",
-          color: "#fff",
-          padding: "10px 14px",
-          borderRadius: 999,
-          boxShadow: "0 6px 24px rgba(0,0,0,0.15)",
-          cursor: "pointer",
-          fontFamily: "system-ui, sans-serif",
-        }}
-        aria-expanded={open}
-        aria-controls="subapp-chat-widget"
-      >
-        {open ? "Hide Copilot" : "Open Copilot"}
-      </button>
-
-      {/* Floating host that holds the ShadowRoot (no inner styles) */}
-      <div
-        id="subapp-chat-widget"
-        ref={hostRef}
-        style={{
-          position: "fixed",
-          right: 20,
-          bottom: 20,
-          width,
-          height,
-          border: "1px solid #e5e7eb",
-          borderRadius: 14,
-          overflow: "hidden",
-          background: "#fff",
-          boxShadow: "0 16px 48px rgba(0,0,0,0.18)",
-          zIndex: 2147483646,
-          transition: "transform 160ms ease, opacity 160ms ease",
-          transform: open ? "translateY(0)" : "translateY(12px)",
-          opacity: open ? 1 : 0,
-          pointerEvents: open ? "auto" : "none",
-        }}
-      />
-
-      {/* Visible error (outside shadow) */}
-      {error && (
-        <div
-          style={{
-            position: "fixed",
-            right: 20,
-            bottom: height + 64,
-            zIndex: 2147483647,
-            background: "#fee2e2",
-            color: "#991b1b",
-            padding: "8px 12px",
-            border: "1px solid #fecaca",
-            borderRadius: 10,
-            fontFamily: "system-ui, sans-serif"
-          }}
-        >
-          Subapp error: {error}
-        </div>
-      )}
-    </>
-  );
-}
-
-
-
-
-
-
-import React, { useEffect, useRef, useState } from "react";
-
-// Load the subapp UMD bundle once via <script>
-function loadScriptOnce(src) {
-  return new Promise((resolve, reject) => {
-    const existing = document.querySelector(`script[src="${src}"]`);
-    if (existing) {
-      if (existing.dataset.ready === "1") return resolve();
-      existing.addEventListener("load", () => resolve());
-      existing.addEventListener("error", reject);
-      return;
-    }
-    const s = document.createElement("script");
-    s.src = src;
-    s.async = true;
-    s.addEventListener("load", () => { s.dataset.ready = "1"; resolve(); });
-    s.addEventListener("error", reject);
-    document.head.appendChild(s);
-  });
-}
-
-/**
- * Bottom-right floating container that hosts the sub-app in a ShadowRoot.
- * - Keeps CopilotKit default styles (no CSS injection inside shadow).
- * - Mounts ONLY ONCE; later open/close just hides/shows the box.
- */
-export default function SubappShadowFloating({
-  runtimeUrl = "http://localhost:8000/copilot",
-  defaultOpen = true,
-  width = 420,
-  height = 600,
-  unmountOnClose = false // set true if you want to fully unmount on close
-}) {
-  const hostRef = useRef(null);
-  const mountedRef = useRef(false);   // prevent double-mount (StrictMode/dev)
-  const unmountFnRef = useRef(null);  // remember subapp unmount
-  const [open, setOpen] = useState(defaultOpen);
-  const [error, setError] = useState("");
-
-  useEffect(() => {
-    // Mount once on first open
-    if (!open || mountedRef.current) return;
-
-    (async () => {
-      try {
-        const host = hostRef.current;
-        if (!host) return;
-
-        // ✅ Reuse existing shadow if present; otherwise attach once
-        const shadow = host.shadowRoot ?? host.attachShadow({ mode: "open" });
-
-        // Load the UMD bundle served by the main app
-        const src = `/subapp/subapp.umd.js`; // or `${process.env.PUBLIC_URL}/subapp/subapp.umd.js`
-        await loadScriptOnce(src);
-
-        if (!window.SubApp?.mount) {
-          throw new Error("window.SubApp.mount not found (is subapp.umd.js copied under /public/subapp/?)");
-        }
-
-        // Mount subapp inside the (existing) ShadowRoot
-        unmountFnRef.current = window.SubApp.mount(shadow, { runtimeUrl });
-        mountedRef.current = true;
-      } catch (e) {
-        setError(e?.message || String(e));
-      }
-    })();
-  }, [open, runtimeUrl]);
-
-  // Optional: unmount when closing (default is to keep it mounted & just hide)
-  useEffect(() => {
-    if (!unmountOnClose) return;
-    if (!open && mountedRef.current && unmountFnRef.current) {
-      try { unmountFnRef.current(); } catch {}
-      mountedRef.current = false;
-      unmountFnRef.current = null;
-      // Keep the shadow root in place; re-open will remount.
-    }
-  }, [open, unmountOnClose]);
-
-  return (
-    <>
-      {/* Toggle button */}
-      <button
-        onClick={() => setOpen(v => !v)}
-        style={{
-          position: "fixed",
-          right: 20,
-          bottom: open ? height + 32 : 20,
-          zIndex: 2147483647,
-          border: "1px solid #e5e7eb",
-          background: "#111827",
-          color: "#fff",
-          padding: "10px 14px",
-          borderRadius: 999,
-          boxShadow: "0 6px 24px rgba(0,0,0,0.15)",
-          cursor: "pointer",
-          fontFamily: "system-ui, sans-serif",
-        }}
-        aria-expanded={open}
-        aria-controls="subapp-chat-widget"
-      >
-        {open ? "Hide Copilot" : "Open Copilot"}
-      </button>
-
-      {/* Floating host (the ShadowRoot is attached to THIS div once) */}
-      <div
-        id="subapp-chat-widget"
-        ref={hostRef}
-        style={{
-          position: "fixed",
-          right: 20,
-          bottom: 20,
-          width,
-          height,
-          border: "1px solid #e5e7eb",
-          borderRadius: 14,
-          overflow: "hidden",
-          background: "#fff",
-          boxShadow: "0 16px 48px rgba(0,0,0,0.18)",
-          zIndex: 2147483646,
-          transition: "transform 160ms ease, opacity 160ms ease",
-          transform: open ? "translateY(0)" : "translateY(12px)",
-          opacity: open ? 1 : 0,
-          pointerEvents: open ? "auto" : "none",
-        }}
-      />
-
-      {/* Show error (outside shadow so it's always visible) */}
-      {error && (
-        <div
-          style={{
-            position: "fixed",
-            right: 20,
-            bottom: height + 64,
-            zIndex: 2147483647,
-            background: "#fee2e2",
-            color: "#991b1b",
-            padding: "8px 12px",
-            border: "1px solid #fecaca",
-            borderRadius: 10,
-            fontFamily: "system-ui, sans-serif"
-          }}
-        >
-          Subapp error: {error}
-        </div>
-      )}
-    </>
-  );
-}
-
-
-
-
-
-
-
-
-import React, { useEffect, useRef, useState } from "react";
-
-// Load the subapp UMD bundle once via <script> and surface a useful error
+// Load the UMD once and provide clear error text (not [object Event])
 function loadScriptOnce(src) {
   return new Promise((resolve, reject) => {
     const existing = document.querySelector(`script[src="${src}"]`);
@@ -564,6 +122,7 @@ function loadScriptOnce(src) {
     const s = document.createElement("script");
     s.src = src;
     s.async = true;
+    s.crossOrigin = "anonymous";
     s.onload = () => { s.dataset.ready = "1"; resolve(); };
     s.onerror = () => reject(new Error(`Failed to load ${src}`));
     document.head.appendChild(s);
@@ -571,8 +130,8 @@ function loadScriptOnce(src) {
 }
 
 /**
- * Bottom-right floating container that hosts the sub-app in the *light* DOM
- * (no ShadowRoot) so CopilotKit's default styles work out-of-the-box.
+ * Bottom-right floating container that hosts the sub-app in light DOM.
+ * We don't inject styles inside; CopilotKit uses its own defaults.
  */
 export default function SubappFloatingNoShadow({
   runtimeUrl = "http://localhost:8000/copilot",
@@ -589,17 +148,19 @@ export default function SubappFloatingNoShadow({
   useEffect(() => {
     if (!open || mountedOnce) return;
     let unmount;
+
     (async () => {
       try {
-        if (!hostRef.current) return;
+        const host = hostRef.current;
+        if (!host) return;
 
-        // 1) Create a mount point in light DOM (NOT shadow)
+        // Create a mount point in light DOM
         const mountPoint = document.createElement("div");
         mountPoint.style.height = "100%";
-        hostRef.current.appendChild(mountPoint);
+        host.appendChild(mountPoint);
         mountPointRef.current = mountPoint;
 
-        // 2) Load sub-app UMD from /public/subapp
+        // Load subapp bundle from CRA public/
         const src = `/subapp/subapp.umd.js`; // or `${process.env.PUBLIC_URL}/subapp/subapp.umd.js`
         await loadScriptOnce(src);
 
@@ -607,7 +168,7 @@ export default function SubappFloatingNoShadow({
           throw new Error("window.SubApp.mount not found (is subapp.umd.js copied to /public/subapp/?)");
         }
 
-        // 3) Mount sub-app (it renders into mountPoint)
+        // Mount it
         unmount = window.SubApp.mount(mountPoint, { runtimeUrl });
         setMountedOnce(true);
       } catch (e) {
@@ -617,9 +178,6 @@ export default function SubappFloatingNoShadow({
 
     return () => {
       try { unmount?.(); } catch {}
-      // keep the mountPoint to avoid repeated mounts unless you want to clean it:
-      // mountPointRef.current?.remove();
-      // mountPointRef.current = null;
     };
   }, [open, mountedOnce, runtimeUrl]);
 
@@ -648,7 +206,7 @@ export default function SubappFloatingNoShadow({
         {open ? "Hide Copilot" : "Open Copilot"}
       </button>
 
-      {/* Floating host (no ShadowRoot) */}
+      {/* Floating host box */}
       <div
         id="subapp-chat-widget"
         ref={hostRef}
@@ -671,7 +229,6 @@ export default function SubappFloatingNoShadow({
         }}
       />
 
-      {/* Visible error (if any) */}
       {error && (
         <div
           style={{
@@ -698,22 +255,36 @@ export default function SubappFloatingNoShadow({
 
 
 
+
+import React from "react";
+import SubappFloatingNoShadow from "./SubappFloatingNoShadow";
+
+export default function App() {
+  return (
+    <div style={{ padding: 24, minHeight: "120vh" }}>
+      <h1>Main App (React 14)</h1>
+
+      <SubappFloatingNoShadow
+        runtimeUrl="http://localhost:8000/copilot"
+        defaultOpen={true}
+        width={420}
+        height={600}
+      />
+    </div>
+  );
+}
+
+
+
+
+
+
 import React from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
 
-// Mount into a provided element (light DOM)
-export function mount(el, opts = {}) {
-  const { runtimeUrl } = opts;
-  const container = document.createElement("div");
-  container.style.height = "100%";
-  el.appendChild(container);
+createRoot(document.getElementById("root")).render(<App />);
 
-  const root = createRoot(container);
-  root.render(<App runtimeUrl={runtimeUrl} />);
 
-  return () => {
-    root.unmount();
-    container.remove();
-  };
-}
+
+
