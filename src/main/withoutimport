@@ -500,3 +500,26 @@ export default function SubApp() {
   background: white; /* prevent overlap */
   border-top: 1px solid #eee; /* optional styling */
 }
+
+
+
+
+
+
+
+from fastapi import FastAPI
+from pydantic import BaseModel
+from typing import List, Optional
+from datetime import datetime
+
+app = FastAPI()
+
+class CopilotMessage(BaseModel):
+    id: str
+    role: str        # "user" | "assistant" | "system"
+    content: str
+    createdAt: Optional[datetime] = None
+
+class CopilotRequest(BaseModel):
+    messages: List[CopilotMessage]
+    variables: Optional[dict] = None   # extra CopilotKit state if you use it
