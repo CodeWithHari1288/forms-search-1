@@ -594,3 +594,85 @@ export default function SubApp() {
 
   return <CopilotChat onSendMessage={onSend} className="h-screen" />;
 }
+
+
+
+
+
+
+
+
+
+
+// SubApp.jsx
+import React, { useState } from "react";
+import { CopilotChat } from "@copilotkit/react-ui";
+
+const API_URL = "http://localhost:8000/copilot"; // your FastAPI endpoint
+
+export default function SubApp() {
+  const [messages, setMessages] = useState([
+    { role: "assistant", content: "Hi! Ask me anything." }
+  ]);
+
+  async function callBackend(text) {
+    const body = { messages: [{ role: "user", content: text }] };
+
+    const res = await fetch(API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    const data = await res.json();
+
+    // Normalize ANY of the known shapes to a plain string
+    const reply =
+      // v2 parts-style
+      (Array.isArray(data?.message?.content) && data.message.content[0]?.text) ||
+      // v1 plain content
+      (typeof data?.message?.content === "string" && data.message.content) ||
+      // very old
+      data?.reply ||
+      // fallback
+      JSON.stringify(data);
+
+    return reply;
+  }
+
+  // Newer CopilotChat builds
+  async function handleSendMessage(text) {
+    // show user message
+    setMessages((m) => [...m, { role: "user", content: text }]);
+
+    try {
+      const reply = await callBackend(text);
+      // show assistant message
+      setMessages((m) => [...m, { role: "assistant", content: reply }]);
+    } catch (e) {
+      setMessages((m) => [...m, { role: "assistant", content: `Error: ${e}` }]);
+    }
+  }
+
+  // Older CopilotChat builds (if it uses onMessage to receive both user & assistant)
+  function handleMessage(msg) {
+    // If CopilotChat invokes this with user messages, forward to backend
+    if (msg?.role === "user" && msg?.content) {
+      handleSendMessage(msg.content);
+    }
+  }
+
+  return (
+    <div className="h-screen flex flex-col">
+      <CopilotChat
+        className="flex-1"
+        // Controlled messages
+        messages={messages}
+        // Newer prop: called with the raw user text
+        onSendMessage={handleSendMessage}
+        // Older prop: called with a message object
+        onMessage={handleMessage}
+      />
+    </div>
+  );
+}
