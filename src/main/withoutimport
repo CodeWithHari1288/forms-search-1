@@ -460,3 +460,43 @@ export default function SubApp() {
     </div>
   );
 }
+
+
+
+
+
+.chat-page {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-container {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0; /* important for flex children to shrink */
+}
+
+/* Ensure CopilotChat uses column layout */
+.chat-inner {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+}
+
+/* First child = messages area, scrollable */
+.chat-inner > :first-child {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+/* Last child = composer, pinned to bottom */
+.chat-inner > :last-child {
+  margin-top: auto;
+  position: sticky;
+  bottom: 0;
+  background: white; /* prevent overlap */
+  border-top: 1px solid #eee; /* optional styling */
+}
