@@ -554,3 +554,43 @@ for msg in req.messages:
 # Get last user query
 last_user = [m for m in req.messages if m.role == "user"][-1]
 print("Last user query:", last_user.content)
+
+
+
+
+
+
+
+
+// SubApp.jsx
+import { CopilotChat } from "@copilotkit/react-ui";
+import { useCopilotChat } from "@copilotkit/react-core";
+
+export default function SubApp() {
+  const { sendMessage, addMessage } = useCopilotChat();
+
+  const onSend = async (text) => {
+    // send as user (lets the UI show the user bubble)
+    await sendMessage(text);
+
+    // call your FastAPI
+    const res = await fetch("http://localhost:8000/copilot", {
+      method: "POST",
+      headers: { "Content-Type":"application/json" },
+      body: JSON.stringify({ messages: [{ role:"user", content:text }] })
+    });
+    const data = await res.json();
+
+    // normalize any of the server shapes to text:
+    const reply =
+      data?.message?.content?.[0]?.text
+      || data?.message?.content
+      || data?.reply
+      || JSON.stringify(data);
+
+    // append assistant message explicitly
+    addMessage({ role: "assistant", content: reply });
+  };
+
+  return <CopilotChat onSendMessage={onSend} className="h-screen" />;
+}
