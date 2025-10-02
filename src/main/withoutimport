@@ -523,3 +523,34 @@ class CopilotMessage(BaseModel):
 class CopilotRequest(BaseModel):
     messages: List[CopilotMessage]
     variables: Optional[dict] = None   # extra CopilotKit state if you use it
+
+
+
+
+
+@app.post("/copilot")
+async def copilot_handler(req: CopilotRequest):
+    # Get the latest user message
+    user_msg = next((m for m in reversed(req.messages) if m.role == "user"), None)
+
+    if user_msg:
+        print("User asked:", user_msg.content)
+
+    # Example response — must return JSON that CopilotChat can display
+    return {
+        "message": {
+            "role": "assistant",
+            "content": f"I received: {user_msg.content if user_msg else 'no message'}"
+        }
+    }
+
+
+
+
+# Get all messages
+for msg in req.messages:
+    print(msg.role, msg.content)
+
+# Get last user query
+last_user = [m for m in req.messages if m.role == "user"][-1]
+print("Last user query:", last_user.content)
