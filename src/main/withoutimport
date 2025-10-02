@@ -676,3 +676,44 @@ export default function SubApp() {
     </div>
   );
 }
+
+
+
+
+
+import React, { useState } from "react";
+import { CopilotChat } from "@copilotkit/react-ui";
+
+export default function ChatPage() {
+  const [messages, setMessages] = useState([
+    { role: "assistant", content: "Hi! Ask me anything." }
+  ]);
+
+  async function send(text) {
+    setMessages(m => [...m, { role: "user", content: text }]);
+
+    const res = await fetch("http://localhost:8000/copilot", {
+      method: "POST",
+      headers: { "Content-Type":"application/json" },
+      body: JSON.stringify({ messages: [{ role: "user", content: text }] })
+    });
+
+    // Will throw if body is empty → you’ll see the real problem
+    const data = await res.json();
+
+    const reply =
+      data?.message?.content?.[0]?.text || // parts-array variant
+      data?.message?.content ||            // plain-string variant
+      data?.reply ||                       // legacy variant
+      JSON.stringify(data);                // fallback for debugging
+
+    setMessages(m => [...m, { role: "assistant", content: reply }]);
+  }
+
+  return (
+    <div style={{height:"100vh", display:"flex", flexDirection:"column"}}>
+      <CopilotChat className="flex-1" messages={messages} onSendMessage={send} />
+    </div>
+  );
+}
+
