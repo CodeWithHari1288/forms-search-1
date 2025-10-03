@@ -855,3 +855,40 @@ module.exports = {
 
   // ...devServer, module.rules, etc. unchanged...
 };
+
+
+
+
+
+const webpack = require("webpack");
+
+module.exports = {
+  // ...your existing config...
+  resolve: {
+    // prefer browser builds when available
+    mainFields: ["browser", "module", "main"],
+    alias: {
+      // hard-block URL-scheme imports
+      "node:fs": false,
+    },
+    fallback: {
+      // DO NOT polyfill fs in the browser
+      fs: false,
+      // keep your other fallbacks if you already added them:
+      // crypto: require.resolve("crypto-browserify"),
+      // stream: require.resolve("stream-browserify"),
+      // buffer: require.resolve("buffer"),
+      // util: require.resolve("util"),
+      // process: require.resolve("process/browser"),
+    },
+  },
+  plugins: [
+    // If any dep still uses the node: scheme, strip it (node:fs -> fs)
+    new webpack.NormalModuleReplacementPlugin(/^node:/, (res) => {
+      res.request = res.request.replace(/^node:/, "");
+    }),
+
+    // As an extra guard, ignore bare "fs" imports completely
+    new webpack.IgnorePlugin({ resourceRegExp: /^fs$/ }),
+  ],
+};
