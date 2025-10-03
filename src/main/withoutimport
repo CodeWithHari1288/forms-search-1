@@ -1,3 +1,7 @@
+
+
+
+
 {
   "name": "subapp-copilot",
   "private": true,
@@ -784,4 +788,70 @@ module.exports = {
     open: false,
   },
   devtool: "source-map",
+};
+
+
+
+
+
+
+
+
+
+
+// webpack.config.js
+const path = require("path");
+const HtmlWebpackPlugin = require("html-webpack-plugin");
+const webpack = require("webpack");
+
+module.exports = {
+  // ...keep your existing config...
+  resolve: {
+    extensions: [".js", ".jsx"],
+    // Prefer browser builds when packages provide them
+    mainFields: ["browser", "module", "main"],
+
+    // 1) Explicit aliases for node: scheme imports
+    alias: {
+      "node:fs": false, // never polyfill fs in browser
+      "node:path": require.resolve("path-browserify"),
+      "node:url": require.resolve("url/"),
+      "node:crypto": require.resolve("crypto-browserify"),
+      "node:stream": require.resolve("stream-browserify"),
+      // (add more only if errors mention them, e.g., "node:os" -> "os-browserify/browser")
+    },
+
+    // 2) Regular fallbacks for bare imports (without node: prefix)
+    fallback: {
+      fs: false, // disable fs entirely
+      path: require.resolve("path-browserify"),
+      url: require.resolve("url/"),
+      crypto: require.resolve("crypto-browserify"),
+      stream: require.resolve("stream-browserify"),
+      buffer: require.resolve("buffer"),
+      util: require.resolve("util"),
+      process: require.resolve("process/browser"),
+      // add http/https/os only if you see errors referencing them:
+      // http: require.resolve("stream-http"),
+      // https: require.resolve("https-browserify"),
+      // os: require.resolve("os-browserify/browser"),
+    },
+  },
+
+  plugins: [
+    new HtmlWebpackPlugin({ template: "./public/index.html" }),
+
+    // 3) Strip the "node:" protocol if any package still uses it
+    new webpack.NormalModuleReplacementPlugin(/^node:/, (resource) => {
+      resource.request = resource.request.replace(/^node:/, "");
+    }),
+
+    // 4) Provide globals some shims rely on
+    new webpack.ProvidePlugin({
+      Buffer: ["buffer", "Buffer"],
+      process: ["process"],
+    }),
+  ],
+
+  // ...devServer, module.rules, etc. unchanged...
 };
