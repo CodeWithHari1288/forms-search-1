@@ -717,3 +717,71 @@ export default function ChatPage() {
   );
 }
 
+
+
+
+
+
+
+// webpack.config.js
+const path = require("path");
+const HtmlWebpackPlugin = require("html-webpack-plugin");
+const webpack = require("webpack");
+
+module.exports = {
+  mode: "development",
+  entry: "./src/index.jsx",
+  output: {
+    filename: "bundle.[contenthash].js",
+    path: path.resolve(__dirname, "dist"),
+    clean: true,
+    publicPath: "/", // dev server
+  },
+  module: {
+    rules: [
+      {
+        test: /\.(js|jsx)$/,
+        exclude: /node_modules/,
+        use: {
+          loader: "babel-loader",
+          options: {
+            presets: [
+              ["@babel/preset-env", { targets: "defaults" }],
+              ["@babel/preset-react", { runtime: "automatic" }],
+            ],
+          },
+        },
+      },
+    ],
+  },
+  resolve: {
+    extensions: [".js", ".jsx"],
+    fallback: {
+      crypto: require.resolve("crypto-browserify"),
+      stream: require.resolve("stream-browserify"),
+      buffer: require.resolve("buffer"),
+      util: require.resolve("util"),
+      process: require.resolve("process/browser"),
+      // add more only if build errors mention them:
+      // http: require.resolve("stream-http"),
+      // https: require.resolve("https-browserify"),
+      // os: require.resolve("os-browserify/browser"),
+      // path: require.resolve("path-browserify"),
+      // url: require.resolve("url/")
+    },
+  },
+  plugins: [
+    new HtmlWebpackPlugin({ template: "./public/index.html" }),
+    new webpack.ProvidePlugin({
+      Buffer: ["buffer", "Buffer"],
+      process: ["process"],
+    }),
+  ],
+  devServer: {
+    port: 3001,
+    historyApiFallback: true,
+    hot: true,
+    open: false,
+  },
+  devtool: "source-map",
+};
