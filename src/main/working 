@@ -1033,3 +1033,134 @@ public class GroupInsideRootBetweenEOR {
         return val.isEmpty() ? null : val;
     }
 }
+
+
+
+
+
+
+
+
+
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class WordReplacer {
+
+    public static void main(String[] args) throws Exception {
+        if (args.length < 3) {
+            System.err.println("Usage: java WordReplacer <input.txt> <replacements.csv> <output.txt>");
+            System.err.println(" - replacements.csv format: from,to (one per line; # for comments)");
+            System.exit(1);
+        }
+        Path input = Paths.get(args[0]);
+        Path mapCsv = Paths.get(args[1]);
+        Path output = Paths.get(args[2]);
+
+        // Load mapping
+        Map<String, String> map = loadMapping(mapCsv);
+
+        // Build a single regex that matches any key as a whole word (longest first)
+        Pattern pattern = buildAlternationPattern(map.keySet());
+
+        String text = new String(Files.readAllBytes(input), StandardCharsets.UTF_8);
+        String replaced = replaceAll(text, pattern, map);
+
+        Files.write(output, replaced.getBytes(StandardCharsets.UTF_8),
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+
+        System.out.println("Done. Wrote: " + output.toAbsolutePath());
+    }
+
+    /** Load "from,to" CSV into a case-insensitive map (keys stored lowercase). */
+    private static Map<String, String> loadMapping(Path csv) throws IOException {
+        Map<String, String> map = new LinkedHashMap<>();
+        try (BufferedReader br = Files.newBufferedReader(csv, StandardCharsets.UTF_8)) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty() || line.startsWith("#")) continue;
+                String[] parts = line.split(",", 2);
+                if (parts.length < 2) continue;
+                String from = parts[0].trim();
+                String to = parts[1].trim();
+                if (!from.isEmpty()) {
+                    map.put(from.toLowerCase(Locale.ROOT), to);
+                }
+            }
+        }
+        return map;
+    }
+
+    /**
+     * Build a case-insensitive alternation pattern with whole-word boundaries.
+     * Example: \b(?:Mgmt|txt|addr)\b  (keys sorted by descending length)
+     */
+    private static Pattern buildAlternationPattern(Set<String> keys) {
+        List<String> sorted = new ArrayList<>(keys);
+        // Longest first to avoid partial matches overshadowing longer ones
+        sorted.sort((a, b) -> Integer.compare(b.length(), a.length()));
+
+        StringBuilder alt = new StringBuilder();
+        alt.append("\\b(?:");
+        boolean first = true;
+        for (String k : sorted) {
+            if (!first) alt.append("|");
+            alt.append(Pattern.quote(k));
+            first = false;
+        }
+        alt.append(")\\b");
+        // Case-insensitive + Unicode-aware word boundaries are good enough here
+        return Pattern.compile(alt.toString(), Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE);
+    }
+
+    /** Replace all matches using map, preserving the original token's casing style. */
+    private static String replaceAll(String text, Pattern pattern, Map<String, String> lowerMap) {
+        Matcher m = pattern.matcher(text);
+        StringBuffer sb = new StringBuffer();
+        while (m.find()) {
+            String original = m.group();
+            String keyLower = original.toLowerCase(Locale.ROOT);
+            String replacement = lowerMap.getOrDefault(keyLower, original);
+            String cased = matchCase(replacement, original);
+            m.appendReplacement(sb, Matcher.quoteReplacement(cased));
+        }
+        m.appendTail(sb);
+        return sb.toString();
+    }
+
+    /**
+     * Simple case preservation:
+     *  - ALL CAPS   -> make replacement UPPER
+     *  - First Caps -> Capitalize replacement
+     *  - lower      -> keep replacement lower
+     *  - Mixed      -> leave replacement as-is
+     */
+    private static String matchCase(String replacement, String original) {
+        if (original.equals(original.toUpperCase(Locale.ROOT))) {
+            return replacement.toUpperCase(Locale.ROOT);
+        }
+        if (original.equals(original.toLowerCase(Locale.ROOT))) {
+            return replacement.toLowerCase(Locale.ROOT);
+        }
+        if (isTitleCase(original)) {
+            return capitalize(replacement);
+        }
+        return replacement; // mixed case → leave mapping's case
+    }
+
+    private static boolean isTitleCase(String s) {
+        if (s.isEmpty()) return false;
+        char first = s.charAt(0);
+        return Character.isUpperCase(first) && s.substring(1).equals(s.substring(1).toLowerCase(Locale.ROOT));
+    }
+
+    private static String capitalize(String s) {
+        if (s.isEmpty()) return s;
+        return s.substring(0, 1).toUpperCase(Locale.ROOT) + s.substring(1).toLowerCase(Locale.ROOT);
+    }
+}
