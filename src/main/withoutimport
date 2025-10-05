@@ -941,3 +941,64 @@ public class PropLabelExtractor {
         }
     }
 }
+
+
+
+
+
+
+
+
+
+import java.io.*;
+import java.nio.file.*;
+import java.util.regex.*;
+
+public class PropLabelExtractorCustom {
+
+    public static void main(String[] args) {
+        Path inputPath = Paths.get("input.txt");   // your raw file
+        Path outputPath = Paths.get("output.txt"); // output
+
+        // Regex to capture "Prop: value" and "Label: value"
+        Pattern propPattern = Pattern.compile("Prop\\s*:\\s*([^,\\s}]+)", Pattern.CASE_INSENSITIVE);
+        Pattern labelPattern = Pattern.compile("Label\\s*:\\s*([^,\\s}]+)", Pattern.CASE_INSENSITIVE);
+
+        try (BufferedReader br = Files.newBufferedReader(inputPath);
+             BufferedWriter bw = Files.newBufferedWriter(outputPath)) {
+
+            String line;
+            String prop = null, label = null;
+
+            while ((line = br.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty() || line.equals("{") || line.equals("}")) {
+                    continue; // skip braces and empty lines
+                }
+
+                Matcher pm = propPattern.matcher(line);
+                if (pm.find()) {
+                    prop = pm.group(1).trim();
+                }
+
+                Matcher lm = labelPattern.matcher(line);
+                if (lm.find()) {
+                    label = lm.group(1).trim();
+                }
+
+                // when both found, write and reset
+                if (prop != null && label != null) {
+                    bw.write(prop + ":" + label);
+                    bw.newLine();
+                    prop = null;
+                    label = null;
+                }
+            }
+
+            System.out.println("Done. Output written to " + outputPath.toAbsolutePath());
+
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+}
