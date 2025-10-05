@@ -1103,3 +1103,123 @@ public class ExpandCamelCase {
         }
     }
 }
+
+
+
+
+
+
+
+
+
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class AddScenarioPrefixes {
+
+    // Matches a header line like: ===== Section : Scenarios === (flexible spacing/case)
+    private static final Pattern SECTION_START = Pattern.compile(
+            "^\\s*=+\\s*Section\\s*:\\s*Scenarios\\s*=+\\s*$",
+            Pattern.CASE_INSENSITIVE);
+
+    // Matches a line that starts with "Scenarios #<num>" (acts as a marker and also for "already has" check)
+    private static final Pattern SCENARIO_AT_START = Pattern.compile(
+            "^\\s*Scenarios\\s*#\\s*(\\d+)\\b.*$",  // capture the number if present
+            Pattern.CASE_INSENSITIVE);
+
+    // Matches a line that starts with ANY "Scenarios #<num>" prefix (used to avoid duplications)
+    private static final Pattern HAS_ANY_SCENARIO_PREFIX = Pattern.compile(
+            "^\\s*Scenarios\\s*#\\s*\\d+\\b\\s*[:\\-]?\\s*",
+            Pattern.CASE_INSENSITIVE);
+
+    public static void main(String[] args) throws IOException {
+        // Usage: java AddScenarioPrefixes input.txt output.txt
+        if (args.length < 2) {
+            System.err.println("Usage: java AddScenarioPrefixes <input.txt> <output.txt>");
+            System.err.println("Tip: The program starts prefixing after a '===== Section : Scenarios ===' line.");
+            System.exit(1);
+        }
+
+        Path in = Paths.get(args[0]);
+        Path out = Paths.get(args[1]);
+
+        process(in, out);
+        System.out.println("Done. Wrote: " + out.toAbsolutePath());
+    }
+
+    private static void process(Path input, Path output) throws IOException {
+        try (BufferedReader reader = Files.newBufferedReader(input, StandardCharsets.UTF_8);
+             BufferedWriter writer = Files.newBufferedWriter(output, StandardCharsets.UTF_8,
+                     StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
+
+            boolean inScenariosSection = false;
+            Integer currentScenario = null; // null until we enter section; will default to 1 on first content after header
+
+            String line;
+            while ((line = reader.readLine()) != null) {
+                // If we encounter the scenarios section header, enter section mode and reset
+                if (SECTION_START.matcher(line).matches()) {
+                    inScenariosSection = true;
+                    currentScenario = null; // will become 1 when we hit first content line (unless a marker forces another number)
+                    writer.write(line);
+                    writer.newLine();
+                    continue;
+                }
+
+                if (!inScenariosSection) {
+                    // Outside the section: write as-is
+                    writer.write(line);
+                    writer.newLine();
+                    continue;
+                }
+
+                // Inside the scenarios section --------------------------
+
+                // If the line itself starts with "Scenarios #N", treat it as a marker:
+                Matcher marker = SCENARIO_AT_START.matcher(line);
+                if (marker.matches()) {
+                    // Update the current scenario to the marker's number
+                    String numStr = marker.group(1);
+                    if (numStr != null) {
+                        try {
+                            currentScenario = Integer.parseInt(numStr);
+                        } catch (NumberFormatException ignored) {
+                            // If somehow not a number, don't change currentScenario
+                        }
+                    }
+                    // Write the marker line unchanged
+                    writer.write(line);
+                    writer.newLine();
+                    continue;
+                }
+
+                // Blank / whitespace-only lines: just write them
+                if (line.trim().isEmpty()) {
+                    writer.write(line);
+                    writer.newLine();
+                    continue;
+                }
+
+                // First non-marker line after entering section? Default to Scenarios #1
+                if (currentScenario == null) {
+                    currentScenario = 1;
+                }
+
+                // If the line already has ANY "Scenarios #<num>" at the beginning, don't duplicate
+                if (HAS_ANY_SCENARIO_PREFIX.matcher(line).find()) {
+                    writer.write(line);
+                    writer.newLine();
+                    continue;
+                }
+
+                // Otherwise, prepend the current scenario prefix
+                String prefixed = "Scenarios #" + currentScenario + " " + line;
+                writer.write(prefixed);
+                writer.newLine();
+            }
+        }
+    }
+}
