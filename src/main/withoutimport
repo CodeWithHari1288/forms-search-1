@@ -1558,3 +1558,191 @@ public class AddScenarioPrefixes {
         }
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class GroupConsecutiveScenarioStatements {
+
+    // Section header like "==== Section : Root====" (flexible = and spaces)
+    private static final Pattern SECTION_HEADER = Pattern.compile(
+            "^\\s*=+\\s*Section\\s*:\\s*([A-Za-z0-9 _-]+)\\s*=+\\s*$",
+            Pattern.CASE_INSENSITIVE);
+
+    // End of record line: "--- End of Record <id...>"
+    private static final Pattern END_OF_RECORD = Pattern.compile(
+            "^\\s*-{3}\\s*End\\s+of\\s+Record\\b.*$", Pattern.CASE_INSENSITIVE);
+
+    // Scenario line: capture scenario number, 2-key words, and value phrase
+    // Examples matched:
+    // "Scenarios #1 abc client data as jjj"
+    // "Scenarios #1 abc opportunities are 2"
+    // "Scenarios #1 abc address ggh"
+    private static final Pattern SCEN_LINE = Pattern.compile(
+            "^\\s*Scenarios\\s*#\\s*(\\d+)\\s+(\\S+)\\s+(\\S+)\\s+(.*)\\s*$",
+            Pattern.CASE_INSENSITIVE);
+
+    // Value-cleanup: strip leading filler like "is/are/as/:" and commas/spaces
+    private static final Pattern LEAD_FILLER = Pattern.compile(
+            "^(?:is|are|as)\\b\\s*[:,]*\\s*", Pattern.CASE_INSENSITIVE);
+
+    public static void main(String[] args) throws IOException {
+        if (args.length < 2) {
+            System.err.println("Usage: java GroupConsecutiveScenarioStatements <input.txt> <output.txt>");
+            System.exit(1);
+        }
+        Path in = Paths.get(args[0]);
+        Path out = Paths.get(args[1]);
+        process(in, out);
+        System.out.println("Done. Output -> " + out.toAbsolutePath());
+    }
+
+    private static void process(Path input, Path output) throws IOException {
+        try (BufferedReader br = Files.newBufferedReader(input, StandardCharsets.UTF_8);
+             BufferedWriter bw = Files.newBufferedWriter(output, StandardCharsets.UTF_8,
+                     StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
+
+            boolean inRoot = false;
+
+            // Rolling group state (active only inside ROOT section)
+            Integer gScenario = null;
+            String gWord1 = null, gWord2 = null;
+            List<String> gValues = new ArrayList<>();
+
+            String line;
+            while ((line = br.readLine()) != null) {
+                // Section changes?
+                Matcher sh = SECTION_HEADER.matcher(line);
+                if (sh.matches()) {
+                    // Flush any open group before switching sections
+                    flushGroupIfAny(bw, gScenario, gWord1, gWord2, gValues);
+                    resetGroup(gValues);
+
+                    String secName = sh.group(1).trim();
+                    inRoot = secName.equalsIgnoreCase("Root");
+                    bw.write(line);
+                    bw.newLine();
+                    continue;
+                }
+
+                // End of record line?
+                if (END_OF_RECORD.matcher(line).matches()) {
+                    // Flush any open group before writing EOR
+                    flushGroupIfAny(bw, gScenario, gWord1, gWord2, gValues);
+                    resetGroup(gValues);
+
+                    bw.write(line);
+                    bw.newLine();
+                    continue;
+                }
+
+                if (!inRoot) {
+                    // Outside ROOT section: passthrough and ensure no group leaks
+                    flushGroupIfAny(bw, gScenario, gWord1, gWord2, gValues);
+                    resetGroup(gValues);
+
+                    bw.write(line);
+                    bw.newLine();
+                    continue;
+                }
+
+                // Inside ROOT section: try to parse scenario line
+                Matcher m = SCEN_LINE.matcher(line);
+                if (m.matches()) {
+                    int scenario = Integer.parseInt(m.group(1));
+                    String w1 = m.group(2);
+                    String w2 = m.group(3);
+                    String rawVal = m.group(4).trim();
+                    String value = cleanValue(rawVal);
+                    if (value.isEmpty()) {
+                        // If nothing meaningful after cleanup, just pass through this line
+                        flushGroupIfAny(bw, gScenario, gWord1, gWord2, gValues);
+                        resetGroup(gValues);
+                        bw.write(line);
+                        bw.newLine();
+                        continue;
+                    }
+
+                    // If same key as rolling group -> accumulate
+                    if (Objects.equals(gScenario, scenario) &&
+                        Objects.equals(eqKey(gWord1), eqKey(w1)) &&
+                        Objects.equals(eqKey(gWord2), eqKey(w2))) {
+                        gValues.add(value);
+                        // Do NOT write the original line (we’re collapsing)
+                    } else {
+                        // Key changed → flush previous group, then start new one
+                        flushGroupIfAny(bw, gScenario, gWord1, gWord2, gValues);
+                        resetGroup(gValues);
+                        gScenario = scenario;
+                        gWord1 = w1;
+                        gWord2 = w2;
+                        gValues.add(value);
+                    }
+                } else {
+                    // Non-scenario line inside ROOT → flush any group, then write through
+                    flushGroupIfAny(bw, gScenario, gWord1, gWord2, gValues);
+                    resetGroup(gValues);
+
+                    bw.write(line);
+                    bw.newLine();
+                }
+            }
+
+            // EOF: flush any remaining group
+            flushGroupIfAny(bw, gScenario, gWord1, gWord2, gValues);
+        }
+    }
+
+    private static String cleanValue(String raw) {
+        String v = raw.trim();
+        v = LEAD_FILLER.matcher(v).replaceFirst("");
+        // remove trailing punctuation-only parts
+        v = v.replaceAll("\\s+", " ").replaceAll("^[,;]+\\s*", "").replaceAll("\\s*[,;]+$", "").trim();
+        return v;
+    }
+
+    private static String eqKey(String s) {
+        return s == null ? null : s.toLowerCase(Locale.ROOT);
+    }
+
+    private static void flushGroupIfAny(BufferedWriter bw,
+                                        Integer gScenario,
+                                        String gWord1,
+                                        String gWord2,
+                                        List<String> gValues) throws IOException {
+        if (gScenario == null || gWord1 == null || gWord2 == null || gValues.isEmpty()) return;
+
+        // Build: "Scenarios #<n> <w1> <w2> has v1, v2, v3"
+        StringBuilder sb = new StringBuilder();
+        sb.append("Scenarios #").append(gScenario).append(' ')
+          .append(gWord1).append(' ').append(gWord2)
+          .append(" has ");
+
+        for (int i = 0; i < gValues.size(); i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(gValues.get(i));
+        }
+        bw.write(sb.toString());
+        bw.newLine();
+    }
+
+    private static void resetGroup(List<String> gValues) {
+        gValues.clear();
+        // We keep scenario/words as locals in process(); resetting by reassigning there.
+        // Here we only clear the list; the caller reassigns gScenario/gWord1/gWord2 when starting next group.
+    }
+}
