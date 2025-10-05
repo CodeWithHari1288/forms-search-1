@@ -1,4 +1,4 @@
-
+no
 
 
 
@@ -1043,6 +1043,55 @@ public class KeyValueFormatter {
 
                 // join with value
                 String outputLine = spaced + " " + value;
+                bw.write(outputLine);
+                bw.newLine();
+            }
+
+            System.out.println("Done. Output written to " + outputPath.toAbsolutePath());
+
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+}
+
+
+
+
+
+import java.io.*;
+import java.nio.file.*;
+import java.util.regex.*;
+
+public class ExpandCamelCase {
+
+    // regex: insert space before uppercase letters
+    private static final Pattern CAMEL_CASE = Pattern.compile("([a-z])([A-Z])");
+
+    public static void main(String[] args) {
+        Path inputPath = Paths.get("input.txt");
+        Path outputPath = Paths.get("output.txt");
+
+        try (BufferedReader br = Files.newBufferedReader(inputPath);
+             BufferedWriter bw = Files.newBufferedWriter(outputPath)) {
+
+            String line;
+            while ((line = br.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty()) continue;
+
+                // split into key:value
+                String[] parts = line.split(":", 2);
+                if (parts.length < 2) continue;
+
+                String key = parts[0].trim();
+                String value = parts[1].trim();
+
+                // expand camelCase key → words
+                String spacedKey = CAMEL_CASE.matcher(key).replaceAll("$1 $2").toLowerCase();
+
+                // build: originalKey: spacedKey + value
+                String outputLine = key + ": " + spacedKey + " " + value;
                 bw.write(outputLine);
                 bw.newLine();
             }
