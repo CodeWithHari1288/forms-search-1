@@ -838,3 +838,198 @@ public class GroupTwoOrThreeWordKeys {
         return out;
     }
 }
+
+
+
+
+
+
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class GroupInsideRootBetweenEOR {
+
+    // Detect presence anywhere in the line (not strict equals)
+    private static final Pattern ROOT_MARKER = Pattern.compile("Section\\s*:\\s*Root", Pattern.CASE_INSENSITIVE);
+    private static final Pattern EOR_MARKER  = Pattern.compile("End\\s*of\\s*Record", Pattern.CASE_INSENSITIVE);
+
+    // Scenario line: scenario number + tail
+    private static final Pattern SCEN_LINE = Pattern.compile("^\\s*Scenarios\\s*#\\s*(\\d+)\\s+(.*)\\s*$",
+            Pattern.CASE_INSENSITIVE);
+
+    // Strip leading filler from value
+    private static final Pattern LEAD_FILLER = Pattern.compile("^(?:is|are|as)\\b\\s*[:,]*\\s*", Pattern.CASE_INSENSITIVE);
+
+    public static void main(String[] args) throws IOException {
+        if (args.length < 2) {
+            System.err.println("Usage: java GroupInsideRootBetweenEOR <input.txt> <output.txt>");
+            System.exit(1);
+        }
+        Path in = Paths.get(args[0]);
+        Path out = Paths.get(args[1]);
+        List<String> lines = Files.readAllLines(in, StandardCharsets.UTF_8);
+        List<String> outLines = process(lines);
+        Files.write(out, outLines, StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        System.out.println("Wrote: " + out.toAbsolutePath());
+    }
+
+    private static List<String> process(List<String> lines) {
+        List<String> out = new ArrayList<>();
+        boolean inRootBlock = false;  // between a line containing "Section : Root" and a subsequent line containing "End of Record"
+
+        for (int i = 0; i < lines.size(); i++) {
+            String line = lines.get(i);
+
+            // Enter a Root block if we see a Root marker
+            if (!inRootBlock && ROOT_MARKER.matcher(line).find()) {
+                inRootBlock = true;
+                out.add(line);
+                continue;
+            }
+
+            if (!inRootBlock) {
+                // Outside blocks: passthrough
+                out.add(line);
+                continue;
+            }
+
+            // Inside a Root block: check End Of Record
+            if (EOR_MARKER.matcher(line).find()) {
+                // Before leaving, just write the EOR line and exit block
+                out.add(line);
+                inRootBlock = false;
+                continue;
+            }
+
+            // Try to group scenario lines starting at current index
+            Matcher m = SCEN_LINE.matcher(line);
+            if (!m.matches()) {
+                // Not a scenario line → write through
+                out.add(line);
+                continue;
+            }
+
+            // Parse current scenario tokens
+            int scenario = Integer.parseInt(m.group(1));
+            String[] tokens = splitWords(m.group(2));
+            if (tokens.length < 2) { // Need at least 2 words after "Scenarios #N" to group
+                out.add(line);
+                continue;
+            }
+
+            // Decide key length: prefer 3 if the next line in this block shares same first 3 words; else 2
+            int keyLen = decideKeyLen(lines, i, scenario, tokens);
+
+            // Build group
+            String[] keyWords = Arrays.copyOfRange(tokens, 0, Math.min(keyLen, tokens.length));
+            String keyLower = joinLower(keyWords);
+
+            List<String> values = new ArrayList<>();
+            String v0 = extractValue(tokens, keyLen);
+            if (v0 == null) { // no meaningful value; just output the original line
+                out.add(line);
+                continue;
+            }
+            values.add(v0);
+
+            int j = i + 1;
+            for (; j < lines.size(); j++) {
+                String nxt = lines.get(j);
+
+                // Boundary checks **inside same Root block**:
+                if (ROOT_MARKER.matcher(nxt).find()) break;             // new Root header starts (rare)
+                if (EOR_MARKER.matcher(nxt).find()) break;              // End of Record ends block
+
+                Matcher nm = SCEN_LINE.matcher(nxt);
+                if (!nm.matches()) break;                                // non-scenario breaks the group
+
+                int nScenario = Integer.parseInt(nm.group(1));
+                if (nScenario != scenario) break;                         // scenario number changed
+
+                String[] ntoks = splitWords(nm.group(2));
+                if (ntoks.length < keyWords.length) break;
+
+                String nKeyLower = joinLower(Arrays.copyOfRange(ntoks, 0, keyWords.length));
+                if (!nKeyLower.equals(keyLower)) break;                   // key changed
+
+                String nv = extractValue(ntoks, keyWords.length);
+                if (nv == null) break;
+                values.add(nv);
+            }
+
+            // Emit collapsed line
+            StringBuilder sb = new StringBuilder();
+            sb.append("Scenarios #").append(scenario).append(' ')
+              .append(String.join(" ", keyWords))
+              .append(" has ");
+            for (int k = 0; k < values.size(); k++) {
+                if (k > 0) sb.append(", ");
+                sb.append(values.get(k));
+            }
+            out.add(sb.toString());
+
+            // Skip consumed lines
+            i = j - 1;
+        }
+
+        return out;
+    }
+
+    private static int decideKeyLen(List<String> lines, int idx, int scenario, String[] tokens) {
+        if (tokens.length < 3) return 2;  // can't use 3 if we don't have it
+        int next = idx + 1;
+        if (next >= lines.size()) return 2;
+
+        String cand = lines.get(next);
+        // Must still be in Root block: don't cross EOR
+        if (EOR_MARKER.matcher(cand).find()) return 2;
+
+        Matcher nm = SCEN_LINE.matcher(cand);
+        if (!nm.matches()) return 2;
+
+        try {
+            int nScenario = Integer.parseInt(nm.group(1));
+            if (nScenario != scenario) return 2;
+        } catch (NumberFormatException e) {
+            return 2;
+        }
+
+        String[] ntoks = splitWords(nm.group(2));
+        if (ntoks.length < 3) return 2;
+
+        String k3 = (tokens[0] + " " + tokens[1] + " " + tokens[2]).toLowerCase(Locale.ROOT);
+        String nk3 = (ntoks[0] + " " + ntoks[1] + " " + ntoks[2]).toLowerCase(Locale.ROOT);
+        return k3.equals(nk3) ? 3 : 2;
+    }
+
+    private static String[] splitWords(String s) {
+        return s.trim().split("\\s+");
+    }
+
+    private static String joinLower(String[] arr) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < arr.length; i++) {
+            if (i > 0) sb.append(' ');
+            sb.append(arr[i].toLowerCase(Locale.ROOT));
+        }
+        return sb.toString();
+    }
+
+    private static String extractValue(String[] tokens, int keyLen) {
+        if (tokens.length <= keyLen) return null;
+        StringBuilder sb = new StringBuilder();
+        for (int i = keyLen; i < tokens.length; i++) {
+            if (i > keyLen) sb.append(' ');
+            sb.append(tokens[i]);
+        }
+        String val = sb.toString().trim();
+        val = LEAD_FILLER.matcher(val).replaceFirst("").trim();
+        val = val.replaceAll("^[:;,]+\\s*", "").replaceAll("\\s*[:;,]+$", "").trim();
+        return val.isEmpty() ? null : val;
+    }
+}
