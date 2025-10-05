@@ -1002,3 +1002,55 @@ public class PropLabelExtractorCustom {
         }
     }
 }
+
+
+
+
+
+
+
+import java.io.*;
+import java.nio.file.*;
+import java.util.regex.*;
+
+public class KeyValueFormatter {
+
+    // Regex: split before uppercase letters
+    private static final Pattern CAMEL_CASE = Pattern.compile("([a-z])([A-Z])");
+
+    public static void main(String[] args) {
+        Path inputPath = Paths.get("input.txt");
+        Path outputPath = Paths.get("output.txt");
+
+        try (BufferedReader br = Files.newBufferedReader(inputPath);
+             BufferedWriter bw = Files.newBufferedWriter(outputPath)) {
+
+            String line;
+            while ((line = br.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty()) continue;
+
+                // Split into key:value
+                String[] parts = line.split(":", 2);
+                if (parts.length < 2) continue;
+
+                String key = parts[0].trim();
+                String value = parts[1].trim();
+
+                // convert camelCase or PascalCase key → words
+                String spaced = CAMEL_CASE.matcher(key).replaceAll("$1 $2");
+                spaced = spaced.toLowerCase(); // optional: make all lower
+
+                // join with value
+                String outputLine = spaced + " " + value;
+                bw.write(outputLine);
+                bw.newLine();
+            }
+
+            System.out.println("Done. Output written to " + outputPath.toAbsolutePath());
+
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+}
