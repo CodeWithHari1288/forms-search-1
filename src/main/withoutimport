@@ -1360,3 +1360,93 @@ public class CollapseScenarioStatements {
         return last;
     }
 }
+
+
+
+
+
+
+
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class AddScenarioPrefixes {
+
+    // Generic section header, captures the section name (e.g., "Root", "Scenarios", etc.)
+    private static final Pattern SECTION_HEADER = Pattern.compile(
+            "^\\s*=+\\s*Section\\s*:\\s*([A-Za-z0-9 _-]+)\\s*=+\\s*$",
+            Pattern.CASE_INSENSITIVE);
+
+    // A line that itself begins with "Scenarios #<num>" (acts as a marker and for "already has" check)
+    private static final Pattern SCENARIO_AT_START = Pattern.compile(
+            "^\\s*Scenarios\\s*#\\s*(\\d+)\\b.*$",  // capture the number
+            Pattern.CASE_INSENSITIVE);
+
+    // Any line already starting with "Scenarios #<num>" so we don't duplicate the prefix
+    private static final Pattern HAS_ANY_SCENARIO_PREFIX = Pattern.compile(
+            "^\\s*Scenarios\\s*#\\s*\\d+\\b\\s*[:\\-]?\\s*",
+            Pattern.CASE_INSENSITIVE);
+
+    public static void main(String[] args) throws IOException {
+        if (args.length < 2) {
+            System.err.println("Usage: java AddScenarioPrefixes <input.txt> <output.txt>");
+            System.exit(1);
+        }
+        process(Paths.get(args[0]), Paths.get(args[1]));
+    }
+
+    private static void process(Path input, Path output) throws IOException {
+        try (BufferedReader reader = Files.newBufferedReader(input, StandardCharsets.UTF_8);
+             BufferedWriter writer = Files.newBufferedWriter(output, StandardCharsets.UTF_8,
+                     StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
+
+            boolean inScenariosSection = false;   // true ONLY between "Section: Scenarios" and the next section header
+            Integer currentScenario = null;       // becomes 1 upon first content unless a marker sets it first
+
+            String line;
+            while ((line = reader.readLine()) != null) {
+
+                // Check for ANY section header first
+                Matcher sec = SECTION_HEADER.matcher(line);
+                if (sec.matches()) {
+                    String name = sec.group(1).trim(); // e.g., "Root", "Scenarios", "Details"
+                    inScenariosSection = name.equalsIgnoreCase("Scenarios");
+                    currentScenario = null; // reset when entering any section (including Scenarios)
+                    writer.write(line);
+                    writer.newLine();
+                    continue;
+                }
+
+                if (!inScenariosSection) {
+                    // Outside Scenarios section: write through unchanged
+                    writer.write(line);
+                    writer.newLine();
+                    continue;
+                }
+
+                // ---- Inside the Scenarios section only ----
+
+                // If line itself starts with "Scenarios #N", treat as marker & keep as-is
+                Matcher marker = SCENARIO_AT_START.matcher(line);
+                if (marker.matches()) {
+                    String numStr = marker.group(1);
+                    if (numStr != null) {
+                        try { currentScenario = Integer.parseInt(numStr); } catch (NumberFormatException ignored) {}
+                    }
+                    writer.write(line);
+                    writer.newLine();
+                    continue;
+                }
+
+                // Blank lines pass through unchanged
+                if (line.trim().isEmpty()) {
+                    writer.write(line);
+                    writer.newLine();
+                    continue;
+                }
+
+                // First non-marker content in Scenarios → default to #1
+                if (currentScenario == null)
