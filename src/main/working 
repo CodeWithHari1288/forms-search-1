@@ -465,3 +465,172 @@ function demoResponder(text) {
   }
   return "Got it. I’ll pick the best tool based on your question and bring back an answer.";
 }
+
+
+
+
+
+
+
+
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class GroupByFirstThreeWords {
+
+    private static final Pattern SECTION_HEADER = Pattern.compile(
+            "^\\s*=+\\s*Section\\s*:\\s*([A-Za-z0-9 _-]+)\\s*=+\\s*$",
+            Pattern.CASE_INSENSITIVE);
+
+    private static final Pattern END_OF_RECORD = Pattern.compile(
+            "^\\s*-{3}\\s*End\\s+of\\s+Record\\b.*$", Pattern.CASE_INSENSITIVE);
+
+    // Capture scenario number and the tail text after it
+    private static final Pattern SCEN_LINE = Pattern.compile(
+            "^\\s*Scenarios\\s*#\\s*(\\d+)\\s+(.*)\\s*$",
+            Pattern.CASE_INSENSITIVE);
+
+    // Optional cleanup of leading fillers in the VALUE (not the key words)
+    private static final Pattern LEAD_FILLER = Pattern.compile(
+            "^(?:is|are|as)\\b\\s*[:,]*\\s*", Pattern.CASE_INSENSITIVE);
+
+    public static void main(String[] args) throws IOException {
+        if (args.length < 2) {
+            System.err.println("Usage: java GroupByFirstThreeWords <input.txt> <output.txt>");
+            System.exit(1);
+        }
+        process(Paths.get(args[0]), Paths.get(args[1]));
+        System.out.println("Done.");
+    }
+
+    private static void process(Path in, Path out) throws IOException {
+        try (BufferedReader br = Files.newBufferedReader(in, StandardCharsets.UTF_8);
+             BufferedWriter bw = Files.newBufferedWriter(out, StandardCharsets.UTF_8,
+                     StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
+
+            boolean inRoot = false;
+
+            Integer gScenario = null;
+            String gKeyLower = null;              // lowercased "w1 w2 w3"
+            String[] gKeyWords = null;            // original-case first three words
+            List<String> gValues = new ArrayList<>();
+
+            String line;
+            while ((line = br.readLine()) != null) {
+                // Section header?
+                Matcher sec = SECTION_HEADER.matcher(line);
+                if (sec.matches()) {
+                    flush(bw, gScenario, gKeyWords, gValues);
+                    gScenario = null; gKeyLower = null; gKeyWords = null; gValues.clear();
+
+                    inRoot = sec.group(1).trim().equalsIgnoreCase("Root");
+                    bw.write(line); bw.newLine();
+                    continue;
+                }
+
+                // End of Record?
+                if (END_OF_RECORD.matcher(line).matches()) {
+                    flush(bw, gScenario, gKeyWords, gValues);
+                    gScenario = null; gKeyLower = null; gKeyWords = null; gValues.clear();
+
+                    bw.write(line); bw.newLine();
+                    continue;
+                }
+
+                if (!inRoot) {
+                    // Outside Root: passthrough
+                    flush(bw, gScenario, gKeyWords, gValues);
+                    gScenario = null; gKeyLower = null; gKeyWords = null; gValues.clear();
+
+                    bw.write(line); bw.newLine();
+                    continue;
+                }
+
+                // Inside Root: try scenario line
+                Matcher m = SCEN_LINE.matcher(line);
+                if (!m.matches()) {
+                    // Not a scenario line: flush current group then passthrough
+                    flush(bw, gScenario, gKeyWords, gValues);
+                    gScenario = null; gKeyLower = null; gKeyWords = null; gValues.clear();
+
+                    bw.write(line); bw.newLine();
+                    continue;
+                }
+
+                int scenario = Integer.parseInt(m.group(1));
+                String tail = m.group(2).trim();
+
+                String[] tokens = tail.split("\\s+");
+                if (tokens.length < 3) {
+                    // Not enough words to form a 3-word key; treat as a boundary
+                    flush(bw, gScenario, gKeyWords, gValues);
+                    gScenario = null; gKeyLower = null; gKeyWords = null; gValues.clear();
+
+                    bw.write(line); bw.newLine();
+                    continue;
+                }
+
+                String w1 = tokens[0], w2 = tokens[1], w3 = tokens[2];
+                String keyLower = (w1 + " " + w2 + " " + w3).toLowerCase(Locale.ROOT);
+
+                // VALUE = everything after the first three words
+                String value = tail.substring(joinLen(tokens, 0, 3)).trim();
+                value = LEAD_FILLER.matcher(value).replaceFirst("").trim();
+                value = trimPunct(value);
+                if (value.isEmpty()) {
+                    // If no meaningful value, treat as boundary and keep original line
+                    flush(bw, gScenario, gKeyWords, gValues);
+                    gScenario = null; gKeyLower = null; gKeyWords = null; gValues.clear();
+
+                    bw.write(line); bw.newLine();
+                    continue;
+                }
+
+                // Same group?
+                if (Objects.equals(gScenario, scenario) && Objects.equals(gKeyLower, keyLower)) {
+                    gValues.add(value);
+                    // do NOT write this original line (collapsed)
+                } else {
+                    // New group → flush previous then start a new one
+                    flush(bw, gScenario, gKeyWords, gValues);
+                    gScenario = scenario;
+                    gKeyLower = keyLower;
+                    gKeyWords = new String[]{w1, w2, w3};
+                    gValues.clear();
+                    gValues.add(value);
+                }
+            }
+
+            // EOF: flush
+            flush(bw, gScenario, gKeyWords, gValues);
+        }
+    }
+
+    private static int joinLen(String[] tokens, int start, int count) {
+        // returns the character length of tokens[start..start+count-1] joined with single spaces
+        StringBuilder sb = new StringBuilder();
+        for (int i = start; i < start + count && i < tokens.length; i++) {
+            if (i > start) sb.append(' ');
+            sb.append(tokens[i]);
+        }
+        return sb.length();
+    }
+
+    private static String trimPunct(String s) {
+        return s.replaceAll("^[:;,]+\\s*", "").replaceAll("\\s*[:;,]+$", "").trim();
+    }
+
+    private static void flush(BufferedWriter bw, Integer scenario, String[] keyWords, List<String> values) throws IOException {
+        if (scenario == null || keyWords == null || values == null || values.isEmpty()) return;
+        bw.write("Scenarios #" + scenario + " " + keyWords[0] + " " + keyWords[1] + " " + keyWords[2] + " has ");
+        for (int i = 0; i < values.size(); i++) {
+            if (i > 0) bw.write(", ");
+            bw.write(values.get(i));
+        }
+        bw.newLine();
+    }
+}
