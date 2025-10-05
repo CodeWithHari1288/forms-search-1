@@ -1223,3 +1223,140 @@ public class AddScenarioPrefixes {
         }
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class CollapseScenarioStatements {
+
+    // Example line:
+    // Scenarios #1 abc client name is hhh
+    // Groups: 1=1, 2=abc, 3=client name, 4=hhh
+    private static final Pattern LINE = Pattern.compile(
+        "^\\s*Scenarios\\s*#\\s*(\\d+)\\s+([^\\s]+)\\s+(.*?)\\s+is\\s+(.*)\\s*$",
+        Pattern.CASE_INSENSITIVE
+    );
+
+    public static void main(String[] args) throws IOException {
+        if (args.length < 2) {
+            System.err.println("Usage: java CollapseScenarioStatements <input.txt> <output.txt>");
+            System.err.println("Each input line like: 'Scenarios #1 abc client name is hhh'");
+            System.exit(1);
+        }
+        Path in = Paths.get(args[0]);
+        Path out = Paths.get(args[1]);
+        List<String> lines = Files.readAllLines(in, StandardCharsets.UTF_8);
+
+        // Key = "scenarioNum|entity"
+        // Value = LinkedHashMap<normalizedAttr, value>  (preserves insertion order)
+        Map<String, LinkedHashMap<String, String>> grouped = new LinkedHashMap<>();
+
+        for (String raw : lines) {
+            String line = raw.trim();
+            if (line.isEmpty()) continue;
+
+            Matcher m = LINE.matcher(line);
+            if (!m.matches()) {
+                // Not a parseable scenario line -> optionally write through or skip
+                // Here we skip, but you can choose to keep:
+                // keepNonMatching.add(line);
+                continue;
+            }
+
+            int scenario = Integer.parseInt(m.group(1));
+            String entity = m.group(2).trim();
+            String attrPhrase = m.group(3).trim();
+            String value = m.group(4).trim();
+
+            String attr = normalizeAttribute(attrPhrase);
+            String key = scenario + "|" + entity;
+
+            grouped.computeIfAbsent(key, k -> new LinkedHashMap<>());
+            // last write wins if same attr repeats; insertion order preserved for first occurrence
+            grouped.get(key).put(attr, value);
+        }
+
+        // Build output lines
+        List<String> outLines = new ArrayList<>();
+        for (Map.Entry<String, LinkedHashMap<String, String>> e : grouped.entrySet()) {
+            String key = e.getKey();
+            int sep = key.indexOf('|');
+            int scenario = Integer.parseInt(key.substring(0, sep));
+            String entity = key.substring(sep + 1);
+
+            LinkedHashMap<String, String> attrs = e.getValue();
+            if (attrs.isEmpty()) continue;
+
+            StringBuilder sb = new StringBuilder();
+            sb.append("Scenarios #").append(scenario).append(' ')
+              .append(entity).append(" has ");
+
+            boolean first = true;
+            for (Map.Entry<String, String> av : attrs.entrySet()) {
+                String attr = av.getKey();
+                String val = av.getValue();
+                if (first) {
+                    // First attribute: "name hhh"
+                    sb.append(attr).append(' ').append(val);
+                    first = false;
+                } else {
+                    // Subsequent attributes: ", address as jkkk"
+                    sb.append(", ").append(attr).append(" as ").append(val);
+                }
+            }
+            outLines.add(sb.toString());
+        }
+
+        Files.write(out, outLines, StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        System.out.println("Wrote " + outLines.size() + " summarized lines to: " + out.toAbsolutePath());
+    }
+
+    /**
+     * Normalize attribute phrases like:
+     * - "client name"        -> "name"
+     * - "client address"     -> "address"
+     * - "opportunities name" -> "opportunity"
+     * - "opportunity name"   -> "opportunity"
+     * Otherwise, keeps the last word as a reasonable fallback.
+     */
+    private static String normalizeAttribute(String phrase) {
+        String p = phrase.toLowerCase(Locale.ROOT).trim();
+        // Common leading nouns to strip
+        p = p.replaceAll("^(client|clients|customer|customers)\\s+", "");
+        // Opportunities/opportunity -> normalize to "opportunity ..."
+        p = p.replaceAll("^opportunit(?:y|ies)\\s+", "opportunity ");
+
+        // Special cases
+        if (p.equals("opportunity name")) return "opportunity";
+        if (p.equals("client name")) return "name";      // defensive
+        if (p.equals("client address")) return "address";
+
+        // If it ends with " name", prefer "name"
+        if (p.endsWith(" name")) return "name";
+        // If it ends with " address", prefer "address"
+        if (p.endsWith(" address")) return "address";
+
+        // Fallback: use the last token (e.g., "billing city" -> "city")
+        String[] parts = p.split("\\s+");
+        String last = parts[parts.length - 1];
+        // tiny cleanup
+        last = last.replaceAll("[^a-z0-9_-]", "");
+        if (last.isEmpty()) last = "value";
+        return last;
+    }
+}
