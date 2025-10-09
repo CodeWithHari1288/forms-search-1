@@ -269,3 +269,174 @@ export default function ChatDock() {
 
 
 
+
+
+
+
+
+// subapp-next/app/embed/sidebar/page.tsx
+"use client";
+import { useEffect, useState } from "react";
+import { CopilotKit } from "@copilotkit/react-core";
+import { CopilotSidebar } from "@copilotkit/react-ui";
+import "@copilotkit/react-ui/styles.css";
+
+const PARENT_ORIGIN = "http://localhost:3000";
+const SIDEBAR_WIDTH = 420;
+const MARGIN = 16;
+
+export default function SidebarEmbed() {
+  const [open, setOpen] = useState(true);
+
+  const postSize = (isOpen: boolean) => {
+    if (isOpen) {
+      const h = Math.max(320, window.innerHeight - MARGIN * 2);
+      window.parent?.postMessage({ type: "chat:size", mode: "open", w: SIDEBAR_WIDTH, h }, PARENT_ORIGIN);
+    } else {
+      window.parent?.postMessage({ type: "chat:size", mode: "min", w: 56, h: 56 }, PARENT_ORIGIN);
+    }
+  };
+
+  useEffect(() => { postSize(open); }, [open]);
+  useEffect(() => {
+    const onResize = () => postSize(open);
+    window.addEventListener("resize", onResize);
+    const onMsg = (e: MessageEvent) => {
+      if (e.origin !== PARENT_ORIGIN) return;
+      if (e.data?.type === "chat:open") setOpen(true);
+      if (e.data?.type === "chat:minimize") setOpen(false);
+    };
+    window.addEventListener("message", onMsg);
+    return () => {
+      window.removeEventListener("resize", onResize);
+      window.removeEventListener("message", onMsg);
+    };
+  }, [open]);
+
+  return (
+    <div style={{ height: "100vh", margin: 0, background: "transparent" }}>
+      <CopilotKit runtimeUrl="/api/copilotkit">
+        <CopilotSidebar open={open} onOpenChange={setOpen} title="Copilot" />
+      </CopilotKit>
+    </div>
+  );
+}
+
+
+
+
+
+
+// ChatDock.jsx
+import React, { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+
+const CHILD_ORIGIN = "http://localhost:3001";
+const CHILD_PATH   = "/embed/sidebar";
+const MARGIN       = 16;
+
+export default function ChatDock() {
+  const [host, setHost] = useState(null);
+  const [minimized, setMinimized] = useState(false);
+  const iframeRef = useRef(null);
+
+  useEffect(() => {
+    const el = document.createElement("div");
+    Object.assign(el.style, {
+      position: "fixed",
+      right: `${MARGIN}px`,
+      bottom: `${MARGIN}px`,
+      width: "56px",
+      height: "56px",
+      borderRadius: "50%",
+      zIndex: "2147483647",
+      pointerEvents: "auto",
+      background: "transparent",
+    });
+    document.body.appendChild(el);
+    setHost(el);
+    return () => document.body.removeChild(el);
+  }, []);
+
+  useEffect(() => {
+    const onMsg = (e) => {
+      if (e.origin !== CHILD_ORIGIN || !host) return;
+      const { type, mode, w, h } = e.data || {};
+      if (type !== "chat:size") return;
+
+      // Resize the dock host
+      if (mode === "open") {
+        Object.assign(host.style, {
+          top: `${MARGIN}px`,
+          bottom: `${MARGIN}px`,
+          right: `${MARGIN}px`,
+          width: `${w}px`,
+          height: "",
+          borderRadius: "12px",
+          overflow: "hidden",
+          boxShadow: "0 8px 24px rgba(0,0,0,.18)",
+        });
+        setMinimized(false);
+      } else {
+        Object.assign(host.style, {
+          top: "", bottom: `${MARGIN}px`, right: `${MARGIN}px`,
+          width: "56px", height: "56px",
+          borderRadius: "50%", overflow: "hidden", boxShadow: "none",
+        });
+        setMinimized(true);
+      }
+    };
+    window.addEventListener("message", onMsg);
+    return () => window.removeEventListener("message", onMsg);
+  }, [host]);
+
+  const openChat = () => {
+    // show iframe, tell child to open
+    if (iframeRef.current) iframeRef.current.style.display = "block";
+    iframeRef.current?.contentWindow?.postMessage({ type: "chat:open" }, CHILD_ORIGIN);
+  };
+
+  if (!host) return null;
+
+  return createPortal(
+    <>
+      {/* Native launcher button shown only when minimized; iframe is hidden then */}
+      {minimized && (
+        <button
+          onClick={openChat}
+          aria-label="Open Copilot"
+          style={{
+            position: "fixed",
+            right: `${MARGIN}px`,
+            bottom: `${MARGIN}px`,
+            width: 56, height: 56,
+            borderRadius: "50%",
+            border: "none",
+            cursor: "pointer",
+            zIndex: 2147483648,
+            background: "white",
+            boxShadow: "0 4px 16px rgba(0,0,0,.18)",
+          }}
+        >
+          💬
+        </button>
+      )}
+
+      {/* The actual chat iframe — hidden when minimized → NO transparent box */}
+      <iframe
+        ref={iframeRef}
+        title="CopilotSidebar"
+        src={`${CHILD_ORIGIN}${CHILD_PATH}`}
+        style={{
+          display: minimized ? "none" : "block",
+          width: "100%", height: "100%",
+          border: 0, background: "transparent", borderRadius: "inherit",
+        }}
+        allow="clipboard-read; clipboard-write"
+        referrerPolicy="no-referrer-when-downgrade"
+      />
+    </>,
+    host
+  );
+}
+
