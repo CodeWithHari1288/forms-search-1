@@ -47,3 +47,82 @@ export default function SidebarEmbed() {
     </div>
   );
 }
+
+
+
+
+
+
+// ChatDock.jsx (main app — portal, no page CSS changes)
+import React, { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+
+const CHILD_ORIGIN = "http://localhost:3001";
+const CHILD_PATH   = "/embed/sidebar";
+
+export default function ChatDock() {
+  const [host, setHost] = useState(null);
+  const iframeRef = useRef(null);
+
+  // Create a floating host attached to <body>
+  useEffect(() => {
+    const el = document.createElement("div");
+    Object.assign(el.style, {
+      position: "fixed",
+      right: "16px",
+      bottom: "16px",
+      width: "56px",
+      height: "56px",
+      borderRadius: "50%",
+      zIndex: "2147483647",
+      pointerEvents: "auto",
+      background: "transparent",
+    });
+    document.body.appendChild(el);
+    setHost(el);
+    return () => document.body.removeChild(el);
+  }, []);
+
+  // Resize the dock when the sub-app tells us to
+  useEffect(() => {
+    const onMsg = (e) => {
+      if (e.origin !== CHILD_ORIGIN || !host) return;
+      const { type, w, h } = e.data || {};
+      if (type === "chat:size") {
+        Object.assign(host.style, {
+          width:  `${w}px`,
+          height: `${h}px`,
+          borderRadius: w === 56 ? "50%" : "12px",
+          boxShadow: w === 56 ? "none" : "0 8px 24px rgba(0,0,0,.18)",
+        });
+      }
+    };
+    window.addEventListener("message", onMsg);
+    return () => window.removeEventListener("message", onMsg);
+  }, [host]);
+
+  if (!host) return null;
+
+  return createPortal(
+    <iframe
+      ref={iframeRef}
+      title="CopilotSidebar"
+      src={`${CHILD_ORIGIN}${CHILD_PATH}`}
+      style={{
+        width: "100%",
+        height: "100%",
+        border: 0,
+        background: "transparent",
+        borderRadius: "inherit",
+      }}
+      allow="clipboard-read; clipboard-write"
+      referrerPolicy="no-referrer-when-downgrade"
+    />,
+    host
+  );
+}
+
+
+
+
+
