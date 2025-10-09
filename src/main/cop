@@ -1,256 +1,49 @@
-// ChatDock.jsx
-import { useEffect, useMemo, useRef, useState } from "react";
-import { createPortal } from "react-dom";
-
-const CHILD_ORIGIN = "http://localhost:3001"; // Next sub-app
-const CHILD_PATH   = "/embed/popup";          // chat-only popup route
-
-export default function ChatDock() {
-  const [host, setHost] = useState(null);
-  const iframeRef = useRef(null);
-
-  // Create a detached host element once, appended to <body>
-  useEffect(() => {
-    const el = document.createElement("div");
-    // Inline, scoped styles; do NOT touch your main page CSS
-    Object.assign(el.style, {
-      position: "fixed",
-      right: "16px",
-      bottom: "16px",
-      width: "56px",
-      height: "56px",
-      borderRadius: "50%",
-      zIndex: "2147483647",
-      pointerEvents: "auto",
-    });
-    document.body.appendChild(el);
-    setHost(el);
-    return () => {
-      document.body.removeChild(el);
-    };
-  }, []);
-
-  // Listen for size updates from the sub-app and resize ONLY this dock
-  useEffect(() => {
-    const onMsg = (e) => {
-      if (e.origin !== CHILD_ORIGIN) return;
-      const { type, w, h } = e.data || {};
-      if (type === "chat:size" && host) {
-        Object.assign(host.style, {
-          width:  `${w}px`,
-          height: `${h}px`,
-          borderRadius: w === 56 ? "50%" : "12px",
-          boxShadow: w === 56 ? "none" : "0 8px 24px rgba(0,0,0,.18)",
-          background: "transparent",
-        });
-      }
-    };
-    window.addEventListener("message", onMsg);
-    return () => window.removeEventListener("message", onMsg);
-  }, [host]);
-
-  if (!host) return null;
-
-  return createPortal(
-    <iframe
-      ref={iframeRef}
-      title="CopilotPopup"
-      src={`${CHILD_ORIGIN}${CHILD_PATH}`}
-      style={{
-        width: "100%",
-        height: "100%",
-        border: 0,
-        background: "transparent",
-        borderRadius: "inherit",
-      }}
-      allow="clipboard-read; clipboard-write"
-      referrerPolicy="no-referrer-when-downgrade"
-    />,
-    host
-  );
-}
-
-
-
-
-// In your page component
-// ...
-<main>
-  {/* your existing content */}
-  <div id="copilot-slot">
-    <ChatDock /> {/* ← add this; no style changes elsewhere */}
-  </div>
-</main>
-<footer>...</footer>
-
-
-
-
-
-// subapp-next/app/embed/popup/page.tsx
+// subapp-next/app/embed/sidebar/page.tsx
 "use client";
-import { useState, useEffect } from "react";
+import { useEffect, useState } from "react";
 import { CopilotKit } from "@copilotkit/react-core";
-import { CopilotPopup } from "@copilotkit/react-ui";
+import { CopilotSidebar } from "@copilotkit/react-ui";
 import "@copilotkit/react-ui/styles.css";
 
 const PARENT_ORIGIN = "http://localhost:3000"; // main app origin
+const SIDEBAR_WIDTH = 420;                      // tweak as you like
+const MARGIN = 16;                              // gap from edges
 
-export default function ChatPopup() {
-  const [open, setOpen] = useState(false);
+export default function SidebarEmbed() {
+  const [open, setOpen] = useState(true); // show it open first time (you can default false)
 
-  // Tell parent how big to make the iframe
+  // helper: notify parent of current size
+  const postSize = () => {
+    if (open) {
+      const h = Math.max(320, window.innerHeight - MARGIN * 2);
+      window.parent?.postMessage(
+        { type: "chat:size", w: SIDEBAR_WIDTH, h }, PARENT_ORIGIN
+      );
+    } else {
+      window.parent?.postMessage({ type: "chat:size", w: 56, h: 56 }, PARENT_ORIGIN);
+    }
+  };
+
   useEffect(() => {
-    const payload = open
-      ? { type: "chat:size", w: 420, h: 560 }
-      : { type: "chat:size", w: 56,  h: 56  };
-    window.parent?.postMessage(payload, PARENT_ORIGIN);
+    postSize(); // on mount & when open changes
+    // keep height correct on window resize while open
+    const onResize = () => postSize();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
   return (
     <div style={{ height: "100vh", margin: 0, background: "transparent" }}>
       <CopilotKit runtimeUrl="/api/copilotkit">
-        <CopilotPopup open={open} onOpenChange={setOpen} title="Copilot" />
+        <CopilotSidebar
+          open={open}
+          onOpenChange={setOpen}
+          title="Copilot"
+          // position="right" // default
+          // width={SIDEBAR_WIDTH} // optional; we already size iframe to this
+        />
       </CopilotKit>
     </div>
-  );
-}
-
-
-
-
-
-// subapp-next/app/embed/layout.tsx
-export default function Layout({ children }: { children: React.ReactNode }) {
-  return (
-    <html lang="en">
-      <body style={{ margin: 0, height: "100vh", background: "transparent" }}>
-        {children}
-      </body>
-    </html>
-  );
-}
-
-
-
-
-
-
-// ChatDock.jsx (TEMP debug version)
-import React, { useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
-
-const CHILD_ORIGIN = "http://localhost:3001";
-const CHILD_PATH = "/embed/popup";
-
-export default function ChatDock() {
-  const [host, setHost] = useState(null);
-  const iframeRef = useRef(null);
-
-  useEffect(() => {
-    const el = document.createElement("div");
-    Object.assign(el.style, {
-      position: "fixed",
-      right: "16px",
-      bottom: "16px",
-      width: "420px",   // TEMP: force full size
-      height: "560px",  // TEMP
-      zIndex: "2147483647",
-      outline: "2px solid red", // TEMP: see bounds
-      background: "transparent",
-    });
-    document.body.appendChild(el);
-    setHost(el);
-    return () => document.body.removeChild(el);
-  }, []);
-
-  if (!host) return null;
-
-  return createPortal(
-    <iframe
-      ref={iframeRef}
-      title="CopilotPopup"
-      src={`${CHILD_ORIGIN}${CHILD_PATH}`}
-      style={{
-        width: "100%",
-        height: "100%",
-        border: 0,
-        background: "transparent",
-      }}
-      allow="clipboard-read; clipboard-write"
-      referrerPolicy="no-referrer-when-downgrade"
-    />,
-    host
-  );
-}
-
-
-
-
-
-// ChatDock.jsx (final)
-import React, { useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
-
-const CHILD_ORIGIN = "http://localhost:3001";
-const CHILD_PATH = "/embed/popup";
-
-export default function ChatDock() {
-  const [host, setHost] = useState(null);
-  const iframeRef = useRef(null);
-
-  useEffect(() => {
-    const el = document.createElement("div");
-    Object.assign(el.style, {
-      position: "fixed",
-      right: "16px",
-      bottom: "16px",
-      width: "56px",
-      height: "56px",
-      borderRadius: "50%",
-      zIndex: "2147483647",
-      pointerEvents: "auto",
-      background: "transparent",
-    });
-    document.body.appendChild(el);
-    setHost(el);
-    return () => document.body.removeChild(el);
-  }, []);
-
-  useEffect(() => {
-    const onMsg = (e) => {
-      if (e.origin !== CHILD_ORIGIN || !host) return;
-      const { type, w, h } = e.data || {};
-      if (type === "chat:size") {
-        Object.assign(host.style, {
-          width:  `${w}px`,
-          height: `${h}px`,
-          borderRadius: w === 56 ? "50%" : "12px",
-          boxShadow: w === 56 ? "none" : "0 8px 24px rgba(0,0,0,.18)",
-        });
-      }
-    };
-    window.addEventListener("message", onMsg);
-    return () => window.removeEventListener("message", onMsg);
-  }, [host]);
-
-  if (!host) return null;
-
-  return createPortal(
-    <iframe
-      ref={iframeRef}
-      title="CopilotPopup"
-      src={`${CHILD_ORIGIN}${CHILD_PATH}`}
-      style={{
-        width: "100%",
-        height: "100%",
-        border: 0,
-        background: "transparent",
-        borderRadius: "inherit",
-      }}
-      allow="clipboard-read; clipboard-write"
-      referrerPolicy="no-referrer-when-downgrade"
-    />,
-    host
   );
 }
