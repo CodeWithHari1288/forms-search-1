@@ -413,3 +413,24 @@ export default function App() {
     </CopilotKit>
   );
 }
+
+
+
+
+
+
+/* src/styles/app.css */
+html, body, #root { height: 100%; margin: 0; }
+.app-shell {
+  height: 100vh;
+  display: grid;
+  grid-template-rows: 56px 1fr; /* header + fill */
+}
+.app-header {
+  display: flex; align-items: center; padding: 0 16px; border-bottom: 1px solid #eee;
+}
+.chat-frame {
+  width: 100%;
+  height: 100%;     /* critical */
+  border: 0;
+}
