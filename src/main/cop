@@ -1,0 +1,123 @@
+// subapp-next/app/embed/popup/page.tsx
+"use client";
+import { useState, useEffect } from "react";
+import { CopilotKit } from "@copilotkit/react-core";
+import { CopilotPopup } from "@copilotkit/react-ui";
+import "@copilotkit/react-ui/styles.css";
+
+const PARENT_ORIGIN = "http://localhost:3000"; // main app origin
+
+export default function ChatPopup() {
+  const [open, setOpen] = useState(false);
+
+  // Tell parent our desired size whenever open state changes
+  useEffect(() => {
+    const payload = open
+      ? { type: "chat:size", w: 420, h: 560 }   // open size
+      : { type: "chat:size", w: 56,  h: 56  };  // minimized icon
+    window.parent?.postMessage(payload, PARENT_ORIGIN);
+  }, [open]);
+
+  // Allow parent to command open/minimize
+  useEffect(() => {
+    const onMsg = (e: MessageEvent) => {
+      if (e.origin !== PARENT_ORIGIN) return;
+      if (e.data?.type === "chat:open") setOpen(true);
+      if (e.data?.type === "chat:minimize") setOpen(false);
+    };
+    window.addEventListener("message", onMsg);
+    return () => window.removeEventListener("message", onMsg);
+  }, []);
+
+  return (
+    <div style={{ height: "100vh", margin: 0, background: "transparent" }}>
+      <CopilotKit runtimeUrl="/api/copilotkit">
+        <CopilotPopup
+          open={open}
+          onOpenChange={setOpen}
+          title="Copilot"
+        />
+      </CopilotKit>
+    </div>
+  );
+}
+
+
+
+
+
+// subapp-next/app/embed/layout.tsx
+export default function Layout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en">
+      <body style={{ margin: 0, height: "100vh", background: "transparent" }}>
+        {children}
+      </body>
+    </html>
+  );
+}
+
+
+
+
+
+// ChatIframe.jsx (main app)
+import { useEffect, useRef } from "react";
+
+const CHILD_ORIGIN = "http://localhost:3001";
+
+export default function ChatIframe() {
+  const ref = useRef(null);
+
+  useEffect(() => {
+    const onMsg = (e) => {
+      if (e.origin !== CHILD_ORIGIN) return;
+      const { type, w, h } = e.data || {};
+      if (type === "chat:size" && ref.current) {
+        Object.assign(ref.current.style, {
+          width:  `${w}px`,
+          height: `${h}px`,
+        });
+      }
+    };
+    window.addEventListener("message", onMsg);
+    return () => window.removeEventListener("message", onMsg);
+  }, []);
+
+  // Optional: expose open/minimize from parent:
+  function openChat()     { ref.current?.contentWindow?.postMessage({ type: "chat:open" }, CHILD_ORIGIN); }
+  function minimizeChat() { ref.current?.contentWindow?.postMessage({ type: "chat:minimize" }, CHILD_ORIGIN); }
+
+  return (
+    <>
+      {/* example host controls */}
+      {/* <button onClick={openChat}>Open chat</button>
+      <button onClick={minimizeChat}>Minimize chat</button> */}
+
+      <iframe
+        ref={ref}
+        title="ChatPopup"
+        src={`${CHILD_ORIGIN}/embed/popup`}
+        style={{
+          position: "fixed",
+          right: 16,
+          bottom: 16,
+          width: 56,           // start minimized
+          height: 56,
+          border: 0,
+          background: "transparent",
+          zIndex: 2147483647,  // above everything
+        }}
+        allow="clipboard-read; clipboard-write"
+      />
+    </>
+  );
+}
+
+
+
+
+
+html, body, #root { height: 100%; margin: 0; }
+.app-main { position: relative; height: 100%; min-height: 0; }
+
