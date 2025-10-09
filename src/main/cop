@@ -130,3 +130,56 @@ export default function Layout({ children }: { children: React.ReactNode }) {
     </html>
   );
 }
+
+
+
+
+
+
+// ChatDock.jsx (TEMP debug version)
+import React, { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+
+const CHILD_ORIGIN = "http://localhost:3001";
+const CHILD_PATH = "/embed/popup";
+
+export default function ChatDock() {
+  const [host, setHost] = useState(null);
+  const iframeRef = useRef(null);
+
+  useEffect(() => {
+    const el = document.createElement("div");
+    Object.assign(el.style, {
+      position: "fixed",
+      right: "16px",
+      bottom: "16px",
+      width: "420px",   // TEMP: force full size
+      height: "560px",  // TEMP
+      zIndex: "2147483647",
+      outline: "2px solid red", // TEMP: see bounds
+      background: "transparent",
+    });
+    document.body.appendChild(el);
+    setHost(el);
+    return () => document.body.removeChild(el);
+  }, []);
+
+  if (!host) return null;
+
+  return createPortal(
+    <iframe
+      ref={iframeRef}
+      title="CopilotPopup"
+      src={`${CHILD_ORIGIN}${CHILD_PATH}`}
+      style={{
+        width: "100%",
+        height: "100%",
+        border: 0,
+        background: "transparent",
+      }}
+      allow="clipboard-read; clipboard-write"
+      referrerPolicy="no-referrer-when-downgrade"
+    />,
+    host
+  );
+}
