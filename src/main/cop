@@ -126,3 +126,146 @@ export default function ChatDock() {
 
 
 
+
+"use client";
+import { useEffect, useState } from "react";
+import { CopilotKit } from "@copilotkit/react-core";
+import { CopilotSidebar } from "@copilotkit/react-ui";
+import "@copilotkit/react-ui/styles.css";
+
+const PARENT_ORIGIN = "http://localhost:3000";
+const SIDEBAR_WIDTH = 420;
+const MARGIN = 16;
+
+export default function SidebarEmbed() {
+  const [open, setOpen] = useState(true); // open by default once; up to you
+
+  const postSize = (isOpen: boolean) => {
+    if (isOpen) {
+      const h = Math.max(320, window.innerHeight - MARGIN * 2);
+      window.parent?.postMessage({ type: "chat:size", mode: "open", w: SIDEBAR_WIDTH, h }, PARENT_ORIGIN);
+    } else {
+      window.parent?.postMessage({ type: "chat:size", mode: "min", w: 56, h: 56 }, PARENT_ORIGIN);
+    }
+  };
+
+  useEffect(() => {
+    postSize(open);
+  }, [open]);
+
+  useEffect(() => {
+    const onResize = () => postSize(open);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [open]);
+
+  return (
+    <div style={{ height: "100vh", margin: 0, background: "transparent" }}>
+      <CopilotKit runtimeUrl="/api/copilotkit">
+        <CopilotSidebar open={open} onOpenChange={setOpen} title="Copilot" />
+      </CopilotKit>
+    </div>
+  );
+}
+
+
+
+
+
+
+
+
+
+import React, { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+
+const CHILD_ORIGIN = "http://localhost:3001";
+const CHILD_PATH   = "/embed/sidebar";
+const MARGIN       = 16;
+
+export default function ChatDock() {
+  const [host, setHost] = useState(null);
+  const iframeRef = useRef(null);
+
+  useEffect(() => {
+    const el = document.createElement("div");
+    // Start minimized
+    Object.assign(el.style, {
+      position: "fixed",
+      right: `${MARGIN}px`,
+      bottom: `${MARGIN}px`,
+      width: "56px",
+      height: "56px",
+      borderRadius: "50%",
+      overflow: "hidden",           // ⬅ prevents any transparent “extra” area
+      zIndex: "2147483647",
+      pointerEvents: "auto",
+      background: "transparent",
+    });
+    document.body.appendChild(el);
+    setHost(el);
+    return () => document.body.removeChild(el);
+  }, []);
+
+  useEffect(() => {
+    const onMsg = (e) => {
+      if (e.origin !== CHILD_ORIGIN || !host) return;
+      const { type, mode, w, h } = e.data || {};
+      if (type !== "chat:size") return;
+
+      if (mode === "open") {
+        // Full height: pin to top & bottom, let height stretch; set width; square corners
+        Object.assign(host.style, {
+          top: `${MARGIN}px`,
+          bottom: `${MARGIN}px`,
+          right: `${MARGIN}px`,
+          left: "",                 // ensure not set
+          width: `${w}px`,
+          height: "",               // let top/bottom control height
+          borderRadius: "12px",
+          overflow: "hidden",
+          boxShadow: "0 8px 24px rgba(0,0,0,.18)",
+        });
+      } else {
+        // Minimized: a clean 56x56 circle at the corner; no transparent window
+        Object.assign(host.style, {
+          top: "",                  // release top
+          bottom: `${MARGIN}px`,
+          right: `${MARGIN}px`,
+          width: "56px",
+          height: "56px",
+          borderRadius: "50%",
+          overflow: "hidden",
+          boxShadow: "none",
+        });
+      }
+    };
+
+    window.addEventListener("message", onMsg);
+    return () => window.removeEventListener("message", onMsg);
+  }, [host]);
+
+  if (!host) return null;
+
+  return createPortal(
+    <iframe
+      ref={iframeRef}
+      title="CopilotSidebar"
+      src={`${CHILD_ORIGIN}${CHILD_PATH}`}
+      style={{
+        width: "100%",
+        height: "100%",
+        border: 0,
+        background: "transparent",
+        borderRadius: "inherit",
+        display: "block",
+      }}
+      allow="clipboard-read; clipboard-write"
+      referrerPolicy="no-referrer-when-downgrade"
+    />,
+    host
+  );
+}
+
+
+
