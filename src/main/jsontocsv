@@ -1,9 +1,3 @@
-// JsonArrayToCsvByPropTemplate.java
-// Reads a template CSV with a "prop" column containing JSON property paths.
-// For each JSON object in the array, creates one CSV file where
-// - label/value columns are written.
-// - Arrays expand to multiple rows (each array element = one row).
-
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -11,19 +5,20 @@ import com.opencsv.CSVReader;
 import com.opencsv.CSVWriter;
 
 import java.io.*;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-public class JsonArrayToCsvByPropTemplate {
+public class JsonArrayToCsv_InsertValueNextToProp {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final Pattern BRACKET = Pattern.compile("\\[([^\\]]*)\\]");
 
     public static void main(String[] args) throws Exception {
         if (args.length < 3) {
-            System.err.println("Usage: java JsonArrayToCsvByPropTemplate <templateCsvPath> <jsonArrayPath> <outputDir>");
+            System.err.println("Usage: java JsonArrayToCsv_InsertValueNextToProp <templateCsvPath> <jsonArrayPath> <outputDir>");
             System.exit(1);
         }
         Path templateCsv = Paths.get(args[0]);
@@ -31,63 +26,127 @@ public class JsonArrayToCsvByPropTemplate {
         Path outDir      = Paths.get(args[2]);
         Files.createDirectories(outDir);
 
-        // Read template
-        List<Map<String, String>> template = readTemplate(templateCsv);
+        // 1) Read template rows (UTF-8; change if your file is UTF-16LE)
+        List<String[]> templateRows = readAll(templateCsv);
+        if (templateRows.isEmpty()) {
+            throw new IllegalArgumentException("Template CSV is empty: " + templateCsv);
+        }
+        String[] templateHeaders = stripBom(templateRows.get(0).clone());
+        int propIdx = findPropIndex(templateHeaders);
+        if (propIdx < 0) {
+            throw new IllegalArgumentException("Template must contain a 'prop' or 'property' column (case-insensitive).");
+        }
 
-        // Read JSON array
+        // Build output headers = insert "value" right after prop/property
+        String[] outHeaders = insertAfter(templateHeaders, propIdx, "value");
+
+        // 2) Read JSON array
         List<JsonNode> items = MAPPER.readValue(
-                Files.newBufferedReader(jsonArray),
+                Files.newBufferedReader(jsonArray, StandardCharsets.UTF_8),
                 new TypeReference<List<JsonNode>>() {}
         );
 
-        int index = 1;
+        // 3) For each JSON object, write one CSV
+        int idx = 1;
         for (JsonNode obj : items) {
-            String fileName = obj.hasNonNull("form_id")
-                    ? obj.get("form_id").asText()
-                    : "record_" + index;
-            Path outFile = outDir.resolve(fileName + ".csv");
+            String baseName = obj.hasNonNull("form_id") ? obj.get("form_id").asText() :
+                              obj.hasNonNull("id") ? obj.get("id").asText() : ("record_" + idx);
+            String fileName = sanitize(baseName) + ".csv";
+            Path outFile = outDir.resolve(fileName);
 
-            try (Writer writer = Files.newBufferedWriter(outFile);
+            try (Writer writer = Files.newBufferedWriter(outFile, StandardCharsets.UTF_8);
                  CSVWriter csv = new CSVWriter(writer)) {
 
-                csv.writeNext(new String[]{"label", "value"}, false);
+                csv.writeNext(outHeaders, false);
 
-                for (Map<String, String> row : template) {
-                    String prop = row.get("prop");
-                    String label = row.getOrDefault("label", prop);
-                    List<String> vals = resolveValues(obj, prop);
-                    if (vals.isEmpty()) vals = Collections.singletonList("");
+                // For each template DATA row, resolve and write
+                for (int r = 1; r < templateRows.size(); r++) {
+                    String[] templateRow = templateRows.get(r);
+                    // Guard against ragged rows: pad to headers length
+                    String[] padded = padTo(templateRow, templateHeaders.length);
 
-                    for (String v : vals) {
-                        csv.writeNext(new String[]{label, v}, false);
+                    String propPath = padded[propIdx] == null ? "" : padded[propIdx].trim();
+                    List<String> values = resolveValues(obj, propPath);
+                    if (values.isEmpty()) values = Collections.singletonList("");
+
+                    // For arrays -> multiple rows; for scalar -> single row
+                    for (String v : values) {
+                        String[] out = new String[outHeaders.length];
+
+                        // Copy columns BEFORE prop
+                        for (int c = 0; c < propIdx; c++) out[c] = safe(padded[c]);
+
+                        // Copy prop column itself
+                        out[propIdx] = safe(padded[propIdx]);
+
+                        // Insert value column
+                        out[propIdx + 1] = v;
+
+                        // Copy remaining template columns, shifted by +1
+                        for (int c = propIdx + 1; c < templateHeaders.length; c++) {
+                            out[c + 1] = safe(padded[c]);
+                        }
+
+                        csv.writeNext(out, false);
                     }
                 }
             }
-            System.out.println("✅ Wrote: " + outFile);
-            index++;
+            System.out.println("✅ Wrote: " + outFile.toAbsolutePath());
+            idx++;
         }
     }
 
-    // --- Template reader (expects columns: prop,label) ---
-    private static List<Map<String, String>> readTemplate(Path path) throws IOException {
-        try (Reader r = Files.newBufferedReader(path);
+    // ---------- CSV helpers ----------
+    private static List<String[]> readAll(Path path) throws IOException {
+        try (Reader r = Files.newBufferedReader(path, StandardCharsets.UTF_8);
              CSVReader csv = new CSVReader(r)) {
-            String[] headers = csv.readNext();
-            if (headers == null) throw new IOException("Template CSV is empty");
-            List<Map<String, String>> rows = new ArrayList<>();
-            String[] row;
-            while ((row = csv.readNext()) != null) {
-                Map<String, String> map = new HashMap<>();
-                for (int i = 0; i < headers.length && i < row.length; i++) {
-                    map.put(headers[i].trim().toLowerCase(), row[i].trim());
-                }
-                rows.add(map);
-            }
+            List<String[]> rows = csv.readAll();
+            // optional: strip BOM in first cell
+            if (!rows.isEmpty()) rows.set(0, stripBom(rows.get(0)));
             return rows;
+        } catch (java.nio.charset.MalformedInputException mie) {
+            // If your CSV is UTF-16LE (common from Excel), switch charset above
+            throw new IOException("Bad charset reading template. Try saving as UTF-8 or reading with UTF_16LE.", mie);
         }
     }
 
-    // --- Resolve JSON path (supports dotted paths, [*], [0]) ---
+    private static String[] stripBom(String[] row) {
+        if (row.length == 0 || row[0] == null) return row;
+        row[0] = row[0].replace("\uFEFF", "");
+        return row;
+    }
+
+    private static int findPropIndex(String[] headers) {
+        for (int i = 0; i < headers.length; i++) {
+            String h = headers[i] == null ? "" : headers[i].trim();
+            if (h.equalsIgnoreCase("prop") || h.equalsIgnoreCase("property")) return i;
+        }
+        return -1;
+    }
+
+    private static String[] insertAfter(String[] arr, int idx, String newHeader) {
+        String[] out = new String[arr.length + 1];
+        for (int i = 0; i <= idx; i++) out[i] = arr[i];
+        out[idx + 1] = newHeader;
+        for (int i = idx + 1; i < arr.length; i++) out[i + 1] = arr[i];
+        return out;
+    }
+
+    private static String[] padTo(String[] row, int len) {
+        if (row.length >= len) return row;
+        String[] out = Arrays.copyOf(row, len);
+        for (int i = row.length; i < len; i++) out[i] = "";
+        return out;
+    }
+
+    private static String safe(String s) { return s == null ? "" : s; }
+
+    private static String sanitize(String s) {
+        if (s == null || s.isEmpty()) return "record";
+        return s.replaceAll("[\\\\/:*?\"<>|]+", "_");
+    }
+
+    // ---------- Path resolution: dotted + [idx] + [*] ----------
     private static List<String> resolveValues(JsonNode root, String path) {
         if (root == null || root.isNull() || path == null || path.isEmpty()) return List.of("");
         String[] segments = path.split("\\.");
@@ -100,13 +159,14 @@ public class JsonArrayToCsvByPropTemplate {
             for (JsonNode node : current) {
                 if (node == null || node.isNull()) continue;
                 List<ArrayAccess> accs = parseSegment(seg);
-                List<JsonNode> nodesAfter = List.of(node);
+                List<JsonNode> nodesAfter = new ArrayList<>();
+                nodesAfter.add(node);
 
                 for (ArrayAccess acc : accs) {
                     List<JsonNode> tmp = new ArrayList<>();
                     for (JsonNode n : nodesAfter) {
                         JsonNode base = n;
-                        if (acc.field != null && !acc.field.isEmpty()) base = base.get(acc.field);
+                        if (acc.field != null && !acc.field.isEmpty()) base = getCaseInsensitive(base, acc.field);
                         if (base == null || base.isNull()) continue;
 
                         if (acc.kind == ArrayAccess.Kind.NONE) {
@@ -130,21 +190,33 @@ public class JsonArrayToCsvByPropTemplate {
         }
 
         if (current.isEmpty()) return List.of("");
-        List<String> out = new ArrayList<>();
-        for (JsonNode n : current) out.add(stringifyNode(n));
+        List<String> out = new ArrayList<>(current.size());
+        for (JsonNode n : current) out.add(stringify(n));
         return out;
+    }
+
+    /** Support case-insensitive field matching (optional but handy). */
+    private static JsonNode getCaseInsensitive(JsonNode obj, String field) {
+        if (obj == null || !obj.isObject() || field == null) return null;
+        JsonNode exact = obj.get(field);
+        if (exact != null) return exact;
+        Iterator<String> it = obj.fieldNames();
+        while (it.hasNext()) {
+            String f = it.next();
+            if (f.equalsIgnoreCase(field)) return obj.get(f);
+        }
+        return null;
     }
 
     private static List<ArrayAccess> parseSegment(String seg) {
         List<ArrayAccess> list = new ArrayList<>();
-        String field = null;
         int i = seg.indexOf('[');
         if (i < 0) {
             Integer maybeIdx = tryParseInt(seg);
             if (maybeIdx != null) list.add(new ArrayAccess(null, ArrayAccess.Kind.INDEX, maybeIdx));
             else list.add(new ArrayAccess(seg, ArrayAccess.Kind.NONE, null));
         } else {
-            field = seg.substring(0, i);
+            String field = seg.substring(0, i);
             if (!field.isEmpty()) list.add(new ArrayAccess(field, ArrayAccess.Kind.NONE, null));
             Matcher m = BRACKET.matcher(seg.substring(i));
             while (m.find()) {
@@ -159,11 +231,9 @@ public class JsonArrayToCsvByPropTemplate {
         return list;
     }
 
-    private static Integer tryParseInt(String s) {
-        try { return Integer.parseInt(s); } catch (Exception e) { return null; }
-    }
+    private static Integer tryParseInt(String s) { try { return Integer.parseInt(s); } catch (Exception e) { return null; } }
 
-    private static String stringifyNode(JsonNode n) {
+    private static String stringify(JsonNode n) {
         if (n == null || n.isNull()) return "";
         if (n.isTextual()) return n.asText();
         if (n.isNumber())  return n.numberValue().toString();
@@ -173,7 +243,7 @@ public class JsonArrayToCsvByPropTemplate {
 
     private static class ArrayAccess {
         enum Kind { NONE, INDEX, WILDCARD }
-        final String field;
+        final String field;   // null => operate on current node (when using brackets with no field)
         final Kind kind;
         final Integer index;
         ArrayAccess(String field, Kind kind, Integer index) {
