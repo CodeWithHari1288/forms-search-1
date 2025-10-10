@@ -1,0 +1,230 @@
+// JsonArrayToCsvWithTemplate.java
+// Usage:
+//   java JsonArrayToCsvWithTemplate <templateCsvPath> <jsonArrayPath> <outputCsvPath>
+// Example:
+//   java JsonArrayToCsvWithTemplate headers.csv data.json out.csv
+//
+// Behavior:
+// - Reads headers from the template CSV's first row.
+// - Reads a JSON array of objects.
+// - For each JSON object, writes one or more CSV rows:
+//     * Scalars repeat on every row for that object.
+//     * Array paths (e.g., items[*].sku) expand rows by index.
+//     * Array index access (items[2].sku) selects a single element.
+// - Supports nested objects and arrays via dotted paths + [idx] + [*].
+// - All JSON objects are appended to the same output CSV.
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.opencsv.CSVReader;
+import com.opencsv.CSVWriter;
+
+import java.io.*;
+import java.nio.file.*;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class JsonArrayToCsvWithTemplate {
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    public static void main(String[] args) throws Exception {
+        if (args.length < 3) {
+            System.err.println("Usage: java JsonArrayToCsvWithTemplate <templateCsvPath> <jsonArrayPath> <outputCsvPath>");
+            System.exit(1);
+        }
+        Path templateCsv = Paths.get(args[0]);
+        Path jsonArray   = Paths.get(args[1]);
+        Path outputCsv   = Paths.get(args[2]);
+
+        // 1) Headers from template (first line)
+        List<String> headers = readHeaders(templateCsv);
+        if (headers.isEmpty()) {
+            throw new IllegalArgumentException("No headers found in template CSV: " + templateCsv);
+        }
+
+        // 2) JSON array of objects
+        List<JsonNode> items = MAPPER.readValue(
+                Files.newBufferedReader(jsonArray),
+                new TypeReference<List<JsonNode>>() {}
+        );
+
+        // 3) Write output
+        Files.createDirectories(outputCsv.getParent() == null ? Paths.get(".") : outputCsv.getParent());
+        try (Writer writer = Files.newBufferedWriter(outputCsv);
+             CSVWriter csv = new CSVWriter(writer)) {
+
+            // header row exactly as template
+            csv.writeNext(headers.toArray(new String[0]), false);
+
+            for (JsonNode item : items) {
+                // For each header, resolve to a list of strings (size 1 for scalars, N for arrays)
+                Map<String, List<String>> columnValues = new LinkedHashMap<>();
+                int maxRows = 1;
+                for (String headerPath : headers) {
+                    List<String> vals = resolveValues(item, headerPath);
+                    if (vals.isEmpty()) vals = Collections.singletonList(""); // no value -> empty scalar
+                    columnValues.put(headerPath, vals);
+                    maxRows = Math.max(maxRows, vals.size());
+                }
+                // Emit rows aligned by index; scalars repeat
+                for (int r = 0; r < maxRows; r++) {
+                    String[] row = new String[headers.size()];
+                    for (int c = 0; c < headers.size(); c++) {
+                        String h = headers.get(c);
+                        List<String> vals = columnValues.get(h);
+                        String v = r < vals.size() ? vals.get(r) : (vals.isEmpty() ? "" : vals.get(0)); // repeat scalar
+                        row[c] = v;
+                    }
+                    csv.writeNext(row, false);
+                }
+            }
+        }
+
+        System.out.println("Wrote CSV: " + outputCsv.toAbsolutePath());
+    }
+
+    /** Read first line of template CSV as headers */
+    private static List<String> readHeaders(Path headersCsvPath) throws IOException {
+        try (Reader r = Files.newBufferedReader(headersCsvPath);
+             CSVReader csv = new CSVReader(r)) {
+            String[] first = csv.readNext();
+            if (first == null) return Collections.emptyList();
+            List<String> headers = new ArrayList<>(first.length);
+            for (String h : first) headers.add(h == null ? "" : h.trim());
+            return headers;
+        }
+    }
+
+    // ---------------- Path resolution with dotted.segments and [idx]/[*] ----------------
+
+    /** Resolve a header path to a list of string values (size>=1). */
+    private static List<String> resolveValues(JsonNode root, String path) {
+        if (root == null || root.isNull() || path == null || path.isEmpty()) {
+            return Collections.singletonList("");
+        }
+        // Split into segments: e.g., "a.b[0].c" -> ["a", "b[0]", "c"]
+        String[] segments = path.split("\\.");
+
+        // We walk a list of candidate nodes to support wildcards producing multiple paths.
+        List<JsonNode> current = new ArrayList<>();
+        current.add(root);
+
+        for (String seg : segments) {
+            if (seg.isEmpty()) continue;
+            List<JsonNode> next = new ArrayList<>();
+            for (JsonNode node : current) {
+                if (node == null || node.isNull()) continue;
+                // Parse field + optional [index] or [*]
+                // Supported shapes: "field", "field[2]", "field[*]", "[2]", "[*]" (array at current)
+                List<ArrayAccess> accesses = parseSegment(seg);
+                // apply sequentially (usually at most one, but "[*]" chains are supported)
+                List<JsonNode> nodesAfter = new ArrayList<>();
+                nodesAfter.add(node);
+
+                for (ArrayAccess acc : accesses) {
+                    List<JsonNode> tmp = new ArrayList<>();
+                    for (JsonNode n : nodesAfter) {
+                        JsonNode base = n;
+                        if (acc.field != null && !acc.field.isEmpty()) {
+                            base = base.get(acc.field);
+                        }
+                        if (base == null || base.isNull()) continue;
+
+                        if (acc.kind == ArrayAccess.Kind.NONE) {
+                            // just the field
+                            tmp.add(base);
+                        } else if (acc.kind == ArrayAccess.Kind.INDEX) {
+                            if (base.isArray() && acc.index != null && acc.index >= 0 && acc.index < base.size()) {
+                                tmp.add(base.get(acc.index));
+                            }
+                        } else if (acc.kind == ArrayAccess.Kind.WILDCARD) {
+                            if (base.isArray()) {
+                                for (JsonNode el : base) tmp.add(el);
+                            }
+                        }
+                    }
+                    nodesAfter = tmp;
+                }
+                next.addAll(nodesAfter);
+            }
+            current = next;
+            if (current.isEmpty()) break;
+        }
+
+        if (current.isEmpty()) return Collections.singletonList("");
+
+        // Convert resulting nodes to strings
+        List<String> out = new ArrayList<>(current.size());
+        for (JsonNode n : current) out.add(stringifyNode(n));
+        return out;
+    }
+
+    /** One segment like "phones[0]" or "phones[*]" or "phones" or "[*]" -> sequence of accesses. */
+    private static List<ArrayAccess> parseSegment(String seg) {
+        List<ArrayAccess> list = new ArrayList<>();
+        // Split field and zero or more bracket parts
+        // e.g., seg="a[0][*]" -> field="a", then [0], then [*]
+        String field = null;
+        int i = seg.indexOf('[');
+        if (i < 0) {
+            // simple field or numeric index on array at current like "0"? We'll treat pure numeric as [index].
+            Integer maybeIdx = tryParseInt(seg);
+            if (maybeIdx != null) {
+                list.add(new ArrayAccess(null, ArrayAccess.Kind.INDEX, maybeIdx));
+            } else {
+                list.add(new ArrayAccess(seg, ArrayAccess.Kind.NONE, null));
+            }
+            return list;
+        } else {
+            field = seg.substring(0, i);
+            if (!field.isEmpty()) list.add(new ArrayAccess(field, ArrayAccess.Kind.NONE, null));
+            String rest = seg.substring(i);
+            // pattern: "[" content "]" possibly repeated
+            Matcher m = BRACKET.matcher(rest);
+            while (m.find()) {
+                String token = m.group(1).trim();
+                if ("*".equals(token)) {
+                    list.add(new ArrayAccess(null, ArrayAccess.Kind.WILDCARD, null));
+                } else {
+                    Integer idx = tryParseInt(token);
+                    if (idx != null) list.add(new ArrayAccess(null, ArrayAccess.Kind.INDEX, idx));
+                }
+            }
+            return list;
+        }
+    }
+
+    private static final Pattern BRACKET = Pattern.compile("\\[([^\\]]*)\\]");
+
+    private static Integer tryParseInt(String s) {
+        try { return Integer.parseInt(s); } catch (Exception e) { return null; }
+    }
+
+    private static String stringifyNode(JsonNode n) {
+        if (n == null || n.isNull()) return "";
+        if (n.isTextual()) return n.asText();
+        if (n.isNumber())  return n.numberValue().toString();
+        if (n.isBoolean()) return String.valueOf(n.booleanValue());
+        // objects/arrays -> compact JSON
+        try {
+            return MAPPER.writeValueAsString(n);
+        } catch (Exception e) {
+            return n.toString();
+        }
+    }
+
+    private static class ArrayAccess {
+        enum Kind { NONE, INDEX, WILDCARD }
+        final String field;      // null means act on the current node (array at current)
+        final Kind kind;
+        final Integer index;
+        ArrayAccess(String field, Kind kind, Integer index) {
+            this.field = field;
+            this.kind = kind;
+            this.index = index;
+        }
+    }
+}
