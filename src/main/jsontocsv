@@ -1,255 +1,121 @@
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.opencsv.CSVReader;
-import com.opencsv.CSVWriter;
+# ingest_csv_chroma_folder.py
+# Purpose: Loop over all CSV files in a folder, embed each with BGE-M3 (dense), and upsert to ChromaDB.
+# Notes:
+# - Each CSV must have a header row.
+# - Uses your "card text" strategy and payload metadata (form_id, pointer, etc.)
+# - Uses dense-only embeddings; sparse/lexical hybrid handled at query time.
 
-import java.io.*;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.*;
-import java.util.*;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import os, csv, argparse
+from typing import Dict, List, Any
+import chromadb
+from FlagEmbedding import BGEM3FlagModel
 
-public class JsonArrayToCsv_InsertValueNextToProp {
+# ---------- Helpers ----------
+def rows_from_csv(path: str) -> List[Dict[str, str]]:
+    with open(path, "r", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
-    private static final Pattern BRACKET = Pattern.compile("\\[([^\\]]*)\\]");
+def build_text(row: Dict[str, str]) -> str:
+    label = (row.get("label") or "").strip()
+    aliases = (row.get("aliases") or "").strip()
+    section = (row.get("section") or "").strip()
+    subsection = (row.get("subsection") or "").strip()
+    enum_labels = (row.get("enum_labels") or "").strip()
+    datatype = (row.get("datatype") or "").strip()
+    parts = [
+        f"Section: {section}" if section else "",
+        f"Subsection: {subsection}" if subsection else "",
+        f"Field: {label}" if label else "",
+        f"Aliases: {aliases}" if aliases else "",
+        f"Type: {datatype}" if datatype else "",
+        f"Enum: {enum_labels}" if enum_labels else "",
+    ]
+    return ". ".join([p for p in parts if p])
 
-    public static void main(String[] args) throws Exception {
-        if (args.length < 3) {
-            System.err.println("Usage: java JsonArrayToCsv_InsertValueNextToProp <templateCsvPath> <jsonArrayPath> <outputDir>");
-            System.exit(1);
-        }
-        Path templateCsv = Paths.get(args[0]);
-        Path jsonArray   = Paths.get(args[1]);
-        Path outDir      = Paths.get(args[2]);
-        Files.createDirectories(outDir);
-
-        // 1) Read template rows (UTF-8; change if your file is UTF-16LE)
-        List<String[]> templateRows = readAll(templateCsv);
-        if (templateRows.isEmpty()) {
-            throw new IllegalArgumentException("Template CSV is empty: " + templateCsv);
-        }
-        String[] templateHeaders = stripBom(templateRows.get(0).clone());
-        int propIdx = findPropIndex(templateHeaders);
-        if (propIdx < 0) {
-            throw new IllegalArgumentException("Template must contain a 'prop' or 'property' column (case-insensitive).");
-        }
-
-        // Build output headers = insert "value" right after prop/property
-        String[] outHeaders = insertAfter(templateHeaders, propIdx, "value");
-
-        // 2) Read JSON array
-        List<JsonNode> items = MAPPER.readValue(
-                Files.newBufferedReader(jsonArray, StandardCharsets.UTF_8),
-                new TypeReference<List<JsonNode>>() {}
-        );
-
-        // 3) For each JSON object, write one CSV
-        int idx = 1;
-        for (JsonNode obj : items) {
-            String baseName = obj.hasNonNull("form_id") ? obj.get("form_id").asText() :
-                              obj.hasNonNull("id") ? obj.get("id").asText() : ("record_" + idx);
-            String fileName = sanitize(baseName) + ".csv";
-            Path outFile = outDir.resolve(fileName);
-
-            try (Writer writer = Files.newBufferedWriter(outFile, StandardCharsets.UTF_8);
-                 CSVWriter csv = new CSVWriter(writer)) {
-
-                csv.writeNext(outHeaders, false);
-
-                // For each template DATA row, resolve and write
-                for (int r = 1; r < templateRows.size(); r++) {
-                    String[] templateRow = templateRows.get(r);
-                    // Guard against ragged rows: pad to headers length
-                    String[] padded = padTo(templateRow, templateHeaders.length);
-
-                    String propPath = padded[propIdx] == null ? "" : padded[propIdx].trim();
-                    List<String> values = resolveValues(obj, propPath);
-                    if (values.isEmpty()) values = Collections.singletonList("");
-
-                    // For arrays -> multiple rows; for scalar -> single row
-                    for (String v : values) {
-                        String[] out = new String[outHeaders.length];
-
-                        // Copy columns BEFORE prop
-                        for (int c = 0; c < propIdx; c++) out[c] = safe(padded[c]);
-
-                        // Copy prop column itself
-                        out[propIdx] = safe(padded[propIdx]);
-
-                        // Insert value column
-                        out[propIdx + 1] = v;
-
-                        // Copy remaining template columns, shifted by +1
-                        for (int c = propIdx + 1; c < templateHeaders.length; c++) {
-                            out[c + 1] = safe(padded[c]);
-                        }
-
-                        csv.writeNext(out, false);
-                    }
-                }
-            }
-            System.out.println("✅ Wrote: " + outFile.toAbsolutePath());
-            idx++;
-        }
+def payload_from_row(row: Dict[str, str]) -> Dict[str, Any]:
+    return {
+        "form_id": row.get("form_id", ""),
+        "section": row.get("section", ""),
+        "subsection": row.get("subsection", ""),
+        "pointer": row.get("pointer", ""),
+        "pattern_path": row.get("pattern_path", ""),
+        "json_property_name": row.get("json_property_name", ""),
+        "label": row.get("label", ""),
+        "aliases": row.get("aliases", ""),
+        "datatype": row.get("datatype", ""),
+        "unit": row.get("unit", ""),
+        "enum_labels": row.get("enum_labels", ""),
+        "status": row.get("status", ""),
+        "version_id": row.get("version_id", ""),
+        "version_ts": row.get("version_ts", ""),
+        "row_id": row.get("row_id", ""),
+        "is_field_card": True,
+        "is_section_card": False,
+        "lang": row.get("lang", ""),
+        "source_file": os.path.basename(row.get("_source", "")),  # added for traceability
     }
 
-    // ---------- CSV helpers ----------
-    private static List<String[]> readAll(Path path) throws IOException {
-        try (Reader r = Files.newBufferedReader(path, StandardCharsets.UTF_8);
-             CSVReader csv = new CSVReader(r)) {
-            List<String[]> rows = csv.readAll();
-            // optional: strip BOM in first cell
-            if (!rows.isEmpty()) rows.set(0, stripBom(rows.get(0)));
-            return rows;
-        } catch (java.nio.charset.MalformedInputException mie) {
-            // If your CSV is UTF-16LE (common from Excel), switch charset above
-            throw new IOException("Bad charset reading template. Try saving as UTF-8 or reading with UTF_16LE.", mie);
-        }
-    }
+def find_csv_files(folder: str) -> List[str]:
+    files = []
+    for f in os.listdir(folder):
+        if f.lower().endswith(".csv"):
+            files.append(os.path.join(folder, f))
+    return files
 
-    private static String[] stripBom(String[] row) {
-        if (row.length == 0 || row[0] == null) return row;
-        row[0] = row[0].replace("\uFEFF", "");
-        return row;
-    }
+# ---------- Main ----------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--folder", required=True, help="Folder path containing CSV files")
+    ap.add_argument("--collection", default=os.environ.get("COLLECTION", "forms_demo"))
+    ap.add_argument("--persist_dir", default=os.environ.get("CHROMA_DIR", "./chroma_db"))
+    ap.add_argument("--batch", type=int, default=256)
+    args = ap.parse_args()
 
-    private static int findPropIndex(String[] headers) {
-        for (int i = 0; i < headers.length; i++) {
-            String h = headers[i] == null ? "" : headers[i].trim();
-            if (h.equalsIgnoreCase("prop") || h.equalsIgnoreCase("property")) return i;
-        }
-        return -1;
-    }
+    csv_files = find_csv_files(args.folder)
+    if not csv_files:
+        print(f"No CSV files found in folder: {args.folder}")
+        return
 
-    private static String[] insertAfter(String[] arr, int idx, String newHeader) {
-        String[] out = new String[arr.length + 1];
-        for (int i = 0; i <= idx; i++) out[i] = arr[i];
-        out[idx + 1] = newHeader;
-        for (int i = idx + 1; i < arr.length; i++) out[i + 1] = arr[i];
-        return out;
-    }
+    print(f"Found {len(csv_files)} CSV file(s) to process in {args.folder}")
+    client = chromadb.PersistentClient(path=args.persist_dir)
+    coll = client.get_or_create_collection(name=args.collection)
+    model = BGEM3FlagModel("BAAI/bge-m3", use_fp16=True)
 
-    private static String[] padTo(String[] row, int len) {
-        if (row.length >= len) return row;
-        String[] out = Arrays.copyOf(row, len);
-        for (int i = row.length; i < len; i++) out[i] = "";
-        return out;
-    }
+    total = 0
+    for csv_path in csv_files:
+        print(f"\n📄 Processing: {csv_path}")
+        rows = rows_from_csv(csv_path)
+        if not rows:
+            print(f"⚠️  Skipped empty CSV: {csv_path}")
+            continue
 
-    private static String safe(String s) { return s == null ? "" : s; }
+        # Attach source info for traceability
+        for r in rows:
+            r["_source"] = csv_path
 
-    private static String sanitize(String s) {
-        if (s == null || s.isEmpty()) return "record";
-        return s.replaceAll("[\\\\/:*?\"<>|]+", "_");
-    }
+        texts = [build_text(r) for r in rows]
+        payloads = [payload_from_row(r) for r in rows]
+        ids = [f"{r.get('form_id','')}:{r.get('pointer','')}:{i}:{os.path.basename(csv_path)}" for i, r in enumerate(rows)]
 
-    // ---------- Path resolution: dotted + [idx] + [*] ----------
-    private static List<String> resolveValues(JsonNode root, String path) {
-        if (root == null || root.isNull() || path == null || path.isEmpty()) return List.of("");
-        String[] segments = path.split("\\.");
-        List<JsonNode> current = new ArrayList<>();
-        current.add(root);
+        B = max(1, args.batch)
+        for start in range(0, len(rows), B):
+            end = min(start + B, len(rows))
+            batch_texts = texts[start:end]
+            out = model.encode(batch_texts, return_dense=True, return_sparse=False)
+            dense = out["dense_vecs"]
 
-        for (String seg : segments) {
-            if (seg.isEmpty()) continue;
-            List<JsonNode> next = new ArrayList<>();
-            for (JsonNode node : current) {
-                if (node == null || node.isNull()) continue;
-                List<ArrayAccess> accs = parseSegment(seg);
-                List<JsonNode> nodesAfter = new ArrayList<>();
-                nodesAfter.add(node);
+            coll.upsert(
+                ids=ids[start:end],
+                documents=batch_texts,
+                metadatas=payloads[start:end],
+                embeddings=dense,
+            )
+            print(f"✅ Upserted {end}/{len(rows)} rows from {os.path.basename(csv_path)}")
 
-                for (ArrayAccess acc : accs) {
-                    List<JsonNode> tmp = new ArrayList<>();
-                    for (JsonNode n : nodesAfter) {
-                        JsonNode base = n;
-                        if (acc.field != null && !acc.field.isEmpty()) base = getCaseInsensitive(base, acc.field);
-                        if (base == null || base.isNull()) continue;
+        total += len(rows)
 
-                        if (acc.kind == ArrayAccess.Kind.NONE) {
-                            tmp.add(base);
-                        } else if (acc.kind == ArrayAccess.Kind.INDEX) {
-                            if (base.isArray() && acc.index != null && acc.index >= 0 && acc.index < base.size()) {
-                                tmp.add(base.get(acc.index));
-                            }
-                        } else if (acc.kind == ArrayAccess.Kind.WILDCARD) {
-                            if (base.isArray()) {
-                                for (JsonNode el : base) tmp.add(el);
-                            }
-                        }
-                    }
-                    nodesAfter = tmp;
-                }
-                next.addAll(nodesAfter);
-            }
-            current = next;
-            if (current.isEmpty()) break;
-        }
+    print(f"\n🎯 Done. Total records embedded: {total}")
+    print(f"✅ All data persisted to collection '{args.collection}' in {args.persist_dir}")
 
-        if (current.isEmpty()) return List.of("");
-        List<String> out = new ArrayList<>(current.size());
-        for (JsonNode n : current) out.add(stringify(n));
-        return out;
-    }
-
-    /** Support case-insensitive field matching (optional but handy). */
-    private static JsonNode getCaseInsensitive(JsonNode obj, String field) {
-        if (obj == null || !obj.isObject() || field == null) return null;
-        JsonNode exact = obj.get(field);
-        if (exact != null) return exact;
-        Iterator<String> it = obj.fieldNames();
-        while (it.hasNext()) {
-            String f = it.next();
-            if (f.equalsIgnoreCase(field)) return obj.get(f);
-        }
-        return null;
-    }
-
-    private static List<ArrayAccess> parseSegment(String seg) {
-        List<ArrayAccess> list = new ArrayList<>();
-        int i = seg.indexOf('[');
-        if (i < 0) {
-            Integer maybeIdx = tryParseInt(seg);
-            if (maybeIdx != null) list.add(new ArrayAccess(null, ArrayAccess.Kind.INDEX, maybeIdx));
-            else list.add(new ArrayAccess(seg, ArrayAccess.Kind.NONE, null));
-        } else {
-            String field = seg.substring(0, i);
-            if (!field.isEmpty()) list.add(new ArrayAccess(field, ArrayAccess.Kind.NONE, null));
-            Matcher m = BRACKET.matcher(seg.substring(i));
-            while (m.find()) {
-                String token = m.group(1).trim();
-                if ("*".equals(token)) list.add(new ArrayAccess(null, ArrayAccess.Kind.WILDCARD, null));
-                else {
-                    Integer idx = tryParseInt(token);
-                    if (idx != null) list.add(new ArrayAccess(null, ArrayAccess.Kind.INDEX, idx));
-                }
-            }
-        }
-        return list;
-    }
-
-    private static Integer tryParseInt(String s) { try { return Integer.parseInt(s); } catch (Exception e) { return null; } }
-
-    private static String stringify(JsonNode n) {
-        if (n == null || n.isNull()) return "";
-        if (n.isTextual()) return n.asText();
-        if (n.isNumber())  return n.numberValue().toString();
-        if (n.isBoolean()) return String.valueOf(n.booleanValue());
-        try { return MAPPER.writeValueAsString(n); } catch (Exception e) { return n.toString(); }
-    }
-
-    private static class ArrayAccess {
-        enum Kind { NONE, INDEX, WILDCARD }
-        final String field;   // null => operate on current node (when using brackets with no field)
-        final Kind kind;
-        final Integer index;
-        ArrayAccess(String field, Kind kind, Integer index) {
-            this.field = field;
-            this.kind = kind;
-            this.index = index;
-        }
-    }
-}
+if __name__ == "__main__":
+    main()
