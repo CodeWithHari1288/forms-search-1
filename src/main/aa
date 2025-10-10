@@ -1,0 +1,187 @@
+# ingest_csv_chroma.py
+# Purpose: read a CSV catalog of form fields, embed with BGE-M3 (dense), upsert to ChromaDB.
+# Notes:
+# - We keep your "card text" strategy and payload metadata (pointers, etc.)
+# - Hybrid (dense+sparse) will be done at QUERY time on the client.
+
+import os, csv, argparse
+from typing import Dict, List, Any
+import chromadb
+from FlagEmbedding import BGEM3FlagModel
+
+# ---------- Helpers ----------
+def rows_from_csv(path: str) -> List[Dict[str, str]]:
+    with open(path, "r", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+def build_text(row: Dict[str, str]) -> str:
+    label = (row.get("label") or "").strip()
+    aliases = (row.get("aliases") or "").strip()
+    section = (row.get("section") or "").strip()
+    subsection = (row.get("subsection") or "").strip()
+    enum_labels = (row.get("enum_labels") or "").strip()
+    datatype = (row.get("datatype") or "").strip()
+    parts = [
+        f"Section: {section}" if section else "",
+        f"Subsection: {subsection}" if subsection else "",
+        f"Field: {label}" if label else "",
+        f"Aliases: {aliases}" if aliases else "",
+        f"Type: {datatype}" if datatype else "",
+        f"Enum: {enum_labels}" if enum_labels else "",
+    ]
+    return ". ".join([p for p in parts if p])
+
+def payload_from_row(row: Dict[str, str]) -> Dict[str, Any]:
+    return {
+        "form_id": row.get("form_id",""),
+        "section": row.get("section",""),
+        "subsection": row.get("subsection",""),
+        "pointer": row.get("pointer",""),
+        "pattern_path": row.get("pattern_path",""),
+        "json_property_name": row.get("json_property_name",""),
+        "label": row.get("label",""),
+        "aliases": row.get("aliases",""),
+        "datatype": row.get("datatype",""),
+        "unit": row.get("unit",""),
+        "enum_labels": row.get("enum_labels",""),
+        "status": row.get("status",""),
+        "version_id": row.get("version_id",""),
+        "version_ts": row.get("version_ts",""),
+        "row_id": row.get("row_id",""),
+        "is_field_card": True,
+        "is_section_card": False,
+        "lang": row.get("lang",""),
+    }
+
+# ---------- Ingest ----------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv", required=True)
+    ap.add_argument("--collection", default=os.environ.get("COLLECTION","forms_demo"))
+    ap.add_argument("--persist_dir", default=os.environ.get("CHROMA_DIR","./chroma_db"))
+    ap.add_argument("--batch", type=int, default=256)
+    args = ap.parse_args()
+
+    client = chromadb.PersistentClient(path=args.persist_dir)
+    coll = client.get_or_create_collection(name=args.collection)
+
+    rows = rows_from_csv(args.csv)
+    texts = [build_text(r) for r in rows]
+    payloads = [payload_from_row(r) for r in rows]
+    ids = [f"{r.get('form_id','')}:{r.get('pointer','')}:{i}" for i, r in enumerate(rows)]
+
+    model = BGEM3FlagModel("BAAI/bge-m3", use_fp16=True)  # CPU/GPU auto; set device='cuda' if desired
+
+    B = max(1, args.batch)
+    for start in range(0, len(rows), B):
+        end = min(start + B, len(rows))
+        batch_texts = texts[start:end]
+        out = model.encode(batch_texts, return_dense=True, return_sparse=False)
+        dense = out["dense_vecs"]
+        coll.upsert(
+            ids=ids[start:end],
+            documents=batch_texts,     # store text for sparse/BM25 later
+            metadatas=payloads[start:end],
+            embeddings=dense,
+        )
+        print(f"upserted {end} / {len(rows)}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+# hybrid_query_chroma.py
+# Purpose: query Chroma dense top-K, compute sparse TF-IDF score over those candidates, fuse with RRF.
+
+from typing import List, Tuple, Dict, Any
+import numpy as np
+import chromadb
+from sklearn.feature_extraction.text import TfidfVectorizer
+from FlagEmbedding import BGEM3FlagModel
+
+def rrf(rank_idx: int, k: int = 60) -> float:
+    return 1.0 / (k + rank_idx)
+
+class HybridSearcher:
+    def __init__(self, persist_dir="./chroma_db", collection="forms_demo", device="cpu"):
+        self.client = chromadb.PersistentClient(path=persist_dir)
+        self.coll = self.client.get_or_create_collection(name=collection)
+        self.model = BGEM3FlagModel("BAAI/bge-m3", device=device)
+
+    def search(self, query: str, k_dense: int = 50, top_k: int = 10, where: Dict[str, Any] | None = None):
+        # 1) Dense search
+        q_dense = self.model.encode([query], return_dense=True, return_sparse=False)["dense_vecs"][0]
+        res = self.coll.query(
+            query_embeddings=[q_dense],
+            n_results=k_dense,
+            where=where  # e.g., {"form_id":"A","section":"address"}
+        )
+        ids = res["ids"][0]
+        docs = res["documents"][0]
+        metas = res["metadatas"][0]
+        # distances if present (Chroma returns similarity/distance depending on backend)
+        # We treat smaller distance as better; convert to score:
+        ds = np.array(res.get("distances", [[0]*len(ids)])[0], dtype=float)
+        if ds.size and ds.max() > 0:
+            dense_score = -ds  # invert distance so higher=better
+        else:
+            # fallback if no distances (rare): uniform
+            dense_score = np.zeros(len(ids))
+
+        # 2) Sparse TF-IDF over candidates (+query), then cosine similarity
+        vect = TfidfVectorizer()
+        X = vect.fit_transform(docs + [query])
+        D = X[:-1]
+        q = X[-1]
+        sparse_score = (D @ q.T).toarray().ravel()
+
+        # 3) Rank & fuse (RRF)
+        dense_rank = {ids[i]: r for r, i in enumerate(np.argsort(np.argsort(-dense_score)))}
+        sparse_rank = {ids[i]: r for r, i in enumerate(np.argsort(np.argsort(-sparse_score)))}
+
+        fused = []
+        for i, _id in enumerate(ids):
+            score = rrf(dense_rank[_id]) + rrf(sparse_rank[_id])
+            fused.append((_id, score, docs[i], metas[i]))
+
+        fused.sort(key=lambda x: x[1], reverse=True)
+        return fused[:top_k]
+
+
+
+
+
+
+
+# demo_query.py
+from hybrid_query_chroma import HybridSearcher
+hs = HybridSearcher(persist_dir="./chroma_db", collection="forms_demo")
+hits = hs.search("copy applicant address from form A", where={"form_id":"A","section":"address"}, top_k=5)
+for _id, score, doc, meta in hits:
+    print(_id, round(score,4), meta.get("pointer"), doc[:100])
+
+
+
+
+
+# retrieve_source_subsection_node -> use Chroma hybrid
+from hybrid_query_chroma import HybridSearcher
+_searcher = HybridSearcher(persist_dir="./chroma_db", collection="forms_demo")
+
+def retrieve_source_subsection_node(state):
+    query = f"copy subsection {state['source_prefix_pointer']}"
+    filters = state.get("filter") or None
+    hits = _searcher.search(query, where=filters, top_k=20)
+    state["hits"] = hits
+    return state
+
+
+
+
+
+
+
