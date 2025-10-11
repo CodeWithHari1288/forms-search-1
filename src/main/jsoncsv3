@@ -14,332 +14,366 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 /**
- * OpenCSV implementation:
- *  - Reads template CSV (keeps all columns)
- *  - Fills value & found from JSON with priority:
- *      1) pointer (exact, no '*')
- *      2) pattern_path with one '*' (expands to multiple rows)
- *      3) pattern_path exact (no '*')
- *      4) json_property_name (first hit anywhere)
- *  - On pattern expansion, tries to set row_id from the parent object.
+ * Java 8 compatible (no records, no String.isBlank/List.of).
+ * Priority:
+ *  1) pointer (exact, no '*')
+ *  2) pattern_path with one '*'
+ *  3) pattern_path exact (no '*')
+ *  4) json_property_name (first match anywhere)
+ * Writes 'value' and 'found' columns.
  */
 public class JsonToCsvByTemplateOpenCsv {
 
-    private static final ObjectMapper MAPPER = new ObjectMapper(new JsonFactory());
+  private static final ObjectMapper MAPPER = new ObjectMapper(new JsonFactory());
 
-    public static void main(String[] args) throws Exception {
-        Map<String, String> arg = parseArgs(args);
-        String jsonPath    = required(arg, "--json");
-        String templateCsv = required(arg, "--template_csv");
-        String outCsv      = required(arg, "--out_csv");
+  // Plain helper classes (instead of 'record')
+  private static final class KeyHit {
+    private final String pointer;
+    private final JsonNode value;
+    KeyHit(String pointer, JsonNode value) { this.pointer = pointer; this.value = value; }
+    String pointer() { return pointer; }
+    JsonNode value() { return value; }
+  }
+  private static final class PathNode {
+    private final JsonNode node;
+    private final List<String> path;
+    PathNode(JsonNode node, List<String> path) { this.node = node; this.path = path; }
+    JsonNode node() { return node; }
+    List<String> path() { return path; }
+  }
 
-        JsonNode doc = readJson(jsonPath);
-        List<Map<String, String>> templateRows = readTemplateCsv(templateCsv);
+  public static void main(String[] args) throws Exception {
+    Map<String, String> arg = parseArgs(args);
+    String jsonPath    = required(arg, "--json");
+    String templateCsv = required(arg, "--template_csv");
+    String outCsv      = required(arg, "--out_csv");
 
-        // Preserve template header order + add value/found if missing
-        List<String> header = inferHeader(templateRows);
-        if (!header.contains("value")) header.add("value");
-        if (!header.contains("found")) header.add("found");
+    JsonNode doc = readJson(jsonPath);
+    List<Map<String, String>> templateRows = readTemplateCsv(templateCsv);
 
-        List<Map<String, String>> filled = processRows(doc, templateRows);
+    // Preserve template header order + add value/found if missing
+    List<String> header = inferHeader(templateRows);
+    if (!header.contains("value")) header.add("value");
+    if (!header.contains("found")) header.add("found");
 
-        writeCsv(outCsv, header, filled);
-        System.out.println("Wrote " + filled.size() + " rows -> " + outCsv);
-    }
+    List<Map<String, String>> filled = processRows(doc, templateRows);
 
-    // ---------------- Core ----------------
+    writeCsv(outCsv, header, filled);
+    System.out.println("Wrote " + filled.size() + " rows -> " + outCsv);
+  }
 
-    private static List<Map<String, String>> processRows(JsonNode doc, List<Map<String, String>> templateRows) {
-        List<Map<String, String>> out = new ArrayList<>();
+  // ---------------- Core ----------------
 
-        for (Map<String, String> row : templateRows) {
-            Map<String, String> base = new LinkedHashMap<>(row);
+  private static List<Map<String, String>> processRows(JsonNode doc, List<Map<String, String>> templateRows) {
+    List<Map<String, String>> out = new ArrayList<Map<String, String>>();
 
-            String pointer  = trim(row.get("pointer"));
-            String pattern  = trim(row.get("pattern_path"));
-            String jsonProp = trim(row.get("json_property_name"));
+    for (Map<String, String> row : templateRows) {
+      Map<String, String> base = new LinkedHashMap<String, String>(row);
 
-            // 1) pointer (exact)
-            if (!isEmpty(pointer) && !pointer.contains("*")) {
-                JsonNode val = atPointer(doc, pointer);
-                boolean found = !isMissing(val);
-                base.put("value", stringify(val));
-                base.put("found", found ? "1" : "0");
-                out.add(base);
-                continue;
+      String pointer  = trim(row.get("pointer"));
+      String pattern  = trim(row.get("pattern_path"));
+      String jsonProp = trim(row.get("json_property_name"));
+
+      // 1) pointer (exact)
+      if (!isEmpty(pointer) && pointer.indexOf('*') < 0) {
+        JsonNode val = atPointer(doc, pointer);
+        boolean found = !isMissing(val);
+        base.put("value", stringify(val));
+        base.put("found", found ? "1" : "0");
+        out.add(base);
+        continue;
+      }
+
+      // 2) pattern with '*'
+      if (!isEmpty(pattern) && pattern.indexOf('*') >= 0) {
+        List<String> concrete = expandPattern(doc, pattern);
+        if (concrete.isEmpty()) {
+          Map<String,String> nf = new LinkedHashMap<String, String>(base);
+          nf.put("value", "");
+          nf.put("found", "0");
+          out.add(nf);
+        } else {
+          for (String cptr : concrete) {
+            Map<String,String> r = new LinkedHashMap<String, String>(base);
+            JsonNode val = atPointer(doc, cptr);
+            boolean found = !isMissing(val);
+            r.put("pointer", cptr);
+
+            // Try to auto-fill row_id from parent object if present
+            if (isEmpty(r.get("row_id"))) {
+              String rid = extractRowIdFromParent(doc, cptr);
+              if (rid != null) r.put("row_id", rid);
             }
 
-            // 2) pattern with '*'
-            if (!isEmpty(pattern) && pattern.contains("*")) {
-                List<String> concrete = expandPattern(doc, pattern);
-                if (concrete.isEmpty()) {
-                    Map<String,String> nf = new LinkedHashMap<>(base);
-                    nf.put("value", "");
-                    nf.put("found", "0");
-                    out.add(nf);
-                } else {
-                    for (String cptr : concrete) {
-                        Map<String,String> r = new LinkedHashMap<>(base);
-                        JsonNode val = atPointer(doc, cptr);
-                        boolean found = !isMissing(val);
-                        r.put("pointer", cptr);
-
-                        // Try to auto-fill row_id from parent object if present
-                        if (isEmpty(r.get("row_id"))) {
-                            String rid = extractRowIdFromParent(doc, cptr);
-                            if (rid != null) r.put("row_id", rid);
-                        }
-
-                        r.put("value", stringify(val));
-                        r.put("found", found ? "1" : "0");
-                        out.add(r);
-                    }
-                }
-                continue;
-            }
-
-            // 3) pattern exact (no '*')
-            if (!isEmpty(pattern)) {
-                JsonNode val = atPointer(doc, pattern);
-                boolean found = !isMissing(val);
-                base.put("pointer", pattern);
-                base.put("value", stringify(val));
-                base.put("found", found ? "1" : "0");
-                out.add(base);
-                continue;
-            }
-
-            // 4) json_property_name (first hit)
-            if (!isEmpty(jsonProp)) {
-                KeyHit hit = findFirstByKey(doc, jsonProp);
-                if (hit != null) {
-                    base.put("pointer", hit.pointer());
-                    base.put("value", stringify(hit.value()));
-                    base.put("found", "1");
-                    out.add(base);
-                    continue;
-                }
-            }
-
-            // 5) not found
-            base.put("value", "");
-            base.put("found", "0");
-            out.add(base);
+            r.put("value", stringify(val));
+            r.put("found", found ? "1" : "0");
+            out.add(r);
+          }
         }
+        continue;
+      }
 
-        return out;
-    }
+      // 3) pattern exact (no '*')
+      if (!isEmpty(pattern)) {
+        JsonNode val = atPointer(doc, pattern);
+        boolean found = !isMissing(val);
+        base.put("pointer", pattern);
+        base.put("value", stringify(val));
+        base.put("found", found ? "1" : "0");
+        out.add(base);
+        continue;
+      }
 
-    // ---------------- JSON helpers ----------------
-
-    private static JsonNode readJson(String path) throws IOException {
-        try (InputStream in = new FileInputStream(path)) {
-            return MAPPER.readTree(in);
+      // 4) json_property_name (first hit)
+      if (!isEmpty(jsonProp)) {
+        KeyHit hit = findFirstByKey(doc, jsonProp);
+        if (hit != null) {
+          base.put("pointer", hit.pointer());
+          base.put("value", stringify(hit.value()));
+          base.put("found", "1");
+          out.add(base);
+          continue;
         }
+      }
+
+      // 5) not found
+      base.put("value", "");
+      base.put("found", "0");
+      out.add(base);
     }
 
-    private static JsonNode atPointer(JsonNode doc, String pointer) {
-        try {
-            JsonPointer jp = JsonPointer.compile(pointer);
-            JsonNode n = doc.at(jp);
-            return (n == null) ? MissingNode.getInstance() : n;
-        } catch (IllegalArgumentException e) {
-            return MissingNode.getInstance();
+    return out;
+  }
+
+  // ---------------- JSON helpers ----------------
+
+  private static JsonNode readJson(String path) throws IOException {
+    InputStream in = new FileInputStream(path);
+    try {
+      return MAPPER.readTree(in);
+    } finally {
+      in.close();
+    }
+  }
+
+  private static JsonNode atPointer(JsonNode doc, String pointer) {
+    try {
+      JsonPointer jp = JsonPointer.compile(pointer);
+      JsonNode n = doc.at(jp);
+      return (n == null) ? MissingNode.getInstance() : n;
+    } catch (IllegalArgumentException e) {
+      return MissingNode.getInstance();
+    }
+  }
+
+  private static boolean isMissing(JsonNode n) {
+    return n == null || n.isMissingNode() || n.isNull();
+  }
+
+  private static String stringify(JsonNode n) {
+    if (isMissing(n)) return "";
+    if (n.isValueNode()) return n.asText();
+    try { return MAPPER.writeValueAsString(n); }
+    catch (Exception e) { return n.toString(); }
+  }
+
+  private static String parentPointerOf(String ptr) {
+    if (ptr == null || ptr.length() == 0 || "/".equals(ptr)) return null;
+    int idx = ptr.lastIndexOf('/');
+    if (idx <= 0) return "/";
+    return ptr.substring(0, idx);
+  }
+
+  private static String extractRowIdFromParent(JsonNode doc, String concretePtr) {
+    String parentPtr = parentPointerOf(concretePtr);
+    if (parentPtr == null) return null;
+    JsonNode parent = atPointer(doc, parentPtr);
+    if (parent != null && parent.isObject()) {
+      JsonNode rid = parent.get("row_id");
+      if (rid != null && (rid.isTextual() || rid.isNumber())) {
+        return rid.asText();
+      }
+    }
+    return null;
+  }
+
+  /** Expand a pattern with one '*' into concrete pointers. */
+  private static List<String> expandPattern(JsonNode doc, String patternPath) {
+    if (isEmpty(patternPath) || patternPath.indexOf('*') < 0) {
+      List<String> single = new ArrayList<String>(1);
+      single.add(patternPath);
+      return single;
+    }
+    String[] parts = splitAndKeepOrder(patternPath);
+
+    List<String> out = new ArrayList<String>();
+    walkPattern(doc, parts, 0, new ArrayList<String>(), out);
+    return out;
+  }
+
+  private static void walkPattern(JsonNode node, String[] parts, int i, List<String> acc, List<String> out) {
+    if (i == parts.length) {
+      out.add("/" + joinSlash(acc));
+      return;
+    }
+    String part = parts[i];
+
+    if ("*".equals(part)) {
+      if (node != null && node.isArray()) {
+        for (int idx = 0; idx < node.size(); idx++) {
+          JsonNode child = node.get(idx);
+          List<String> next = new ArrayList<String>(acc);
+          next.add(String.valueOf(idx));
+          walkPattern(child, parts, i + 1, next, out);
         }
+      }
+      return;
     }
 
-    private static boolean isMissing(JsonNode n) {
-        return n == null || n.isMissingNode() || n.isNull();
-    }
+    if (node == null || node.isMissingNode() || node.isNull()) return;
 
-    private static String stringify(JsonNode n) {
-        if (isMissing(n)) return "";
-        if (n.isValueNode()) return n.asText();
-        try { return MAPPER.writeValueAsString(n); }
-        catch (Exception e) { return n.toString(); }
-    }
-
-    private static String parentPointerOf(String ptr) {
-        if (ptr == null || ptr.isEmpty() || "/".equals(ptr)) return null;
-        int idx = ptr.lastIndexOf('/');
-        if (idx <= 0) return "/";
-        return ptr.substring(0, idx);
-    }
-
-    private static String extractRowIdFromParent(JsonNode doc, String concretePtr) {
-        String parentPtr = parentPointerOf(concretePtr);
-        if (parentPtr == null) return null;
-        JsonNode parent = atPointer(doc, parentPtr);
-        if (parent != null && parent.isObject()) {
-            JsonNode rid = parent.get("row_id");
-            if (rid != null && (rid.isTextual() || rid.isNumber())) {
-                return rid.asText();
-            }
+    if (node.isObject()) {
+      JsonNode child = node.get(part);
+      if (child != null) {
+        List<String> next = new ArrayList<String>(acc);
+        next.add(part);
+        walkPattern(child, parts, i + 1, next, out);
+      }
+    } else if (node.isArray()) {
+      try {
+        int idx = Integer.parseInt(part);
+        if (idx >= 0 && idx < node.size()) {
+          JsonNode child = node.get(idx);
+          List<String> next = new ArrayList<String>(acc);
+          next.add(part);
+          walkPattern(child, parts, i + 1, next, out);
         }
-        return null;
+      } catch (NumberFormatException ignore) { }
     }
+  }
 
-    /**
-     * Expand a pattern with a single '*' into concrete pointers.
-     * Example: /applicant/address/*/postcode → /applicant/address/0/postcode, ...
-     */
-    private static List<String> expandPattern(JsonNode doc, String patternPath) {
-        if (isEmpty(patternPath) || !patternPath.contains("*")) {
-            return List.of(patternPath);
+  // DFS first match of a key anywhere; returns pointer + value
+  private static KeyHit findFirstByKey(JsonNode root, String key) {
+    Deque<PathNode> stack = new ArrayDeque<PathNode>();
+    stack.push(new PathNode(root, new ArrayList<String>()));
+
+    while (!stack.isEmpty()) {
+      PathNode cur = stack.pop();
+      JsonNode n = cur.node();
+      List<String> p = cur.path();
+
+      if (n == null || n.isMissingNode() || n.isNull()) continue;
+
+      if (n.isObject()) {
+        JsonNode direct = n.get(key);
+        if (direct != null) {
+          List<String> path = new ArrayList<String>(p);
+          path.add(key);
+          return new KeyHit("/" + joinSlash(path), direct);
         }
-        String[] parts = Arrays.stream(patternPath.split("/"))
-                .filter(s -> !s.isEmpty())
-                .toArray(String[]::new);
-
-        List<String> out = new ArrayList<>();
-        walkPattern(doc, parts, 0, new ArrayList<>(), out);
-        return out;
+        Iterator<String> it = n.fieldNames();
+        while (it.hasNext()) {
+          String k = it.next();
+          JsonNode child = n.get(k);
+          List<String> np = new ArrayList<String>(p);
+          np.add(k);
+          stack.push(new PathNode(child, np));
+        }
+      } else if (n.isArray()) {
+        for (int i = 0; i < n.size(); i++) {
+          JsonNode child = n.get(i);
+          List<String> np = new ArrayList<String>(p);
+          np.add(String.valueOf(i));
+          stack.push(new PathNode(child, np));
+        }
+      }
     }
+    return null;
+  }
 
-    private static void walkPattern(JsonNode node, String[] parts, int i, List<String> acc, List<String> out) {
-        if (i == parts.length) {
-            out.add("/" + String.join("/", acc));
-            return;
-        }
-        String part = parts[i];
+  // ---------------- OpenCSV helpers ----------------
 
-        if ("*".equals(part)) {
-            if (node != null && node.isArray()) {
-                for (int idx = 0; idx < node.size(); idx++) {
-                    JsonNode child = node.get(idx);
-                    List<String> next = new ArrayList<>(acc);
-                    next.add(String.valueOf(idx));
-                    walkPattern(child, parts, i + 1, next, out);
-                }
-            }
-            return;
-        }
-
-        if (node == null || node.isMissingNode() || node.isNull()) return;
-
-        if (node.isObject()) {
-            JsonNode child = node.get(part);
-            if (child != null) {
-                List<String> next = new ArrayList<>(acc);
-                next.add(part);
-                walkPattern(child, parts, i + 1, next, out);
-            }
-        } else if (node.isArray()) {
-            // allow numeric indices in a segment (rare, but safe)
-            try {
-                int idx = Integer.parseInt(part);
-                if (idx >= 0 && idx < node.size()) {
-                    JsonNode child = node.get(idx);
-                    List<String> next = new ArrayList<>(acc);
-                    next.add(part);
-                    walkPattern(child, parts, i + 1, next, out);
-                }
-            } catch (NumberFormatException ignore) { }
-        }
+  private static List<Map<String,String>> readTemplateCsv(String path) throws IOException {
+    InputStreamReader in = new InputStreamReader(new FileInputStream(path), StandardCharsets.UTF_8);
+    CSVReaderHeaderAware reader = new CSVReaderHeaderAware(in);
+    try {
+      List<Map<String,String>> rows = new ArrayList<Map<String,String>>();
+      Map<String,String> map;
+      while ((map = reader.readMap()) != null) {
+        rows.add(new LinkedHashMap<String, String>(map)); // preserve order
+      }
+      return rows;
+    } finally {
+      try { reader.close(); } catch (Exception ignore) {}
+      try { in.close(); } catch (Exception ignore) {}
     }
+  }
 
-    // DFS first match of a key anywhere; returns pointer + value
-    private static KeyHit findFirstByKey(JsonNode root, String key) {
-        Deque<PathNode> stack = new ArrayDeque<>();
-        stack.push(new PathNode(root, new ArrayList<>()));
+  private static void writeCsv(String path, List<String> header, List<Map<String,String>> rows) throws IOException {
+    File f = new File(path);
+    File parent = f.getParentFile();
+    if (parent != null) parent.mkdirs();
 
-        while (!stack.isEmpty()) {
-            PathNode cur = stack.pop();
-            JsonNode n = cur.node();
-            List<String> p = cur.path();
-
-            if (n == null || n.isMissingNode() || n.isNull()) continue;
-
-            if (n.isObject()) {
-                JsonNode direct = n.get(key);
-                if (direct != null) {
-                    List<String> path = new ArrayList<>(p);
-                    path.add(key);
-                    return new KeyHit("/" + String.join("/", path), direct);
-                }
-                Iterator<String> it = n.fieldNames();
-                while (it.hasNext()) {
-                    String k = it.next();
-                    JsonNode child = n.get(k);
-                    List<String> np = new ArrayList<>(p);
-                    np.add(k);
-                    stack.push(new PathNode(child, np));
-                }
-            } else if (n.isArray()) {
-                for (int i = 0; i < n.size(); i++) {
-                    JsonNode child = n.get(i);
-                    List<String> np = new ArrayList<>(p);
-                    np.add(String.valueOf(i));
-                    stack.push(new PathNode(child, np));
-                }
-            }
+    OutputStreamWriter w = new OutputStreamWriter(new FileOutputStream(f), StandardCharsets.UTF_8);
+    CSVWriter writer = new CSVWriter(w,
+        CSVWriter.DEFAULT_SEPARATOR,
+        CSVWriter.DEFAULT_QUOTE_CHARACTER,
+        CSVWriter.DEFAULT_ESCAPE_CHARACTER,
+        CSVWriter.DEFAULT_LINE_END);
+    try {
+      writer.writeNext(header.toArray(new String[header.size()]));
+      for (Map<String,String> row : rows) {
+        String[] rec = new String[header.size()];
+        for (int i = 0; i < header.size(); i++) {
+          String h = header.get(i);
+          String v = row.containsKey(h) ? row.get(h) : "";
+          rec[i] = (v == null) ? "" : v;
         }
-        return null;
+        writer.writeNext(rec, false);
+      }
+    } finally {
+      try { writer.close(); } catch (Exception ignore) {}
+      try { w.close(); } catch (Exception ignore) {}
     }
+  }
 
-    // ---------------- OpenCSV helpers ----------------
+  private static List<String> inferHeader(List<Map<String,String>> rows) {
+    if (rows.isEmpty()) return new ArrayList<String>();
+    return new ArrayList<String>(rows.get(0).keySet()); // keep CSV column order
+  }
 
-    private static List<Map<String,String>> readTemplateCsv(String path) throws IOException {
-        try (Reader in = new InputStreamReader(new FileInputStream(path), StandardCharsets.UTF_8)) {
-            CSVReaderHeaderAware reader = new CSVReaderHeaderAware(in);
-            List<Map<String,String>> rows = new ArrayList<>();
-            Map<String,String> map;
-            while ((map = reader.readMap()) != null) {
-                // CSVReaderHeaderAware returns a LinkedHashMap preserving column order
-                rows.add(new LinkedHashMap<>(map));
-            }
-            return rows;
-        }
+  // ---------------- utils (Java 8 safe) ----------------
+
+  private static Map<String,String> parseArgs(String[] args) {
+    Map<String,String> m = new HashMap<String,String>();
+    for (int i = 0; i < args.length - 1; i += 2) m.put(args[i], args[i+1]);
+    return m;
+  }
+
+  private static String required(Map<String,String> m, String key) {
+    String v = m.get(key);
+    if (v == null) throw new IllegalArgumentException("Missing argument: " + key);
+    return v;
+  }
+
+  private static boolean isEmpty(String s) { return s == null || s.trim().isEmpty(); }
+  private static String trim(String s) { return (s == null) ? "" : s.trim(); }
+
+  private static String[] splitAndKeepOrder(String patternPath) {
+    String[] raw = patternPath.split("/");
+    List<String> parts = new ArrayList<String>();
+    for (int i = 0; i < raw.length; i++) {
+      if (raw[i] != null && raw[i].length() > 0) parts.add(raw[i]);
     }
+    return parts.toArray(new String[parts.size()]);
+  }
 
-    private static void writeCsv(String path, List<String> header, List<Map<String,String>> rows) throws IOException {
-        File f = new File(path);
-        File parent = f.getParentFile();
-        if (parent != null) parent.mkdirs();
-
-        try (Writer w = new OutputStreamWriter(new FileOutputStream(f), StandardCharsets.UTF_8);
-             CSVWriter writer = new CSVWriter(w,
-                     CSVWriter.DEFAULT_SEPARATOR,
-                     CSVWriter.DEFAULT_QUOTE_CHARACTER,
-                     CSVWriter.DEFAULT_ESCAPE_CHARACTER,
-                     CSVWriter.DEFAULT_LINE_END)) {
-
-            writer.writeNext(header.toArray(new String[0]));
-
-            for (Map<String,String> row : rows) {
-                String[] rec = header.stream()
-                        .map(h -> row.getOrDefault(h, ""))
-                        .toArray(String[]::new);
-                writer.writeNext(rec, false);
-            }
-        }
+  private static String joinSlash(List<String> parts) {
+    StringBuilder sb = new StringBuilder();
+    for (int i = 0; i < parts.size(); i++) {
+      if (i > 0) sb.append("/");
+      sb.append(parts.get(i));
     }
-
-    private static List<String> inferHeader(List<Map<String,String>> rows) {
-        if (rows.isEmpty()) return new ArrayList<>();
-        // preserve CSV column order from first row map (LinkedHashMap by OpenCSV)
-        return new ArrayList<>(rows.get(0).keySet());
-        }
-
-    // ---------------- utils ----------------
-
-    private static Map<String,String> parseArgs(String[] args) {
-        Map<String,String> m = new HashMap<>();
-        for (int i = 0; i < args.length - 1; i += 2) {
-            m.put(args[i], args[i+1]);
-        }
-        return m;
-    }
-
-    private static String required(Map<String,String> m, String key) {
-        String v = m.get(key);
-        if (v == null) throw new IllegalArgumentException("Missing argument: " + key);
-        return v;
-    }
-
-    private static boolean isEmpty(String s) { return s == null || s.isBlank(); }
-    private static String trim(String s) { return s == null ? "" : s.trim(); }
-
-    private record KeyHit(String pointer, JsonNode value) {}
-    private record PathNode(JsonNode node, List<String> path) {}
+    return sb.toString();
+  }
 }
