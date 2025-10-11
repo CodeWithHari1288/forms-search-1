@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+# JSON → CSV with template Prop matching (arrays, dicts, scalars)
+# - Template columns: Prop, question_id, question_label, section, sub_section, question_context, repeatable
+# - Match rule: ONLY Prop vs JSON key (trimmed; case-insensitive by default)
+# - Input: single JSON object or root array of objects
+# - Output: write CSV(s) into an output folder
+#
+# Usage:
+#   python json_to_csv_prop_template.py --json input.json --template template.csv --out_dir out_folder
+# Optional flags:
+#   --case_insensitive true|false   (default true)
+#   --trim true|false               (default true)
+
+import json, csv, sys, os
+from typing import Any, List, Dict, Tuple
+
+# ---------- RFC6901 helpers ----------
+def esc_token(s: str) -> str:
+    return s.replace("~", "~0").replace("/", "~1")
+
+def pointer_from(path: List[str]) -> str:
+    return "/" + "/".join(esc_token(p) for p in path)
+
+# ---------- path helpers ----------
+def index_path(path: List[str]) -> str:
+    # ["form","applicants","0","address","1","city"] -> "applicants=0>address=1"
+    parts = []
+    for i, seg in enumerate(path):
+        if seg.isdigit():
+            parent = path[i-1] if i > 0 else ""
+            parts.append((parent + "=" + seg) if parent else seg)
+    return ">".join(parts)
+
+def array_indexes(path: List[str]) -> str:
+    return ",".join(seg for seg in path if seg.isdigit())
+
+# ---------- walk JSON: emit EVERY dict key; recurse into lists/objects ----------
+def walk_json(doc: Any, base: List[str]=[]):
+    if isinstance(doc, dict):
+        for k, v in doc.items():
+            path = base + [str(k)]
+            yield path, v               # a key we can match by Prop
+            for p, v2 in walk_json(v, path):
+                yield p, v2
+    elif isinstance(doc, list):
+        for i, v in enumerate(doc):
+            for p, v2 in walk_json(v, base + [str(i)]):
+                yield p, v2
+    else:
+        return
+
+# ---------- template loading ----------
+TEMPLATE_COLS = ["Prop","question_id","question_label","section","sub_section","question_context","repeatable"]
+
+def load_template(path: str, trim=True, case_insensitive=True) -> Tuple[List[Dict[str,str]], List[str]]:
+    rows: List[Dict[str,str]] = []
+    with open(path, newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        hdrs = r.fieldnames or TEMPLATE_COLS
+        for row in r:
+            prop_raw = row.get("Prop", "")
+            prop = prop_raw.strip() if trim else prop_raw
+            prop_norm = prop.lower() if case_insensitive else prop
+            row["_prop_norm"] = prop_norm
+            rows.append(row)
+    print(f"[INFO] Loaded {len(rows)} template rows from {path}")
+    return rows, hdrs
+
+# ---------- Prop vs key comparison ----------
+def keys_equal(tpl_prop_norm: str, json_key: str, trim=True, case_insensitive=True) -> bool:
+    key = json_key.strip() if trim else json_key
+    key_norm = key.lower() if case_insensitive else key
+    return key_norm == tpl_prop_norm
+
+# ---------- transform one JSON object ----------
+def rows_for_doc(doc: Any, template_csv: str, trim=True, case_insensitive=True) -> Tuple[List[str], List[Dict[str,str]]]:
+    tpl_rows, tpl_hdrs = load_template(template_csv, trim, case_insensitive)
+
+    # output header = template headers + our extras
+    header = list(tpl_hdrs)
+    for extra in ["value","json_pointer","array_indexes","index_path"]:
+        if extra not in header:
+            header.append(extra)
+
+    all_nodes = list(walk_json(doc))
+    print(f"[INFO] Keys discovered in JSON object: {len(all_nodes)} (key occurrences)")
+
+    # preview a few keys
+    for i, (p, v) in enumerate(all_nodes[:10]):
+        print(f"   [DEBUG] path[{i}]: {pointer_from(p)} → {type(v).__name__}")
+
+    out_rows: List[Dict[str,str]] = []
+    for tpl in tpl_rows:
+        prop_norm = tpl["_prop_norm"]
+        found = False
+        print(f"\n[CHECK] Template Prop='{tpl.get('Prop')}' normalized='{prop_norm}'")
+
+        for path, value in all_nodes:
+            json_key = path[-1] if path else ""
+            if not keys_equal(prop_norm, json_key, trim, case_insensitive):
+                continue
+
+            found = True
+            jp = pointer_from(path)
+            print(f"   [MATCH] key='{json_key}' pointer={jp} value_type={type(value).__name__}")
+
+            if isinstance(value, list):
+                if not value:
+                    row = dict(tpl)
+                    row["value"] = "[]"
+                    row["json_pointer"] = jp
+                    row["array_indexes"] = array_indexes(path)
+                    row["index_path"] = index_path(path)
+                    out_rows.append(row)
+                else:
+                    for i, elem in enumerate(value):
+                        elem_path = path + [str(i)]
+                        row = dict(tpl)
+                        row["json_pointer"] = pointer_from(elem_path)
+                        row["array_indexes"] = array_indexes(elem_path)
+                        row["index_path"] = index_path(elem_path)
+                        row["value"] = elem if isinstance(elem, (str,int,float,bool)) or elem is None \
+                                       else json.dumps(elem, ensure_ascii=False)
+                        out_rows.append(row)
+                        print(f"      [ELEM] {row['json_pointer']} → {repr(row['value'])}")
+            else:
+                row = dict(tpl)
+                row["json_pointer"] = jp
+                row["array_indexes"] = array_indexes(path)
+                row["index_path"] = index_path(path)
+                row["value"] = value if isinstance(value, (str,int,float,bool)) or value is None \
+                               else json.dumps(value, ensure_ascii=False)
+                out_rows.append(row)
+                print(f"      [SCALAR/DICT] {row['json_pointer']} → {repr(row['value'])}")
+
+        if not found:
+            print(f"   [MISS] No match for Prop='{tpl.get('Prop')}'")
+            row = dict(tpl)
+            row["value"] = ""
+            row["json_pointer"] = ""
+            row["array_indexes"] = ""
+            row["index_path"] = ""
+            out_rows.append(row)
+
+    return header, out_rows
+
+# ---------- CSV writer ----------
+def write_csv(path: str, header: List[str], rows: List[Dict[str,str]]):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+    print(f"[INFO] Wrote {len(rows)} rows to {path}")
+
+# ---------- CLI ----------
+def main(argv):
+    # flags:
+    #   --json <file>
+    #   --template <template.csv>
+    #   --out_dir <folder>
+    #   --case_insensitive true|false   (default true)
+    #   --trim true|false               (default true)
+    args = {}
+    i = 0
+    while i < len(argv):
+        if argv[i].startswith("--"):
+            k = argv[i]; v = None
+            if i + 1 < len(argv) and not argv[i+1].startswith("--"):
+                v = argv[i+1]; i += 1
+            args[k] = v
+        i += 1
+
+    in_json   = args.get("--json")
+    template  = args.get("--template")
+    out_dir   = args.get("--out_dir")
+    ci_flag   = args.get("--case_insensitive","true").lower() != "false"
+    trim_flag = args.get("--trim","true").lower() != "false"
+
+    if not in_json or not template or not out_dir:
+        sys.exit("Usage: --json <file.json> --template <template.csv> --out_dir <folder> [--case_insensitive true|false] [--trim true|false]")
+
+    with open(in_json, "r", encoding="utf-8") as f:
+        root = json.load(f)
+
+    os.makedirs(out_dir, exist_ok=True)
+    base = os.path.splitext(os.path.basename(in_json))[0]
+
+    if isinstance(root, list):
+        print(f"[INFO] Root is an array with {len(root)} elements. Writing multiple CSVs to {out_dir}")
+        for idx, elem in enumerate(root):
+            header, rows = rows_for_doc(elem, template, trim_flag, ci_flag)
+            out_path = os.path.join(out_dir, f"{base}_{idx}.csv")
+            write_csv(out_path, header, rows)
+    else:
+        header, rows = rows_for_doc(root, template, trim_flag, ci_flag)
+        out_path = os.path.join(out_dir, f"{base}.csv")
+        write_csv(out_path, header, rows)
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
