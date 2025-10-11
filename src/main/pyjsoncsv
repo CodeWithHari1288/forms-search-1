@@ -1,12 +1,26 @@
 #!/usr/bin/env python3
 # JSON → CSV with template Prop matching (arrays, dicts, scalars)
-# Debug version: no id_pointer, added print logs for visibility
+# Debug version (no id_pointer). Supports:
+#  • Single JSON object  → one CSV
+#  • JSON whose root is an array → multiple CSVs (…_0.csv, …_1.csv, …)
+#  • Optional --out_dir to place array outputs into a folder
 #
 # Template headers expected:
 #   Prop, question_id, question_label, section, sub_section, question_context, repeatable
 #
 # Usage:
+#   # Single JSON object:
 #   python json_to_csv_prop_template_debug.py --json input.json --template template.csv --out output.csv
+#
+#   # Root array in a single file (creates output_0.csv, output_1.csv, … in same folder):
+#   python json_to_csv_prop_template_debug.py --json inputs.json --template template.csv --out output.csv
+#
+#   # Root array + write to a directory:
+#   python json_to_csv_prop_template_debug.py --json inputs.json --template template.csv --out_dir outdir
+#
+# Flags:
+#   --case_insensitive true|false   (default true)
+#   --trim true|false               (default true)
 
 import json, csv, sys, os
 from typing import Any, List, Dict, Tuple
@@ -29,12 +43,12 @@ def index_path(path: List[str]) -> str:
 def array_indexes(path: List[str]) -> str:
     return ",".join(seg for seg in path if seg.isdigit())
 
-# ---------- walk JSON ----------
-def walk_json(doc: Any, base: List[str]=[]) -> List[Tuple[List[str], Any]]:
+# ---------- walk JSON (emit every dict key; recurse into lists/objects) ----------
+def walk_json(doc: Any, base: List[str]=[]):
     if isinstance(doc, dict):
         for k, v in doc.items():
             path = base + [str(k)]
-            yield path, v
+            yield path, v               # every key is a potential match
             for p, v2 in walk_json(v, path):
                 yield p, v2
     elif isinstance(doc, list):
@@ -45,11 +59,13 @@ def walk_json(doc: Any, base: List[str]=[]) -> List[Tuple[List[str], Any]]:
         return
 
 # ---------- template loading ----------
+TEMPLATE_COLS = ["Prop","question_id","question_label","section","sub_section","question_context","repeatable"]
+
 def load_template(path: str, trim=True, case_insensitive=True) -> Tuple[List[Dict[str,str]], List[str]]:
     rows = []
     with open(path, newline="", encoding="utf-8") as f:
         r = csv.DictReader(f)
-        hdrs = r.fieldnames or []
+        hdrs = r.fieldnames or TEMPLATE_COLS
         for row in r:
             prop_raw = row.get("Prop", "")
             prop = prop_raw.strip() if trim else prop_raw
@@ -60,12 +76,12 @@ def load_template(path: str, trim=True, case_insensitive=True) -> Tuple[List[Dic
     return rows, hdrs
 
 # ---------- property matching ----------
-def keys_equal(tpl_prop: str, json_key: str, trim=True, case_insensitive=True) -> bool:
+def keys_equal(tpl_prop_norm: str, json_key: str, trim=True, case_insensitive=True) -> bool:
     key = json_key.strip() if trim else json_key
     key_norm = key.lower() if case_insensitive else key
-    return key_norm == tpl_prop
+    return key_norm == tpl_prop_norm
 
-# ---------- build rows ----------
+# ---------- build rows for ONE JSON object ----------
 def rows_for_doc(doc: Any, template_csv: str, trim=True, case_insensitive=True):
     tpl_rows, tpl_hdrs = load_template(template_csv, trim, case_insensitive)
 
@@ -75,9 +91,8 @@ def rows_for_doc(doc: Any, template_csv: str, trim=True, case_insensitive=True):
             header.append(extra)
 
     all_nodes = list(walk_json(doc))
-    print(f"[INFO] Total keys discovered in JSON: {len(all_nodes)}")
-
-    for i, (p, v) in enumerate(all_nodes[:10]):  # sample first 10 keys
+    print(f"[INFO] Total keys discovered in JSON object: {len(all_nodes)}")
+    for i, (p, v) in enumerate(all_nodes[:10]):  # preview first 10
         print(f"   [DEBUG] JSON key path {i}: {pointer_from(p)} → {type(v).__name__}")
 
     out_rows = []
@@ -92,11 +107,11 @@ def rows_for_doc(doc: Any, template_csv: str, trim=True, case_insensitive=True):
                 continue
 
             found = True
-            print(f"   [MATCH] JSON key='{json_key}' pointer={pointer_from(path)} value={repr(value)}")
+            print(f"   [MATCH] key='{json_key}' pointer={pointer_from(path)} value_type={type(value).__name__}")
 
-            # handle arrays
             if isinstance(value, list):
                 if not value:
+                    # emit one empty-array row at the key
                     row = dict(tpl)
                     row["value"] = "[]"
                     row["json_pointer"] = pointer_from(path)
@@ -110,18 +125,22 @@ def rows_for_doc(doc: Any, template_csv: str, trim=True, case_insensitive=True):
                         row["json_pointer"] = pointer_from(elem_path)
                         row["array_indexes"] = array_indexes(elem_path)
                         row["index_path"] = index_path(elem_path)
-                        row["value"] = elem if isinstance(elem, (str, int, float, bool)) or elem is None else json.dumps(elem, ensure_ascii=False)
+                        row["value"] = elem if isinstance(elem, (str, int, float, bool)) or elem is None \
+                                       else json.dumps(elem, ensure_ascii=False)
                         out_rows.append(row)
+                        print(f"      [ELEM] {row['json_pointer']} → {repr(row['value'])}")
             else:
                 row = dict(tpl)
                 row["json_pointer"] = pointer_from(path)
                 row["array_indexes"] = array_indexes(path)
                 row["index_path"] = index_path(path)
-                row["value"] = value if isinstance(value, (str, int, float, bool)) or value is None else json.dumps(value, ensure_ascii=False)
+                row["value"] = value if isinstance(value, (str, int, float, bool)) or value is None \
+                               else json.dumps(value, ensure_ascii=False)
                 out_rows.append(row)
+                print(f"      [SCALAR/DICT] {row['json_pointer']} → {repr(row['value'])}")
 
         if not found:
-            print(f"   [MISS] No match found for Prop='{tpl.get('Prop')}'")
+            print(f"   [MISS] No match for Prop='{tpl.get('Prop')}'")
             row = dict(tpl)
             row["value"] = ""
             row["json_pointer"] = ""
@@ -143,30 +162,62 @@ def write_csv(path: str, header: List[str], rows: List[Dict[str,str]]):
 
 # ---------- CLI ----------
 def main(argv):
+    # flags:
+    #   --json <file>
+    #   --template <template.csv>
+    #   --out <file.csv>      (single object OR base name for root array files)
+    #   --out_dir <dir>       (optional; for root array, place files here)
+    #   --case_insensitive true|false  (default true)
+    #   --trim true|false               (default true)
     args = {}
     i = 0
     while i < len(argv):
         if argv[i].startswith("--"):
-            k = argv[i]
-            v = None
+            k = argv[i]; v = None
             if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
-                v = argv[i + 1]
-                i += 1
+                v = argv[i + 1]; i += 1
             args[k] = v
         i += 1
 
-    in_path = args.get("--json")
-    template = args.get("--template")
-    out_csv = args.get("--out")
-    ci_flag = args.get("--case_insensitive", "true").lower() != "false"
+    in_path   = args.get("--json")
+    template  = args.get("--template")
+    out_csv   = args.get("--out")
+    out_dir   = args.get("--out_dir")
+    ci_flag   = args.get("--case_insensitive", "true").lower() != "false"
     trim_flag = args.get("--trim", "true").lower() != "false"
 
-    if not in_path or not template or not out_csv:
-        sys.exit("Usage: --json <file> --template <template.csv> --out <output.csv> [--case_insensitive true|false] [--trim true|false]")
+    if not in_path or not template or (not out_csv and not out_dir):
+        sys.exit("Usage:\n  --json <file> --template <template.csv> (--out <file.csv> | --out_dir <dir>) [--case_insensitive true|false] [--trim true|false]")
 
+    # Load the input JSON (file only; if you need directory batching, say the word)
     with open(in_path, "r", encoding="utf-8") as f:
         doc = json.load(f)
 
+    # If root is an array: write multiple CSVs
+    if isinstance(doc, list):
+        # Decide base dir + base filename
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+            base_dir = out_dir
+            base_fn = os.path.splitext(os.path.basename(out_csv or "out.csv"))[0] if out_csv else "out"
+        else:
+            # derive from --out path
+            if not out_csv:
+                sys.exit("Root array: provide --out <base.csv> or --out_dir <dir>.")
+            base_dir = os.path.dirname(out_csv) or "."
+            os.makedirs(base_dir, exist_ok=True)
+            base_fn = os.path.splitext(os.path.basename(out_csv))[0]
+
+        print(f"[INFO] Root array detected with {len(doc)} elements. Writing multiple CSVs.")
+        for idx, elem in enumerate(doc):
+            header, rows = rows_for_doc(elem, template, trim_flag, ci_flag)
+            out_path = os.path.join(base_dir, f"{base_fn}_{idx}.csv")
+            write_csv(out_path, header, rows)
+        return
+
+    # Single object → single CSV (requires --out)
+    if not out_csv:
+        sys.exit("Provide --out <file.csv> for a single JSON object.")
     header, rows = rows_for_doc(doc, template, trim_flag, ci_flag)
     write_csv(out_csv, header, rows)
 
