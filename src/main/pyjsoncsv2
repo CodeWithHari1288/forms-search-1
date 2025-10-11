@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+# JSON→CSV with RFC 6901 pointers + template join
+# RFC 6901: https://datatracker.ietf.org/doc/html/rfc6901
+# python-json-pointer docs: https://python-json-pointer.readthedocs.io/
+# ijson (streaming, optional): https://pypi.org/project/ijson/
+
+import json, csv, sys
+from typing import Any, List, Dict
+
+def esc_token(s: str) -> str:               # RFC 6901 escaping
+    return s.replace("~", "~0").replace("/", "~1")
+
+def walk(doc: Any, base: List[str] = []):
+    if isinstance(doc, dict):
+        for k, v in doc.items():
+            yield from walk(v, base + [k])
+    elif isinstance(doc, list):
+        for i, v in enumerate(doc):
+            yield from walk(v, base + [str(i)])
+    else:
+        yield base, doc                     # scalar
+
+def load_template(path: str) -> Dict[str, Dict[str,str]]:
+    """
+    Template CSV must have at least: pointer,label,section,subsection
+    pointer must be RFC 6901 (same as we emit here)
+    """
+    m = {}
+    with open(path, newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            m[row["pointer"]] = row
+    return m
+
+def main(in_json: str, out_csv: str, template_csv: str | None):
+    template = load_template(template_csv) if template_csv else {}
+
+    with open(in_json, "r", encoding="utf-8") as f:
+        doc = json.load(f)
+
+    cols = ["Label","propertyname","repeatable","array/listindex",
+            "property value","section","subsection","pointerforjson"]
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+
+        for path, val in walk(doc):
+            ptr = "/" + "/".join(esc_token(p) for p in path)
+            idxs = [int(p) for p in path if p.isdigit()]
+            propname = next((p for p in reversed(path) if not p.isdigit()), "")
+
+            t = template.get(ptr, {})
+            w.writerow({
+                "Label": t.get("label",""),
+                "propertyname": propname,
+                "repeatable": bool(idxs),
+                "array/listindex": idxs[0] if idxs else "",
+                "property value": val,
+                "section": t.get("section",""),
+                "subsection": t.get("subsection",""),
+                "pointerforjson": ptr
+            })
+
+if __name__ == "__main__":
+    # Usage: python json_to_csv.py input.json out.csv template.csv
+    in_json   = sys.argv[1]
+    out_csv   = sys.argv[2] if len(sys.argv)>2 else "out.csv"
+    template  = sys.argv[3] if len(sys.argv)>3 else None
+    main(in_json, out_csv, template)
