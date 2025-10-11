@@ -1,0 +1,375 @@
+package forms.catalog;
+
+import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.MissingNode;
+import com.fasterxml.jackson.core.JsonPointer;
+import org.apache.commons.csv.CSVFormat;
+import org.apache.commons.csv.CSVPrinter;
+import org.apache.commons.csv.CSVParser;
+import org.apache.commons.csv.CSVRecord;
+
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.stream.Collectors;
+
+/**
+ * Given a JSON document and a "template" CSV that includes columns like:
+ *   form_id, section, subsection, label, aliases, json_property_name,
+ *   pointer, pattern_path, datatype, unit, enum_labels, status,
+ *   version_id, version_ts, row_id, lang
+ *
+ * Produce an output CSV that preserves all template columns and adds:
+ *   - value : extracted from JSON (stringified)
+ *   - found : "1" if found, "0" otherwise
+ *
+ * Priority per row:
+ * 1) pointer (exact)                       -> single row
+ * 2) pattern_path with '*' (one wildcard)  -> expands to multiple rows
+ * 3) pattern_path without '*'              -> single row
+ * 4) json_property_name (first hit)        -> single row
+ * else -> found=0
+ */
+public class JsonToCsvByTemplate {
+
+    private static final ObjectMapper MAPPER = new ObjectMapper(new JsonFactory());
+
+    public static void main(String[] args) throws Exception {
+        // Simple CLI
+        Map<String, String> arg = parseArgs(args);
+        String jsonPath      = req(arg, "--json");
+        String templateCsv   = req(arg, "--template_csv");
+        String outCsv        = req(arg, "--out_csv");
+
+        JsonNode doc = readJson(jsonPath);
+        List<Map<String,String>> templateRows = readCsv(templateCsv);
+
+        // Preserve template header + add "value" & "found"
+        List<String> header = new ArrayList<>(inferHeader(templateRows));
+        if (!header.contains("value")) header.add("value");
+        if (!header.contains("found")) header.add("found");
+
+        List<Map<String,String>> filled = processRows(doc, templateRows);
+
+        writeCsv(outCsv, header, filled);
+        System.out.println("Wrote " + filled.size() + " rows -> " + outCsv);
+    }
+
+    // ---------- Core processing ----------
+
+    private static List<Map<String,String>> processRows(JsonNode doc, List<Map<String,String>> templateRows) {
+        List<Map<String,String>> out = new ArrayList<>();
+
+        for (Map<String,String> row : templateRows) {
+            // Copy to keep original columns intact
+            Map<String,String> base = new LinkedHashMap<>(row);
+
+            String pointer = trim(row.get("pointer"));
+            String pattern = trim(row.get("pattern_path"));
+            String jsonProp= trim(row.get("json_property_name"));
+
+            // 1) pointer (exact)
+            if (!isEmpty(pointer) && !pointer.contains("*")) {
+                JsonNode val = atPointer(doc, pointer);
+                boolean found = !isMissing(val);
+                base.put("value", stringify(val));
+                base.put("found", found ? "1" : "0");
+                out.add(base);
+                continue;
+            }
+
+            // 2) pattern_path with '*'
+            if (!isEmpty(pattern) && pattern.contains("*")) {
+                List<String> concretePtrs = expandPattern(doc, pattern);
+                if (concretePtrs.isEmpty()) {
+                    Map<String,String> nf = new LinkedHashMap<>(base);
+                    nf.put("value", "");
+                    nf.put("found", "0");
+                    out.add(nf);
+                } else {
+                    for (String cptr : concretePtrs) {
+                        Map<String,String> r = new LinkedHashMap<>(base);
+                        JsonNode val = atPointer(doc, cptr);
+                        boolean found = !isMissing(val);
+                        r.put("pointer", cptr);
+                        // try to populate row_id from parent if available
+                        if (isEmpty(r.get("row_id"))) {
+                            String rid = extractRowIdFromParent(doc, cptr);
+                            if (rid != null) r.put("row_id", rid);
+                        }
+                        r.put("value", stringify(val));
+                        r.put("found", found ? "1" : "0");
+                        out.add(r);
+                    }
+                }
+                continue;
+            }
+
+            // 3) pattern_path without '*'
+            if (!isEmpty(pattern)) {
+                JsonNode val = atPointer(doc, pattern);
+                boolean found = !isMissing(val);
+                base.put("pointer", pattern);
+                base.put("value", stringify(val));
+                base.put("found", found ? "1" : "0");
+                out.add(base);
+                continue;
+            }
+
+            // 4) json_property_name (first match anywhere)
+            if (!isEmpty(jsonProp)) {
+                KeyHit hit = findFirstByKey(doc, jsonProp);
+                if (hit != null) {
+                    base.put("pointer", hit.pointer());
+                    base.put("value", stringify(hit.value()));
+                    base.put("found", "1");
+                    out.add(base);
+                    continue;
+                }
+            }
+
+            // 5) nothing matched
+            base.put("value", "");
+            base.put("found", "0");
+            out.add(base);
+        }
+
+        return out;
+    }
+
+    // ---------- JSON helpers ----------
+
+    private static JsonNode readJson(String path) throws IOException {
+        try (InputStream in = new FileInputStream(path)) {
+            return MAPPER.readTree(in);
+        }
+    }
+
+    private static JsonNode atPointer(JsonNode doc, String pointer) {
+        try {
+            JsonPointer jp = JsonPointer.compile(pointer);
+            JsonNode node = doc.at(jp);
+            return node == null ? MissingNode.getInstance() : node;
+        } catch (IllegalArgumentException e) {
+            return MissingNode.getInstance();
+        }
+    }
+
+    private static boolean isMissing(JsonNode n) {
+        return n == null || n.isMissingNode() || n.isNull();
+    }
+
+    private static String stringify(JsonNode n) {
+        if (isMissing(n)) return "";
+        if (n.isValueNode()) {
+            // scalar → use asText() (keeps numbers/bools human-friendly)
+            return n.asText();
+        }
+        // objects/arrays → JSON string
+        try {
+            return MAPPER.writeValueAsString(n);
+        } catch (Exception e) {
+            return n.toString();
+        }
+    }
+
+    private static String parentPointerOf(String ptr) {
+        if (ptr == null || ptr.isEmpty() || ptr.equals("/")) return null;
+        int lastSlash = ptr.lastIndexOf('/');
+        if (lastSlash <= 0) return "/";
+        return ptr.substring(0, lastSlash);
+    }
+
+    private static String extractRowIdFromParent(JsonNode doc, String concretePtr) {
+        String parentPtr = parentPointerOf(concretePtr);
+        if (parentPtr == null) return null;
+        JsonNode parent = atPointer(doc, parentPtr);
+        if (parent != null && parent.isObject()) {
+            JsonNode rid = parent.get("row_id");
+            if (rid != null && (rid.isTextual() || rid.isNumber())) {
+                return rid.asText();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Expand a pattern path with a single '*' wildcard inside an array segment.
+     * Example: /applicant/address/*/postcode
+     * Returns concrete pointers like /applicant/address/0/postcode, ...
+     */
+    private static List<String> expandPattern(JsonNode doc, String patternPath) {
+        if (isEmpty(patternPath) || !patternPath.contains("*")) return List.of(patternPath);
+
+        // split path into parts, ignoring leading slash
+        String[] rawParts = Arrays.stream(patternPath.split("/"))
+                .filter(s -> !s.isEmpty())
+                .toArray(String[]::new);
+
+        List<String> out = new ArrayList<>();
+
+        walkPattern(doc, rawParts, 0, new ArrayList<>(), out);
+        return out;
+    }
+
+    private static void walkPattern(JsonNode node, String[] parts, int i, List<String> acc, List<String> out) {
+        if (i == parts.length) {
+            out.add("/" + String.join("/", acc));
+            return;
+        }
+        String part = parts[i];
+
+        if ("*".equals(part)) {
+            if (node != null && node.isArray()) {
+                for (int idx = 0; idx < node.size(); idx++) {
+                    JsonNode child = node.get(idx);
+                    List<String> next = new ArrayList<>(acc);
+                    next.add(String.valueOf(idx));
+                    walkPattern(child, parts, i + 1, next, out);
+                }
+            }
+            return;
+        }
+
+        // Normal step: object key or array index
+        if (node == null || node.isMissingNode() || node.isNull()) return;
+
+        if (node.isObject()) {
+            JsonNode child = node.get(part);
+            if (child != null) {
+                List<String> next = new ArrayList<>(acc);
+                next.add(part);
+                walkPattern(child, parts, i + 1, next, out);
+            }
+        } else if (node.isArray()) {
+            try {
+                int idx = Integer.parseInt(part);
+                if (idx >= 0 && idx < node.size()) {
+                    JsonNode child = node.get(idx);
+                    List<String> next = new ArrayList<>(acc);
+                    next.add(part);
+                    walkPattern(child, parts, i + 1, next, out);
+                }
+            } catch (NumberFormatException ignore) { /* not an index */ }
+        }
+    }
+
+    // DFS search for first occurrence of key; returns pointer + value
+    private static KeyHit findFirstByKey(JsonNode root, String key) {
+        Deque<PathNode> stack = new ArrayDeque<>();
+        stack.push(new PathNode(root, new ArrayList<>()));
+
+        while (!stack.isEmpty()) {
+            PathNode cur = stack.pop();
+            JsonNode n = cur.node();
+            List<String> path = cur.path();
+
+            if (n == null || n.isMissingNode() || n.isNull()) continue;
+
+            if (n.isObject()) {
+                // direct hit?
+                JsonNode direct = n.get(key);
+                if (direct != null) {
+                    List<String> p = new ArrayList<>(path);
+                    p.add(key);
+                    return new KeyHit("/" + String.join("/", p), direct);
+                }
+                // traverse children
+                Iterator<String> it = n.fieldNames();
+                while (it.hasNext()) {
+                    String k = it.next();
+                    JsonNode child = n.get(k);
+                    List<String> nextPath = new ArrayList<>(path);
+                    nextPath.add(k);
+                    stack.push(new PathNode(child, nextPath));
+                }
+            } else if (n.isArray()) {
+                for (int i = 0; i < n.size(); i++) {
+                    JsonNode child = n.get(i);
+                    List<String> nextPath = new ArrayList<>(path);
+                    nextPath.add(String.valueOf(i));
+                    stack.push(new PathNode(child, nextPath));
+                }
+            }
+        }
+        return null;
+    }
+
+    // ---------- CSV helpers ----------
+
+    private static List<Map<String,String>> readCsv(String path) throws IOException {
+        try (Reader in = new InputStreamReader(new FileInputStream(path), StandardCharsets.UTF_8)) {
+            CSVParser parser = CSVFormat.DEFAULT
+                    .builder()
+                    .setHeader()
+                    .setSkipHeaderRecord(true)
+                    .build()
+                    .parse(in);
+            List<String> header = parser.getHeaderNames();
+
+            List<Map<String,String>> rows = new ArrayList<>();
+            for (CSVRecord rec : parser) {
+                Map<String,String> m = new LinkedHashMap<>();
+                for (String h : header) {
+                    m.put(h, rec.get(h));
+                }
+                rows.add(m);
+            }
+            return rows;
+        }
+    }
+
+    private static void writeCsv(String path, List<String> header, List<Map<String,String>> rows) throws IOException {
+        File outFile = new File(path);
+        File parent = outFile.getParentFile();
+        if (parent != null) parent.mkdirs();
+
+        try (Writer w = new OutputStreamWriter(new FileOutputStream(outFile), StandardCharsets.UTF_8);
+             CSVPrinter p = new CSVPrinter(w, CSVFormat.DEFAULT.builder()
+                     .setHeader(header.toArray(new String[0]))
+                     .build())) {
+            for (Map<String,String> row : rows) {
+                List<String> rec = header.stream()
+                        .map(h -> row.getOrDefault(h, ""))
+                        .collect(Collectors.toList());
+                p.printRecord(rec);
+            }
+        }
+    }
+
+    private static List<String> inferHeader(List<Map<String,String>> rows) {
+        if (rows.isEmpty()) return List.of();
+        return new ArrayList<>(rows.get(0).keySet());
+    }
+
+    // ---------- Utils ----------
+
+    private static Map<String, String> parseArgs(String[] args) {
+        Map<String, String> m = new HashMap<>();
+        for (int i = 0; i < args.length - 1; i += 2) {
+            m.put(args[i], args[i + 1]);
+        }
+        return m;
+    }
+
+    private static String req(Map<String, String> m, String key) {
+        String v = m.get(key);
+        if (v == null) throw new IllegalArgumentException("Missing argument: " + key);
+        return v;
+    }
+
+    private static boolean isEmpty(String s) {
+        return s == null || s.isBlank();
+    }
+
+    private static String trim(String s) {
+        return s == null ? "" : s.trim();
+    }
+
+    // ---------- small records ----------
+
+    private record KeyHit(String pointer, JsonNode value) { }
+    private record PathNode(JsonNode node, List<String> path) { }
+}
