@@ -200,3 +200,39 @@ def main(argv):
 
 if __name__ == "__main__":
     main(sys.argv[1:])
+
+
+
+
+
+
+
+
+def find_notesid(doc):
+    """Recursively search for a key named 'notesid' in JSON and return its value (first match)."""
+    if isinstance(doc, dict):
+        for k, v in doc.items():
+            if k.lower().strip() == "notesid":
+                return v
+            res = find_notesid(v)
+            if res is not None:
+                return res
+    elif isinstance(doc, list):
+        for i in doc:
+            res = find_notesid(i)
+            if res is not None:
+                return res
+    return None
+
+
+
+
+
+
+def make_out_name(obj, base: str, idx: int | None):
+    v = find_notesid(obj)
+    if isinstance(v, (str, int, float)) and str(v).strip():
+        sid = sanitize_filename(v)
+        return f"{base}_{sid}.csv"
+    return f"{base}_{idx}.csv" if idx is not None else f"{base}.csv"
+
