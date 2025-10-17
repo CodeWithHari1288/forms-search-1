@@ -101,3 +101,280 @@ def query(prompt: str, top_k: int = 5, pool: int = 50):
         include=["ids","documents","metadatas","distances"]
     )
     # ...format hits as before...
+
+
+
+
+
+
+
+
+
+
+
+
+
+#!/usr/bin/env python3
+"""
+Chroma + Ollama bge-m3 (no FlagEmbedding) with RRF fusion.
+
+CSV schema expected: question_id, question_label, prop, value
+
+Ingest:
+- Builds a compact document string containing question_label & value (plus id/prop)
+- Embeds via Ollama /api/embed (bge-m3)
+- Stores in Chroma with metadata
+
+Query:
+- Extracts optional ID from prompt -> where={"question_id": <ID>}
+- Builds where_document (substring filters) from dates/numbers/quoted phrases/long tokens/keywords
+- Runs two searches: (A) plain dense, (B) filtered dense
+- Fuses IDs with RRF and returns top-k
+"""
+
+import os, csv, re, time, argparse, requests
+from typing import List, Dict, Any, Iterable, Optional
+import chromadb
+
+# ---------------- Config ----------------
+CHROMA_DIR    = "./chroma_qna"
+COLLECTION    = "qna"
+OLLAMA_URL    = os.getenv("OLLAMA_URL", "http://localhost:11434/api/embed")
+OLLAMA_MODEL  = os.getenv("OLLAMA_MODEL", "bge-m3")
+
+# CSV columns
+QID_COL    = "question_id"
+LABEL_COL  = "question_label"
+PROP_COL   = "prop"
+VALUE_COL  = "value"
+
+# Batch sizes (tune to avoid timeouts)
+EMBED_BATCH = 128
+ADD_BATCH   = 256
+
+# ---------------- Helpers ----------------
+ID_TOKEN   = re.compile(r"\b[qQ][-_]?\d{2,}\b|[A-Za-z]{1,3}[-_]?\d{3,}", re.IGNORECASE)
+DATE_RE    = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")     # 2025-10-01
+NUMBER_RE  = re.compile(r"\b\d[\d,.\-/]*\b")
+QUOTED_RE  = re.compile(r"\"([^\"]+)\"|'([^']+)'")
+
+def chunked(lst: List[Any], n: int) -> Iterable[List[Any]]:
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
+
+def embed_ollama(texts: List[str]) -> List[List[float]]:
+    """Get dense embeddings from local Ollama."""
+    resp = requests.post(OLLAMA_URL, json={"model": OLLAMA_MODEL, "input": texts}, timeout=300)
+    resp.raise_for_status()
+    return resp.json()["embeddings"]
+
+def ensure_collection():
+    client = chromadb.PersistentClient(path=CHROMA_DIR)
+    return client.get_or_create_collection(COLLECTION, metadata={"hnsw:space": "cosine"})
+
+def row_to_text(row: Dict[str, str]) -> str:
+    """
+    Make sure question_label and value are inside the doc text so where_document can match them.
+    """
+    parts = []
+    for k in (QID_COL, LABEL_COL, PROP_COL, VALUE_COL):
+        v = (row.get(k) or "").strip()
+        if v:
+            parts.append(f"{k}: {v}")
+    return " | ".join(parts)
+
+def to_metadata(row: Dict[str, str]) -> Dict[str, Any]:
+    return {
+        QID_COL:    row.get(QID_COL),
+        LABEL_COL:  row.get(LABEL_COL),
+        PROP_COL:   row.get(PROP_COL),
+        VALUE_COL:  row.get(VALUE_COL),
+    }
+
+def extract_prompt_id(prompt: str) -> Optional[str]:
+    m = ID_TOKEN.search(prompt)
+    return m.group(0) if m else None
+
+def extract_contains_terms(prompt: str, limit: int = 4) -> List[str]:
+    """
+    Build value/label clues for where_document:
+    - quoted phrases
+    - ISO dates, numbers
+    - long tokens (IDs, codes)
+    - a couple of general words (length > 3)
+    """
+    clues: List[str] = []
+
+    for m in QUOTED_RE.finditer(prompt):
+        phrase = (m.group(1) or m.group(2) or "").strip()
+        if phrase:
+            clues.append(phrase)
+
+    for m in DATE_RE.finditer(prompt):
+        clues.append(m.group(0))
+
+    for m in NUMBER_RE.finditer(prompt):
+        tok = m.group(0)
+        if len(tok) >= 3:
+            clues.append(tok)
+
+    for t in re.findall(r"[A-Za-z0-9_-]+", prompt):
+        if len(t) >= 5 and not t.isalpha():
+            clues.append(t)
+
+    words = [w for w in re.findall(r"[a-zA-Z]+", prompt.lower()) if len(w) > 3]
+    clues += words[:2]
+
+    # De-dup, keep order, cap
+    seen, out = set(), []
+    for c in clues:
+        if c not in seen:
+            seen.add(c); out.append(c)
+        if len(out) >= limit:
+            break
+    return out
+
+# ---------------- Ingest ----------------
+def ingest_csv(csv_path: str):
+    coll = ensure_collection()
+    ids: List[str] = []
+    docs: List[str] = []
+    metas: List[Dict[str, Any]] = []
+    buf_texts: List[str] = []
+    auto = 0
+
+    with open(csv_path, newline="", encoding="utf-8-sig") as f:
+        r = csv.DictReader(f)
+        need = {QID_COL, LABEL_COL, PROP_COL, VALUE_COL}
+        if not need.issubset(set(r.fieldnames or [])):
+            missing = list(need - set(r.fieldnames or []))
+            raise ValueError(f"CSV missing columns: {missing}")
+
+        for row in r:
+            rid = row.get(QID_COL) or f"row-{auto}"; auto += 1
+            text = row_to_text(row)
+            ids.append(str(rid))
+            docs.append(text)
+            metas.append(to_metadata(row))
+            buf_texts.append(text)
+
+            if len(ids) >= EMBED_BATCH * 4:
+                _flush(coll, ids, docs, metas, buf_texts)
+
+        if ids:
+            _flush(coll, ids, docs, metas, buf_texts)
+
+    print(f"Ingest complete. Count ≈ {coll.count()}")
+
+def _flush(coll, ids, docs, metas, buf_texts):
+    # 1) embed in micro-batches
+    embs: List[List[float]] = []
+    for chunk in chunked(buf_texts, EMBED_BATCH):
+        for attempt in range(3):
+            try:
+                embs.extend(embed_ollama(chunk))
+                break
+            except Exception:
+                if attempt == 2: raise
+                time.sleep(2 * (2**attempt))
+
+    # 2) add to Chroma in small batches
+    i = 0
+    while i < len(ids):
+        j = min(i + ADD_BATCH, len(ids))
+        coll.add(
+            ids=ids[i:j],
+            documents=docs[i:j],
+            metadatas=metas[i:j],
+            embeddings=embs[i:j]
+        )
+        i = j
+
+    ids.clear(); docs.clear(); metas.clear(); buf_texts.clear()
+
+# ---------------- RRF ----------------
+def rrf_fuse(id_lists: List[List[str]], k: int = 60) -> List[str]:
+    """
+    RRF fusion of multiple ranked ID lists.
+    """
+    scores: Dict[str, float] = {}
+    for ids in id_lists:
+        for rank, _id in enumerate(ids, start=1):
+            scores[_id] = scores.get(_id, 0.0) + 1.0 / (k + rank)
+    return [i for i, _ in sorted(scores.items(), key=lambda x: x[1], reverse=True)]
+
+# ---------------- Search ----------------
+def search(prompt: str, top_k: int = 5, pool: int = 50):
+    coll = ensure_collection()
+    q_emb = embed_ollama([prompt])[0]
+
+    # Build filters from prompt
+    qid = extract_prompt_id(prompt)  # optional
+    contains_terms = extract_contains_terms(prompt)  # label/value clues
+
+    where = {"question_id": qid} if qid else {}
+    where_document = {"$and": [{"$contains": t} for t in contains_terms]} if contains_terms else None
+
+    # Pass A: plain dense (broad recall)
+    resA = coll.query(
+        query_embeddings=[q_emb],
+        n_results=min(pool, top_k * 5),
+        include=["ids","documents","metadatas","distances"]
+    )
+    idsA = resA["ids"][0] if resA["ids"] else []
+
+    # Pass B: filtered dense (higher precision)
+    resB = coll.query(
+        query_embeddings=[q_emb],
+        n_results=min(pool, top_k * 5),
+        where=where or {},
+        where_document=where_document,
+        include=["ids","documents","metadatas","distances"]
+    )
+    idsB = resB["ids"][0] if resB["ids"] else []
+
+    # Fuse
+    fused_ids = rrf_fuse([idsA, idsB])[:top_k]
+
+    # Build final results (prefer filtered distances if present, else plain)
+    def pick(res, _id):
+        if not res or not res["ids"]:
+            return None
+        ids = res["ids"][0]; docs = res["documents"][0]; dists = res["distances"][0]; metas = res["metadatas"][0]
+        if _id in ids:
+            i = ids.index(_id)
+            return {"id": _id, "distance": dists[i], "doc": docs[i], "meta": metas[i]}
+        return None
+
+    hits = []
+    for _id in fused_ids:
+        hit = pick(resB, _id) or pick(resA, _id) or {"id": _id, "distance": None, "doc": None, "meta": {}}
+        hits.append(hit)
+
+    return {
+        "filters_used": {"where": where, "where_document": where_document},
+        "passes": {"plain": idsA[:top_k], "filtered": idsB[:top_k]},
+        "results": hits
+    }
+
+# ---------------- CLI ----------------
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ingest", help="Path to CSV (question_id, question_label, prop, value)")
+    ap.add_argument("--ask", help="Prompt to search")
+    ap.add_argument("--topk", type=int, default=5)
+    args = ap.parse_args()
+
+    if args.ingest:
+        ingest_csv(args.ingest)
+
+    if args.ask:
+        out = search(args.ask, top_k=args.topk)
+        print("FILTERS USED:", out["filters_used"])
+        print("PASSES:", out["passes"])
+        print("\nTop hits:")
+        for h in out["results"]:
+            dist = "NA" if h["distance"] is None else f"{h['distance']:.4f}"
+            print(f"- {h['id']}  dist={dist}")
+            print(f"  {h['doc']}")
+            print(f"  meta: {h['meta']}\n")
