@@ -1,0 +1,103 @@
+def row_to_text(row: dict) -> str:
+    # make sure VALUE is present so where_document can match it
+    parts = []
+    for c in ["section", "subsection", "label", "value"]:
+        v = row.get(c)
+        if v and str(v).strip():
+            parts.append(f"{c}: {v}")
+    return " | ".join(parts) if parts else " ".join(f"{k}: {v}" for k,v in row.items() if v)
+
+
+
+
+
+
+import re
+from typing import Tuple, Dict, Any, Optional, List
+
+DATE_RE  = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")           # 2025-10-01
+NUM_RE   = re.compile(r"\b\d[\d,.\-/]*\b")                # 1280.55, 12/10/2025, etc.
+QUOTED_RE= re.compile(r"\"([^\"]+)\"|'([^']+)'")          # "primary approver", 'INV-001'
+
+def extract_value_clues(prompt: str) -> List[str]:
+    p = prompt.strip()
+    clues = set()
+
+    # 1) quoted phrases keep spaces
+    for m in QUOTED_RE.finditer(p):
+        phrase = (m.group(1) or m.group(2)).strip()
+        if phrase:
+            clues.add(phrase)
+
+    # 2) ISO dates & generic numbers (amounts, ids)
+    for m in DATE_RE.finditer(p):
+        clues.add(m.group(0))
+    for m in NUM_RE.finditer(p):
+        token = m.group(0)
+        # keep plausible numeric/ID tokens; ignore tiny ones like "2"
+        if len(token) >= 3:
+            clues.add(token)
+
+    # 3) long alphanum tokens (invoice ids, codes)
+    for t in re.findall(r"[A-Za-z0-9_-]+", p):
+        if len(t) >= 5 and not t.isalpha():  # e.g., INV-2025-001
+            clues.add(t)
+
+    # limit to a few to keep the filter cheap
+    return list(clues)[:4]
+
+def parse_prompt_to_filters(prompt: str) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], List[str]]:
+    # --- your existing logic for quest_id / section / subsection / label ---
+    q = prompt.lower()
+    where: Dict[str, Any] = {}
+
+    m = re.search(r"\bq\d{2,}\b", q)          # quest id like Q001
+    if m: where["quest_id"] = m.group(0).upper()
+
+    # section/subsection/label detection using your synonym maps (keep your versions here)
+    q_norm = re.sub(r"[^a-z0-9_]+","", q.replace(" ", "_"))
+    for sect_norm, syns in _NORM_SECTION_SYNS.items():
+        if any(s in q_norm for s in syns):
+            where["section_norm"] = sect_norm
+            break
+    for lab_norm, syns in _NORM_LABEL_SYNS.items():
+        if any(s in q_norm for s in syns):
+            where["label_norm"] = lab_norm
+            break
+    if "subsection_norm" not in where:
+        for candidate in ("primary","secondary","alternate","main"):
+            if candidate in q:
+                where["subsection_norm"] = re.sub(r"[^a-z0-9_]+","", candidate)
+                break
+
+    # --- value-aware where_document ---
+    # general keywords (soft) + value-specific clues (dates, numbers, quoted)
+    kw_general = [t for t in re.findall(r"[a-z0-9]+", q) if len(t) > 3][:3]
+    value_clues = extract_value_clues(prompt)
+
+    where_doc_clauses = []
+    where_doc_clauses += [{"$contains": kw} for kw in kw_general]
+    where_doc_clauses += [{"$contains": vc} for vc in value_clues]
+
+    where_document = {"$and": where_doc_clauses} if where_doc_clauses else None
+    tokens = kw_general + value_clues
+    return where, where_document, tokens
+
+
+
+
+
+
+def query(prompt: str, top_k: int = 5, pool: int = 50):
+    coll = ensure_collection()
+    q_emb = embed_ollama([prompt])[0]
+    where, where_doc, _ = parse_prompt_to_filters(prompt)
+
+    res = coll.query(
+        query_embeddings=[q_emb],
+        n_results=min(pool, top_k*5),
+        where=where or {},
+        where_document=where_doc,        # <-- this now includes value clues
+        include=["ids","documents","metadatas","distances"]
+    )
+    # ...format hits as before...
