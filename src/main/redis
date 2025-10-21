@@ -1,0 +1,470 @@
+
+
+# ---- Redis ----
+REDIS_URL=redis://default:YOUR_PASSWORD@YOUR_HOST:YOUR_PORT/0
+
+# ---- Ollama ----
+OLLAMA_HOST=http://127.0.0.1:11434
+OLLAMA_MODEL=bge-m3
+
+# ---- Ingestion ----
+DATA_DIR=./data
+FILE_GLOB=*.csv
+ID_COLUMN=id
+TEXT_COLUMNS=
+META_COLUMNS=topic,subtopic
+LABEL_MODE=label:value
+SPARSE_MODE=tfidf
+BATCH_SIZE=64
+DENSE_DIM=1024
+DISTANCE=COSINE
+REDIS_INDEX=kb_idx
+REDIS_PREFIX=kb:
+
+
+
+
+
+
+# config_loader.py
+
+import os
+from pathlib import Path
+from typing import Dict
+
+def _parse_env_file(path: Path) -> Dict[str, str]:
+    env: Dict[str, str] = {}
+    if not path.exists():
+        raise FileNotFoundError(f"Env file not found: {path}")
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        env[k] = v
+    return env
+
+def load_app_env() -> None:
+    """
+    Loads env/{APP_ENV}.env into os.environ (does NOT overwrite already-set vars).
+    Select environment via APP_ENV (default 'dev').
+    """
+    app_env = os.getenv("APP_ENV", "dev")
+    file_path = Path("env") / f"{app_env}.env"
+    env_vars = _parse_env_file(file_path)
+    for k, v in env_vars.items():
+        if k not in os.environ:   # don't clobber pre-set envs
+            os.environ[k] = v
+
+
+
+
+
+
+
+
+#!/usr/bin/env python3
+# ingest_csvs_to_redis.py
+import os, csv, json, math, glob, re, uuid
+from typing import List, Dict, Any, Optional, Iterable, Tuple
+import numpy as np
+import redis
+import requests
+
+from config_loader import load_app_env
+
+# --- load env file based on APP_ENV ---
+load_app_env()
+
+# -------- Config from env --------
+REDIS_URL    = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+INDEX_NAME   = os.getenv("REDIS_INDEX", "kb_idx")
+KEY_PREFIX   = os.getenv("REDIS_PREFIX", "kb:")
+DENSE_DIM    = int(os.getenv("DENSE_DIM", "1024"))
+DISTANCE     = os.getenv("DISTANCE", "COSINE")
+
+OLLAMA_HOST  = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "bge-m3")
+
+DATA_DIR     = os.getenv("DATA_DIR", "./data")
+FILE_GLOB    = os.getenv("FILE_GLOB", "*.csv")
+ID_COLUMN    = os.getenv("ID_COLUMN", "id")
+TEXT_COLUMNS = [c.strip() for c in os.getenv("TEXT_COLUMNS", "").split(",") if c.strip()]
+META_COLUMNS = [c.strip() for c in os.getenv("META_COLUMNS", "").split(",") if c.strip()]
+JOIN_WITH    = os.getenv("JOIN_WITH", "\n")
+LABEL_MODE   = os.getenv("LABEL_MODE", "label:value")
+SPARSE_MODE  = os.getenv("SPARSE_MODE", "tfidf")
+BATCH_SIZE   = int(os.getenv("BATCH_SIZE", "64"))
+MAX_TOKENS   = int(os.getenv("MAX_TOKENS", "0"))
+
+TEXT_FIELD    = "text"
+LEXICAL_FIELD = "lexical"
+META_FIELD    = "meta"
+VECTOR_FIELD  = "dense"
+
+# Redis client
+r = redis.Redis.from_url(REDIS_URL, decode_responses=False)
+
+# ------------ Tokenizer ------------
+_WORD_RE = re.compile(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?")
+STOP = set("""
+a an the and or for of on to in is are was were be been being it this that with as by from at into about over after before under again further then once
+i me my we our you your he him his she her they them their what which who whom whose
+do does did doing would should could can will just not no nor only same so than too very
+""".split())
+
+def simple_tokenize(text: str) -> List[str]:
+    toks = [t.lower() for t in _WORD_RE.findall(text)]
+    toks = [t for t in toks if t not in STOP and len(t) > 1]
+    if MAX_TOKENS and len(toks) > MAX_TOKENS:
+        toks = toks[:MAX_TOKENS]
+    return toks
+
+# ------------ Sparse weights ------------
+def build_sparse_weights_tfidf(texts: List[str]) -> Optional[List[Dict[str, float]]]:
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        vec = TfidfVectorizer(tokenizer=simple_tokenize, lowercase=False)
+        X = vec.fit_transform(texts)
+        vocab = np.array(vec.get_feature_names_out())
+        out: List[Dict[str, float]] = []
+        for i in range(X.shape[0]):
+            row = X.getrow(i)
+            idxs, vals = row.indices, row.data
+            out.append({vocab[j]: float(vals[k]) for k, j in enumerate(idxs)})
+        return out
+    except Exception:
+        return None
+
+def build_sparse_weights_tf(texts: List[str]) -> List[Dict[str, float]]:
+    outs: List[Dict[str, float]] = []
+    for t in texts:
+        toks = simple_tokenize(t)
+        if not toks:
+            outs.append({})
+            continue
+        counts: Dict[str, int] = {}
+        for tok in toks:
+            counts[tok] = counts.get(tok, 0) + 1
+        N = float(sum(counts.values()))
+        outs.append({k: (v / N) for k, v in counts.items()})
+    return outs
+
+def sparse_to_lexical(sparse: Dict[str, float], limit: int = 64) -> str:
+    if not sparse:
+        return ""
+    items = sorted(sparse.items(), key=lambda kv: kv[1], reverse=True)[:limit]
+    toks: List[str] = []
+    for tok, w in items:
+        reps = max(1, min(4, int(round(w * 4))))
+        toks.extend([tok] * reps)
+    return " ".join(toks)
+
+# ------------ Dense embeddings (Ollama bge-m3) ------------
+def embed_dense_ollama(texts: List[str]) -> List[np.ndarray]:
+    out: List[np.ndarray] = []
+    for t in texts:
+        resp = requests.post(
+            f"{OLLAMA_HOST}/api/embeddings",
+            json={"model": OLLAMA_MODEL, "prompt": t},
+            timeout=120,
+        )
+        resp.raise_for_status()
+        emb = np.array(resp.json()["embedding"], dtype=np.float32)
+        n = np.linalg.norm(emb) + 1e-12
+        out.append((emb / n).astype(np.float32))  # cosine-normalized
+    return out
+
+def _vec_to_bytes(x: np.ndarray) -> bytes:
+    assert x.dtype == np.float32 and x.ndim == 1
+    return x.tobytes(order="C")
+
+# ------------ FT index ------------
+def create_index_if_needed():
+    from redis.commands.search import Search
+    from redis.commands.search.field import TextField, VectorField
+    from redis.commands.search.indexDefinition import IndexDefinition, IndexType
+
+    search = Search(r, index_name=INDEX_NAME)
+    try:
+        _ = search.info()
+        return
+    except Exception:
+        pass
+
+    schema = [
+        TextField(TEXT_FIELD),
+        TextField(LEXICAL_FIELD),
+        TextField(META_FIELD),
+        VectorField(
+            VECTOR_FIELD,
+            "HNSW",
+            {"TYPE": "FLOAT32", "DIM": DENSE_DIM, "DISTANCE_METRIC": DISTANCE,
+             "M": 16, "EF_CONSTRUCTION": 200},
+        ),
+    ]
+    definition = IndexDefinition(prefix=[KEY_PREFIX], index_type=IndexType.HASH)
+    search.create_index(schema=schema, definition=definition)
+
+# ------------ CSV helpers ------------
+def strip_bom(s: str) -> str:
+    return s.lstrip("\ufeff").strip()
+
+def discover_columns(headers: List[str]) -> Tuple[Optional[str], List[str], List[str]]:
+    hdrs = [strip_bom(h) for h in headers]
+    id_col = ID_COLUMN if ID_COLUMN in hdrs else (None if ID_COLUMN != "id" else ("id" if "id" in hdrs else None))
+    meta_cols = META_COLUMNS[:] if META_COLUMNS else []
+    if not meta_cols:
+        for cand in ["topic", "subtopic", "section", "label", "category"]:
+            if cand in hdrs and cand not in meta_cols:
+                meta_cols.append(cand)
+    text_cols = TEXT_COLUMNS[:] if TEXT_COLUMNS else [h for h in hdrs if h != id_col and h not in meta_cols]
+    return id_col, text_cols, meta_cols
+
+def build_text_from_row(row: Dict[str, str], text_cols: List[str]) -> str:
+    parts: List[str] = []
+    for col in text_cols:
+        if col not in row:
+            continue
+        val = str(row.get(col, "")).strip()
+        if not val:
+            continue
+        parts.append(f"{col}: {val}" if LABEL_MODE == "label:value" else val)
+    return JOIN_WITH.join(parts)
+
+def meta_from_row(row: Dict[str, str], meta_cols: List[str]) -> Dict[str, Any]:
+    meta = {}
+    for c in meta_cols:
+        if c in row:
+            meta[c] = row[c]
+    return meta
+
+def read_csv_rows(path: str):
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        sample = f.read(8192); f.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample)
+        except Exception:
+            dialect = csv.excel
+        rdr = csv.DictReader(f, dialect=dialect)
+        if rdr.fieldnames:
+            rdr.fieldnames = [strip_bom(h) for h in rdr.fieldnames]
+        for row in rdr:
+            yield {strip_bom(k): (v if v is not None else "") for k, v in row.items()}
+
+# ------------ Upsert pipeline ------------
+def upsert_batch(batch_docs: List[Dict[str, Any]]):
+    texts = [d["text"] for d in batch_docs]
+    dense = embed_dense_ollama(texts)
+
+    if SPARSE_MODE == "tfidf":
+        sparse = build_sparse_weights_tfidf(texts) or build_sparse_weights_tf(texts)
+    else:
+        sparse = build_sparse_weights_tf(texts)
+
+    pipe = r.pipeline(transaction=False)
+    for i, d in enumerate(batch_docs):
+        key = f"{KEY_PREFIX}{d['id']}"
+        mapping = {
+            TEXT_FIELD: d["text"],
+            LEXICAL_FIELD: sparse_to_lexical(sparse[i]),
+            META_FIELD: json.dumps(d.get("meta", {}), ensure_ascii=False),
+            VECTOR_FIELD: _vec_to_bytes(dense[i]),
+        }
+        pipe.hset(key, mapping=mapping)
+    pipe.execute()
+
+def ingest_folder():
+    from redis.commands.search import Search
+    create_index_if_needed()
+
+    files = sorted(glob.glob(os.path.join(DATA_DIR, FILE_GLOB)))
+    if not files:
+        print(f"No CSV found at {DATA_DIR}/{FILE_GLOB}")
+        return
+
+    total = 0
+    for fp in files:
+        print(f"→ {fp}")
+        rows = list(read_csv_rows(fp))
+        if not rows:
+            continue
+        id_col, text_cols, meta_cols = discover_columns(list(rows[0].keys()))
+        print(f"  ID: {id_col or '(generated)'}")
+        print(f"  TEXT_COLUMNS: {text_cols}")
+        print(f"  META_COLUMNS: {meta_cols}")
+
+        docs: List[Dict[str, Any]] = []
+        for row in rows:
+            rid = row.get(id_col) if id_col and row.get(id_col) else str(uuid.uuid4())
+            text = build_text_from_row(row, text_cols)
+            if not text.strip():
+                continue
+            meta = meta_from_row(row, meta_cols)
+            docs.append({"id": rid, "text": text, "meta": meta})
+
+            if len(docs) >= BATCH_SIZE:
+                upsert_batch(docs); total += len(docs); docs.clear()
+                print(f"  upserted so far: {total}")
+
+        if docs:
+            upsert_batch(docs); total += len(docs)
+            print(f"  upserted so far: {total}")
+
+    # summarize
+    try:
+        search = __import__("redis.commands.search", fromlist=["Search"]).Search(r, index_name=INDEX_NAME)
+        info = search.info()
+        print(f"\nIndex {INDEX_NAME}: num_docs={info.get('num_docs')} vector_index_size={info.get('vector_index_size')}")
+    except Exception as e:
+        print(f"(FT.INFO not available) {e}")
+
+if __name__ == "__main__":
+    ingest_folder()
+
+
+
+
+
+
+
+
+#!/usr/bin/env python3
+# query_redis.py
+import os, json, math, argparse
+from typing import List, Dict, Any
+import numpy as np
+import redis
+import requests
+
+from config_loader import load_app_env
+
+# load env
+load_app_env()
+
+# Config
+REDIS_URL    = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+INDEX_NAME   = os.getenv("REDIS_INDEX", "kb_idx")
+KEY_PREFIX   = os.getenv("REDIS_PREFIX", "kb:")
+DENSE_DIM    = int(os.getenv("DENSE_DIM", "1024"))
+DISTANCE     = os.getenv("DISTANCE", "COSINE")
+
+OLLAMA_HOST  = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "bge-m3")
+
+TEXT_FIELD    = "text"
+LEXICAL_FIELD = "lexical"
+META_FIELD    = "meta"
+VECTOR_FIELD  = "dense"
+
+r = redis.Redis.from_url(REDIS_URL, decode_responses=False)
+
+def embed_dense_ollama(texts: List[str]) -> List[np.ndarray]:
+    out: List[np.ndarray] = []
+    for t in texts:
+        resp = requests.post(
+            f"{OLLAMA_HOST}/api/embeddings",
+            json={"model": OLLAMA_MODEL, "prompt": t},
+            timeout=120,
+        )
+        resp.raise_for_status()
+        emb = np.array(resp.json()["embedding"], dtype=np.float32)
+        n = np.linalg.norm(emb) + 1e-12
+        out.append((emb / n).astype(np.float32))
+    return out
+
+def _vec_to_bytes(x: np.ndarray) -> bytes:
+    assert x.dtype == np.float32 and x.ndim == 1
+    return x.tobytes(order="C")
+
+def hybrid_search(query: str, k: int = 5, blend: float = 0.6, ef_runtime: int = 200) -> List[Dict[str, Any]]:
+    from redis.commands.search import Search
+    from redis.commands.search.query import Query
+
+    qvec = embed_dense_ollama([query])[0]
+    qvec_bytes = _vec_to_bytes(qvec)
+
+    knn = f"=>[KNN {k} @{VECTOR_FIELD} $vec AS vector_score]"
+    clause = f"(@{LEXICAL_FIELD}:({query}) | @{TEXT_FIELD}:({query})) {knn}"
+    params = {"vec": qvec_bytes}
+
+    # runtime recall knob
+    try:
+        r.execute_command("FT.CONFIG", "SET", "EF_RUNTIME", str(ef_runtime))
+    except Exception:
+        pass
+
+    search = Search(r, index_name=INDEX_NAME)
+    q = (Query(clause)
+         .return_fields(TEXT_FIELD, META_FIELD, "vector_score")
+         .sort_by("vector_score")
+         .paging(0, k)
+         .dialect(2))
+    vres = search.search(q, query_params=params)
+
+    # BM25 scores to blend
+    bm25_map = {}
+    if blend < 1.0:
+        qbm = (Query(f"@{LEXICAL_FIELD}:({query}) | @{TEXT_FIELD}:({query})")
+               .with_scores()
+               .return_fields()
+               .paging(0, 1000)
+               .dialect(2))
+        bres = search.search(qbm)
+        for d in bres.docs:
+            bm25_map[d.id] = float(d.score)
+
+    def _norm(vals: List[float]) -> List[float]:
+        if not vals: return []
+        vmin, vmax = min(vals), max(vals)
+        if abs(vmax - vmin) < 1e-12: return [0.5] * len(vals)
+        return [(v - vmin) / (vmax - vmin) for v in vals]
+
+    vec_dists = [float(doc.vector_score) for doc in vres.docs]
+    vec_sims_n = _norm([1.0 - d for d in vec_dists])
+    bm25_raw = [bm25_map.get(doc.id, 0.0) for doc in vres.docs]
+    bm25_n = _norm(bm25_raw)
+
+    rows: List[Dict[str, Any]] = []
+    for i, doc in enumerate(vres.docs):
+        try:
+            text = getattr(doc, TEXT_FIELD).decode("utf-8", "ignore")
+        except Exception:
+            text = ""
+        try:
+            meta_raw = getattr(doc, META_FIELD)
+            meta = json.loads(meta_raw.decode("utf-8", "ignore")) if meta_raw else {}
+        except Exception:
+            meta = {}
+        score = blend * vec_sims_n[i] + (1.0 - blend) * bm25_n[i]
+        rows.append({
+            "id": doc.id.decode() if isinstance(doc.id, bytes) else doc.id,
+            "text": text,
+            "meta": meta,
+            "vector_distance": float(vec_dists[i]),
+            "bm25_score": float(bm25_raw[i]),
+            "blend_score": float(score),
+        })
+
+    rows.sort(key=lambda x: x["blend_score"], reverse=True)
+    return rows[:k]
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--q", required=True, help="query text / prompt")
+    ap.add_argument("--k", type=int, default=5)
+    ap.add_argument("--blend", type=float, default=0.6, help="1=vector-only, 0=BM25-only")
+    args = ap.parse_args()
+
+    hits = hybrid_search(args.q, k=args.k, blend=args.blend)
+    for i, h in enumerate(hits, 1):
+        topic = h["meta"].get("topic")
+        print(f"{i}. id={h['id']} | dist={h['vector_distance']:.4f} | bm25={h['bm25_score']:.3f} | blend={h['blend_score']:.3f} | topic={topic} \n   {h['text']}\n")
+
+if __name__ == "__main__":
+    main()
+
