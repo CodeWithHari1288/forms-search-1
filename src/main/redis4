@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+import os, glob, json, ulid
+import numpy as np
+import pandas as pd
+import redis
+from dotenv import load_dotenv
+from ollama import Client
+from redis.commands.search.indexDefinition import IndexDefinition, IndexType
+from redis.commands.search.field import TextField, TagField, VectorField
+
+load_dotenv()
+
+# ---- Config ----
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+
+INDEX_NAME  = os.getenv("INDEX_NAME", "idx:forms")
+KEY_PREFIX  = os.getenv("KEY_PREFIX", "form:")
+CSV_DIR     = os.getenv("CSV_DIR", "./data")
+FORM_ID_DEF = os.getenv("DEFAULT_FORM_ID", "A")
+VECTOR_DIM  = int(os.getenv("VECTOR_DIM", "1024"))
+
+# ---- Connect ----
+r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=False)
+r.ping()
+ollama = Client(host=OLLAMA_HOST)
+ollama.show("bge-m3")  # verify availability
+
+# ---- Embeddings ----
+def embed_text(text: str) -> list[float]:
+    """Return list[float] (length 1024) from Ollama bge-m3 embeddings."""
+    resp = ollama.embeddings(model="bge-m3", prompt=text)
+    vec = resp["embedding"]
+    if len(vec) != VECTOR_DIM:
+        raise ValueError(f"Expected {VECTOR_DIM}-D vector, got {len(vec)}")
+    # keep JSON as array of floats (RedisJSON supports VECTOR over arrays)
+    return vec
+
+# ---- Index (ON JSON) ----
+def ensure_index():
+    try:
+        r.ft(INDEX_NAME).info()
+        print(f"[ok] Index {INDEX_NAME} exists.")
+        return
+    except Exception:
+        pass
+
+    schema = (
+        # TEXT for BM25
+        TextField("$.text",          as_name="text"),
+        TextField("$.label",         as_name="label"),
+        TextField("$.propertyname",  as_name="propertyname"),
+        TextField("$.value",         as_name="value"),
+        TextField("$.question_context", as_name="question_context"),
+        TextField("$.repeatable",    as_name="repeatable"),
+        TextField("$.pointer",       as_name="pointer"),
+
+        # TAG filters
+        TagField("$.form_id",    as_name="form_id"),
+        TagField("$.section",    as_name="section"),
+        TagField("$.subsection", as_name="subsection"),
+        TagField("$.status",     as_name="status"),  # optional if you set it later
+
+        # VECTOR field over JSON array
+        VectorField(
+            "$.vec",
+            "HNSW",
+            {
+                "TYPE":"FLOAT32",
+                "DIM":VECTOR_DIM,
+                "DISTANCE_METRIC":"COSINE",
+                "M":16,
+                "EF_CONSTRUCTION":200,
+                "EF_RUNTIME":64
+            },
+            as_name="vec"
+        ),
+    )
+    definition = IndexDefinition(prefix=[KEY_PREFIX], index_type=IndexType.JSON)
+    r.ft(INDEX_NAME).create_index(schema, definition=definition)
+    print(f"[ok] Created index {INDEX_NAME} (ON JSON).")
+
+# ---- CSV -> JSON doc model ----
+def row_to_doc(row: pd.Series, form_id: str) -> dict:
+    # Your CSV columns:
+    # Prop, question_id, question_label, section, sub_section,
+    # question_context, repeatable, value, json_pointer
+    label = str(row.get("question_label", "") or "")
+    prop  = str(row.get("Prop", "") or "")
+    sec   = str(row.get("section", "") or "")
+    sub   = str(row.get("sub_section", "") or "")
+    ctx   = "" if pd.isna(row.get("question_context")) else str(row.get("question_context"))
+    rep   = "" if pd.isna(row.get("repeatable")) else str(row.get("repeatable"))
+    val   = "" if pd.isna(row.get("value")) else str(row.get("value"))
+    ptr   = str(row.get("json_pointer", "") or "")
+    qid   = str(row.get("question_id", "") or "")
+
+    # Build human text for BM25 (do NOT stuff volatile value into semantic meaning)
+    text = (
+        f"Section: {sec}. Subsection: {sub}. "
+        f"Field: {label}. Property: {prop}. "
+        f"Context: {ctx}. Repeatable: {rep}."
+    ).strip()
+
+    doc = {
+        "form_id": form_id,
+        "section": sec,
+        "subsection": sub,
+        "label": label,
+        "propertyname": prop,
+        "value": val,          # keep raw value for display/patch
+        "pointer": ptr,        # authoritative JSON Pointer
+        "text": text,
+        "question_context": ctx,
+        "repeatable": rep,
+        "question_id": qid,    # stored as reference if you need it
+        # vector populated later
+    }
+    return doc
+
+def ingest_csv(file_path: str, form_id: str):
+    df = pd.read_csv(file_path)
+    # sanity: ensure required columns exist
+    required = [
+        "Prop","question_id","question_label","section","sub_section",
+        "question_context","repeatable","value","json_pointer"
+    ]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"{os.path.basename(file_path)} missing columns: {missing}")
+
+    total = 0
+    for _, row in df.iterrows():
+        doc = row_to_doc(row, form_id=form_id)
+        # embed the BM25 text
+        doc["vec"] = embed_text(doc["text"])
+        # stable key: form:<form_id>:row:<ulid()>
+        key = f"{KEY_PREFIX}{form_id}:row:{ulid.new().str}"
+        r.json().set(key, "$", doc)
+        total += 1
+    return total
+
+def ingest_folder(csv_dir: str):
+    files = sorted(glob.glob(os.path.join(csv_dir, "*.csv")))
+    if not files:
+        print(f"[warn] no CSV files in {csv_dir}")
+        return
+
+    grand = 0
+    for f in files:
+        # You can derive form_id from filename if preferred:
+        form_id = FORM_ID_DEF
+        print(f"[info] ingesting {os.path.basename(f)} (form_id={form_id})")
+        count = ingest_csv(f, form_id)
+        print(f"[ok] {count} rows")
+        grand += count
+    print(f"[done] total rows ingested: {grand}")
+
+if __name__ == "__main__":
+    ensure_index()
+    ingest_folder(CSV_DIR)
+
+
+
+
+
+
+
+
+
+
+
+#!/usr/bin/env python3
+import os
+import numpy as np
+import redis
+from dotenv import load_dotenv
+from ollama import Client
+from redis.commands.search.query import Query
+
+load_dotenv()
+
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+INDEX_NAME  = os.getenv("INDEX_NAME", "idx:forms")
+
+VECTOR_DIM  = int(os.getenv("VECTOR_DIM", "1024"))
+
+r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=False)
+r.ping()
+ollama = Client(host=OLLAMA_HOST)
+ollama.show("bge-m3")
+
+def embed_bytes(text: str) -> bytes:
+    """Return float32 bytes for Redis PARAMS."""
+    emb = ollama.embeddings(model="bge-m3", prompt=text)["embedding"]
+    if len(emb) != VECTOR_DIM:
+        raise ValueError(f"Expected {VECTOR_DIM}-D vector, got {len(emb)}")
+    return np.asarray(emb, dtype=np.float32).tobytes()
+
+def _esc_tag(v: str) -> str:
+    return str(v).replace(" ", r"\ ")
+
+def one_call_hybrid(
+    query_text: str,
+    k: int = 10,
+    form_id: str | None = None,
+    section: str | None = None,
+    subsection: str | None = None,
+    text_terms: list[str] | None = None,
+    return_fields: list[str] | None = None
+):
+    """
+    Single FT.SEARCH: filters + BM25 text + KNN.
+    DIALECT >= 2 is required for =>[KNN ...].
+    """
+    blob = embed_bytes(query_text)
+    filters = []
+    if form_id:   filters.append(f"@form_id:{{{_esc_tag(form_id)}}}")
+    if section:   filters.append(f"@section:{{{_esc_tag(section)}}}")
+    if subsection:filters.append(f"@subsection:{{{_esc_tag(subsection)}}}")
+
+    text_part = ""
+    if text_terms:
+        # search in TEXT field "text" primarily; add label/propertyname for recall
+        ors = []
+        for t in text_terms:
+            t = t.replace('"', r'\"')
+            ors.append(f'(@text:"{t}" | @label:"{t}" | @propertyname:"{t}")')
+        text_part = "(" + " | ".join(ors) + ")"
+
+    left = " ".join(filters + ([text_part] if text_part else [])) or "*"
+    right = f"=>[KNN {k} @vec $BLOB AS __score]"
+    expr = f"{left} {right}"
+
+    q = Query(expr)\
+        .return_fields(*(return_fields or ["label","pointer","value","section","subsection","form_id","__score"]))\
+        .sort_by("__score", asc=True)\
+        .dialect(2)\
+        .with_params({"BLOB": blob})
+    res = r.ft(INDEX_NAME).search(q)
+    out = []
+    for d in res.docs:
+        out.append({
+            "label": d.label.decode() if isinstance(d.label, (bytes,bytearray)) else d.label,
+            "pointer": d.pointer.decode() if isinstance(d.pointer,(bytes,bytearray)) else d.pointer,
+            "value": d.value.decode() if isinstance(d.value,(bytes,bytearray)) else d.value,
+            "section": d.section.decode() if isinstance(d.section,(bytes,bytearray)) else d.section,
+            "subsection": d.subsection.decode() if isinstance(d.subsection,(bytes,bytearray)) else d.subsection,
+            "form_id": d.form_id.decode() if isinstance(d.form_id,(bytes,bytearray)) else d.form_id,
+            "score": float(d.__score),
+        })
+    return out
+
+# Optional: two-call RRF fusion baseline
+def bm25_only(query_text: str, k=20, form_id=None, section=None, subsection=None):
+    filters = []
+    if form_id:    filters.append(f"@form_id:{{{_esc_tag(form_id)}}}")
+    if section:    filters.append(f"@section:{{{_esc_tag(section)}}}")
+    if subsection: filters.append(f"@subsection:{{{_esc_tag(subsection)}}}")
+    text = query_text.replace('"', r'\"')
+    left = " ".join(filters) or "*"
+    expr = f'{left} (@text:"{text}" | @label:"{text}" | @propertyname:"{text}")'
+    q = Query(expr).return_fields("label","pointer","value","section","subsection","form_id")\
+                   .paging(0, k).dialect(2)
+    res = r.ft(INDEX_NAME).search(q)
+    out = []
+    for d in res.docs:
+        out.append({
+            "label": d.label.decode() if isinstance(d.label,(bytes,bytearray)) else d.label,
+            "pointer": d.pointer.decode() if isinstance(d.pointer,(bytes,bytearray)) else d.pointer,
+            "value": d.value.decode() if isinstance(d.value,(bytes,bytearray)) else d.value,
+            "section": d.section.decode() if isinstance(d.section,(bytes,bytearray)) else d.section,
+            "subsection": d.subsection.decode() if isinstance(d.subsection,(bytes,bytearray)) else d.subsection,
+            "form_id": d.form_id.decode() if isinstance(d.form_id,(bytes,bytearray)) else d.form_id,
+        })
+    return out
+
+def knn_only(query_text: str, k=20, form_id=None, section=None, subsection=None):
+    return one_call_hybrid(query_text, k=k, form_id=form_id, section=section, subsection=subsection, text_terms=None)
+
+def rrf_fuse(dense, sparse, k=10, c=60.0):
+    def rankify(lst):
+        for i, it in enumerate(lst, start=1):
+            it["_r"] = i
+    rankify(dense); rankify(sparse)
+    def idf(it):  # prefer pointer as identity
+        return it.get("pointer") or (it.get("label") + "|" + it.get("form_id", ""))
+    scores, best = {}, {}
+    for lst in (dense, sparse):
+        for it in lst:
+            did = idf(it); best.setdefault(did, it)
+            scores[did] = scores.get(did, 0.0) + 1.0 / (c + it.get("_r", 9999))
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:k]
+    return [best[did] | {"rrf": sc} for did, sc in ranked]
+
+if __name__ == "__main__":
+    # Example queries
+    print("\n[ONE-CALL HYBRID] query='address city postcode', form_id=A, section=address")
+    res = one_call_hybrid(
+        query_text="address city postcode",
+        k=10,
+        form_id="A",
+        section="address",
+        text_terms=["address","city","postcode"],
+        return_fields=["label","pointer","value","section","subsection","form_id","__score"]
+    )
+    for i, x in enumerate(res, 1):
+        print(f"{i:>2}. {x['label']}  -> {x['pointer']}  (score={x['score']:.6f})")
+
+    print("\n[RRF FUSION] query='date of joining' (BM25 + KNN)")
+    bm = bm25_only("date of joining", k=20, form_id="A")
+    kn = knn_only("date of joining", k=20, form_id="A")
+    fused = rrf_fuse(kn, bm, k=10)
+    for i, x in enumerate(fused, 1):
+        print(f"{i:>2}. {x['label']}  -> {x['pointer']}  (rrf={x['rrf']:.4f})")
