@@ -450,3 +450,338 @@ if __name__ == "__main__":
 
     print("\n[Address collections (lists/maps)]")
     print(find_address_collections(k=10))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#!/usr/bin/env python3
+import os, re
+import numpy as np
+import redis
+from ollama import Client
+from redis.commands.search.query import Query
+
+# ---------- Config ----------
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+INDEX_NAME = os.getenv("INDEX_NAME", "json_field_index")
+PREFIX = os.getenv("INDEX_PREFIX", "json_field:")
+
+DEFAULT_TEXT_FIELDS = ["text_boost", "text_chunk", "question_label", "json_property", "json_value"]
+
+# ---------- Connections ----------
+r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=False)
+r.ping()
+ollama_client = Client(host=OLLAMA_HOST)
+ollama_client.show("bge-m3")
+
+# ---------- Helpers ----------
+def _escape_tag(s: str) -> str:
+    if s is None: return ""
+    return str(s).strip().replace(" ", r"\ ")
+
+def _escape_phrase(s: str) -> str:
+    # Escape double quotes for RediSearch phrase query
+    return str(s).replace('"', r'\"')
+
+def _bytes_to_str(b):
+    return b.decode() if isinstance(b, (bytes, bytearray)) else b
+
+def get_vec(text: str) -> bytes:
+    resp = ollama_client.embeddings(model="bge-m3", prompt=text)
+    arr = np.array(resp["embedding"], dtype=np.float32)
+    return arr.tobytes()
+
+def _project_fields():
+    # safe default projection set
+    return [
+        "vector_score",
+        "question_id","question_label",
+        "json_property","json_value","json_pointer",
+        "section","subsection",
+        "shape","shape_size",
+        "text_chunk"
+    ]
+
+# ---------- BM25 query builder (generic) ----------
+def build_bm25_clause(
+    query_text: str | None,
+    fields: list[str] | None = None,
+    include_terms: list[str] | None = None,
+    exclude_terms: list[str] | None = None,
+    equals_filters: dict[str, str] | None = None,
+    section: str | None = None,
+    subsection: str | None = None,
+    require_shape: str | None = None,   # 'list' | 'map' | 'scalar'
+) -> str:
+    fields = fields or DEFAULT_TEXT_FIELDS
+    parts = []
+
+    # Section/Subsection TAG filters
+    if section:
+        parts.append(f"@section:{{{_escape_tag(section)}}}")
+    if subsection:
+        parts.append(f"@subsection:{{{_escape_tag(subsection)}}}")
+
+    # equals_filters on any TEXT field (exact phrase)
+    if equals_filters:
+        for fld, val in equals_filters.items():
+            parts.append(f'@{fld}:"{_escape_phrase(val)}"')
+
+    # shape filter (TEXT field)
+    if require_shape in {"list","map","scalar"}:
+        parts.append(f'@shape:{require_shape}')
+
+    # main query_text across provided fields (OR)
+    or_chunks = []
+    if query_text:
+        phrase = _escape_phrase(query_text)
+        for f in fields:
+            or_chunks.append(f'@{f}:"{phrase}"')
+    if or_chunks:
+        parts.append("(" + " | ".join(or_chunks) + ")")
+
+    # include_terms: terms that must appear in any of the fields
+    if include_terms:
+        inc_parts = []
+        for term in include_terms:
+            t = _escape_phrase(term)
+            inc_parts.append("(" + " | ".join([f'@{f}:"{t}"' for f in fields]) + ")")
+        parts.extend(inc_parts)
+
+    # exclude_terms: terms that must NOT appear
+    if exclude_terms:
+        exc_parts = []
+        for term in exclude_terms:
+            t = _escape_phrase(term)
+            exc_parts.append("(" + " | ".join([f'-@{f}:"{t}"' for f in fields]) + ")")
+        parts.extend(exc_parts)
+
+    if not parts:
+        return "*"
+    return " ".join(parts)
+
+# ---------- Dense KNN ----------
+def dense_search(
+    query_text: str,
+    k: int = 5,
+    section: str | None = None,
+    subsection: str | None = None,
+    equals_filters: dict[str,str] | None = None,
+    require_shape: str | None = None,
+    return_fields: list[str] | None = None,
+):
+    vec = get_vec(f"query: {query_text}")
+    # build filter prefix (TAG/TEXT exacts) then append KNN
+    filter_parts = []
+    if section:
+        filter_parts.append(f"@section:{{{_escape_tag(section)}}}")
+    if subsection:
+        filter_parts.append(f"@subsection:{{{_escape_tag(subsection)}}}")
+    if require_shape in {"list","map","scalar"}:
+        filter_parts.append(f'@shape:{require_shape}')
+    if equals_filters:
+        for fld, val in equals_filters.items():
+            filter_parts.append(f'@{fld}:"{_escape_phrase(val)}"')
+
+    prefix = " ".join(filter_parts) if filter_parts else "*"
+    q = Query(f"{prefix}=>[KNN {k} @vector $vec AS vector_score]")\
+        .return_fields(*(return_fields or _project_fields()))\
+        .sort_by("vector_score", asc=True)\
+        .dialect(4)\
+        .with_params({"vec": vec})
+
+    res = r.ft(INDEX_NAME).search(q)
+    out = []
+    for d in res.docs:
+        out.append({
+            "distance": float(d.vector_score),
+            "question_id": _bytes_to_str(getattr(d, "question_id", "")),
+            "question_label": _bytes_to_str(getattr(d, "question_label", "")),
+            "json_property": _bytes_to_str(getattr(d, "json_property", "")),
+            "json_value": _bytes_to_str(getattr(d, "json_value", "")),
+            "json_pointer": _bytes_to_str(getattr(d, "json_pointer", "")),
+            "section": _bytes_to_str(getattr(d, "section", "")),
+            "subsection": _bytes_to_str(getattr(d, "subsection", "")),
+            "shape": _bytes_to_str(getattr(d, "shape", "")),
+            "shape_size": _bytes_to_str(getattr(d, "shape_size", "")),
+            "chunk": _bytes_to_str(getattr(d, "text_chunk", ""))[:240],
+        })
+    return out
+
+# ---------- BM25 ("sparse-ish") ----------
+def bm25_search(
+    query_text: str | None = None,
+    k: int = 5,
+    fields: list[str] | None = None,
+    include_terms: list[str] | None = None,
+    exclude_terms: list[str] | None = None,
+    equals_filters: dict[str,str] | None = None,
+    section: str | None = None,
+    subsection: str | None = None,
+    require_shape: str | None = None,
+    return_fields: list[str] | None = None,
+):
+    expr = build_bm25_clause(
+        query_text=query_text,
+        fields=fields,
+        include_terms=include_terms,
+        exclude_terms=exclude_terms,
+        equals_filters=equals_filters,
+        section=section,
+        subsection=subsection,
+        require_shape=require_shape,
+    )
+    q = Query(expr)\
+        .return_fields(*(return_fields or [f for f in _project_fields() if f != "vector_score"]))\
+        .paging(0, k)\
+        .dialect(4)
+
+    res = r.ft(INDEX_NAME).search(q)
+    out = []
+    for d in res.docs:
+        out.append({
+            "distance": None,
+            "question_id": _bytes_to_str(getattr(d, "question_id", "")),
+            "question_label": _bytes_to_str(getattr(d, "question_label", "")),
+            "json_property": _bytes_to_str(getattr(d, "json_property", "")),
+            "json_value": _bytes_to_str(getattr(d, "json_value", "")),
+            "json_pointer": _bytes_to_str(getattr(d, "json_pointer", "")),
+            "section": _bytes_to_str(getattr(d, "section", "")),
+            "subsection": _bytes_to_str(getattr(d, "subsection", "")),
+            "shape": _bytes_to_str(getattr(d, "shape", "")),
+            "shape_size": _bytes_to_str(getattr(d, "shape_size", "")),
+            "chunk": _bytes_to_str(getattr(d, "text_chunk", ""))[:240],
+        })
+    return out
+
+# ---------- RRF fusion ----------
+def rrf_fuse(dense_results, bm25_results, k=5, c=60.0):
+    def rankify(items):
+        for i, it in enumerate(items, start=1):
+            it["_rank"] = i
+    rankify(dense_results); rankify(bm25_results)
+
+    def doc_id(it):
+        return it.get("question_id") or f"{it.get('json_property')}|{it.get('json_pointer')}"
+
+    scores, by_id = {}, {}
+    for lst in (dense_results, bm25_results):
+        for it in lst:
+            did = doc_id(it)
+            by_id.setdefault(did, it)
+            rnk = it.get("_rank", 9999)
+            scores[did] = scores.get(did, 0.0) + 1.0 / (c + rnk)
+
+    fused = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:k]
+    return [by_id[did] | {"rrf": sc} for did, sc in fused]
+
+# ---------- One-call generic search ----------
+def search(
+    query_text: str | None,
+    mode: str = "hybrid",               # 'dense' | 'bm25' | 'hybrid'
+    k: int = 5,
+    section: str | None = None,
+    subsection: str | None = None,
+    equals_filters: dict[str,str] | None = None,  # e.g. {"question_label": "Employee Name"}
+    require_shape: str | None = None,             # 'list'|'map'|'scalar'
+    fields: list[str] | None = None,             # BM25 fields
+    include_terms: list[str] | None = None,      # extra required terms
+    exclude_terms: list[str] | None = None,      # forbidden terms
+    return_fields: list[str] | None = None,
+    rrf_c: float = 60.0,
+):
+    if mode == "dense":
+        return dense_search(query_text or "", k, section, subsection, equals_filters, require_shape, return_fields)
+    if mode == "bm25":
+        return bm25_search(query_text, k, fields, include_terms, exclude_terms, equals_filters, section, subsection, require_shape, return_fields)
+    # hybrid
+    d = dense_search(query_text or "", k, section, subsection, equals_filters, require_shape, return_fields)
+    b = bm25_search(query_text, k, fields, include_terms, exclude_terms, equals_filters, section, subsection, require_shape, return_fields)
+    return rrf_fuse(d, b, k=k, c=rrf_c)
+
+# ---------- Utilities ----------
+def unique(field: str, limit: int = 2000):
+    # simple SCAN + HGET for moderate scale
+    cursor, seen = 0, set()
+    while True:
+        cursor, batch = r.scan(cursor=cursor, match=f"{PREFIX}*", count=1000)
+        for key in batch:
+            val = r.hget(key, field)
+            if val is not None:
+                seen.add(_bytes_to_str(val))
+                if len(seen) >= limit:
+                    return sorted(seen)
+        if cursor == 0:
+            break
+    return sorted(seen)
+
+def find_equals(field: str, value: str, k: int = 50):
+    expr = f'@{field}:"{_escape_phrase(value)}"'
+    q = Query(expr)\
+        .return_fields(*[f for f in _project_fields() if f != "vector_score"])\
+        .paging(0, k).dialect(4)
+    res = r.ft(INDEX_NAME).search(q)
+    return [{fld: _bytes_to_str(getattr(d, fld, "")) for fld in ["question_id","question_label","json_property","json_value","json_pointer","section","subsection","shape","shape_size"]} for d in res.docs]
+
+def find_regex(field: str, pattern: str, k: int = 50):
+    # RediSearch supports TAG regex but not full regex on TEXT; we approximate using wildcard:
+    # Convert very simple patterns: '^abc' -> 'abc*', 'xyz$' -> '*xyz'
+    p = pattern
+    if p.startswith("^") and p.endswith("$"):
+        p = p[1:-1] + "*"  # crude
+    elif p.startswith("^"):
+        p = p[1:] + "*"
+    elif p.endswith("$"):
+        p = "*" + p[:-1]
+    else:
+        p = f"*{p}*"
+
+    expr = f'@{field}:{p}'
+    q = Query(expr)\
+        .return_fields(*[f for f in _project_fields() if f != "vector_score"])\
+        .paging(0, k).dialect(4)
+    res = r.ft(INDEX_NAME).search(q)
+    return [{fld: _bytes_to_str(getattr(d, fld, "")) for fld in ["question_id","question_label","json_property","json_value","json_pointer","section","subsection","shape","shape_size"]} for d in res.docs]
+
+# ---------- Examples ----------
+if __name__ == "__main__":
+    # 1) Generic NL: hybrid
+    print("\n[HYBRID] find compensation")
+    res = search("current compensation", mode="hybrid", k=5)
+    for i, x in enumerate(res, 1):
+        print(f"{i:>2}. {x.get('question_label')} -> {x.get('json_value')} (ptr={x.get('json_pointer')})")
+
+    # 2) Unique values (ids)
+    print("\n[UNIQUE question_id]")
+    print(unique("question_id")[:20])
+
+    # 3) Pointer by exact label (generic)
+    print("\n[POINTER by exact label]")
+    print(find_equals("question_label", "Employee Name", k=5))
+
+    # 4) Generic filtered NL: section/subsection, require shape 'list'
+    print("\n[HYBRID] section filter + require list")
+    res = search(
+        query_text="address",
+        mode="hybrid",
+        k=10,
+        section="Personnel",
+        require_shape="list"
+    )
+    for i, x in enumerate(res, 1):
+        print(f"{i:>2}. {x.get('question_label')} | shape={x.get('shape')} size={x.get('shape_size')} -> {x.get('json_pointer')}")
