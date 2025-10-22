@@ -13,6 +13,10 @@ load_dotenv()
 # ---- Config ----
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_USERNAME = os.getenv("REDIS_USERNAME") or None
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
+REDIS_SSL = (os.getenv("REDIS_SSL", "false").lower() == "true")
+
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
 INDEX_NAME  = os.getenv("INDEX_NAME", "idx:forms")
@@ -22,8 +26,17 @@ FORM_ID_DEF = os.getenv("DEFAULT_FORM_ID", "A")
 VECTOR_DIM  = int(os.getenv("VECTOR_DIM", "1024"))
 
 # ---- Connect ----
-r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=False)
+r = redis.Redis(
+    host=REDIS_HOST,
+    port=REDIS_PORT,
+    username=REDIS_USERNAME,
+    password=REDIS_PASSWORD,
+    ssl=REDIS_SSL,
+    decode_responses=False,
+)
+# sanity check
 r.ping()
+
 ollama = Client(host=OLLAMA_HOST)
 ollama.show("bge-m3")  # verify availability
 
@@ -60,7 +73,7 @@ def ensure_index():
         TagField("$.form_id",    as_name="form_id"),
         TagField("$.section",    as_name="section"),
         TagField("$.subsection", as_name="subsection"),
-        TagField("$.status",     as_name="status"),  # optional if you set it later
+        TagField("$.status",     as_name="status"),  # optional
 
         # VECTOR field over JSON array
         VectorField(
@@ -83,7 +96,7 @@ def ensure_index():
 
 # ---- CSV -> JSON doc model ----
 def row_to_doc(row: pd.Series, form_id: str) -> dict:
-    # Your CSV columns:
+    # CSV columns (as you provided):
     # Prop, question_id, question_label, section, sub_section,
     # question_context, repeatable, value, json_pointer
     label = str(row.get("question_label", "") or "")
@@ -96,7 +109,7 @@ def row_to_doc(row: pd.Series, form_id: str) -> dict:
     ptr   = str(row.get("json_pointer", "") or "")
     qid   = str(row.get("question_id", "") or "")
 
-    # Build human text for BM25 (do NOT stuff volatile value into semantic meaning)
+    # Human text for BM25 + embedding
     text = (
         f"Section: {sec}. Subsection: {sub}. "
         f"Field: {label}. Property: {prop}. "
@@ -109,19 +122,18 @@ def row_to_doc(row: pd.Series, form_id: str) -> dict:
         "subsection": sub,
         "label": label,
         "propertyname": prop,
-        "value": val,          # keep raw value for display/patch
-        "pointer": ptr,        # authoritative JSON Pointer
+        "value": val,
+        "pointer": ptr,
         "text": text,
         "question_context": ctx,
         "repeatable": rep,
-        "question_id": qid,    # stored as reference if you need it
-        # vector populated later
+        "question_id": qid,
+        # vec set later
     }
     return doc
 
 def ingest_csv(file_path: str, form_id: str):
     df = pd.read_csv(file_path)
-    # sanity: ensure required columns exist
     required = [
         "Prop","question_id","question_label","section","sub_section",
         "question_context","repeatable","value","json_pointer"
@@ -133,9 +145,7 @@ def ingest_csv(file_path: str, form_id: str):
     total = 0
     for _, row in df.iterrows():
         doc = row_to_doc(row, form_id=form_id)
-        # embed the BM25 text
         doc["vec"] = embed_text(doc["text"])
-        # stable key: form:<form_id>:row:<ulid()>
         key = f"{KEY_PREFIX}{form_id}:row:{ulid.new().str}"
         r.json().set(key, "$", doc)
         total += 1
@@ -149,8 +159,7 @@ def ingest_folder(csv_dir: str):
 
     grand = 0
     for f in files:
-        # You can derive form_id from filename if preferred:
-        form_id = FORM_ID_DEF
+        form_id = FORM_ID_DEF  # or derive from filename if needed
         print(f"[info] ingesting {os.path.basename(f)} (form_id={form_id})")
         count = ingest_csv(f, form_id)
         print(f"[ok] {count} rows")
@@ -160,159 +169,3 @@ def ingest_folder(csv_dir: str):
 if __name__ == "__main__":
     ensure_index()
     ingest_folder(CSV_DIR)
-
-
-
-
-
-
-
-
-
-
-
-#!/usr/bin/env python3
-import os
-import numpy as np
-import redis
-from dotenv import load_dotenv
-from ollama import Client
-from redis.commands.search.query import Query
-
-load_dotenv()
-
-REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-INDEX_NAME  = os.getenv("INDEX_NAME", "idx:forms")
-
-VECTOR_DIM  = int(os.getenv("VECTOR_DIM", "1024"))
-
-r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=False)
-r.ping()
-ollama = Client(host=OLLAMA_HOST)
-ollama.show("bge-m3")
-
-def embed_bytes(text: str) -> bytes:
-    """Return float32 bytes for Redis PARAMS."""
-    emb = ollama.embeddings(model="bge-m3", prompt=text)["embedding"]
-    if len(emb) != VECTOR_DIM:
-        raise ValueError(f"Expected {VECTOR_DIM}-D vector, got {len(emb)}")
-    return np.asarray(emb, dtype=np.float32).tobytes()
-
-def _esc_tag(v: str) -> str:
-    return str(v).replace(" ", r"\ ")
-
-def one_call_hybrid(
-    query_text: str,
-    k: int = 10,
-    form_id: str | None = None,
-    section: str | None = None,
-    subsection: str | None = None,
-    text_terms: list[str] | None = None,
-    return_fields: list[str] | None = None
-):
-    """
-    Single FT.SEARCH: filters + BM25 text + KNN.
-    DIALECT >= 2 is required for =>[KNN ...].
-    """
-    blob = embed_bytes(query_text)
-    filters = []
-    if form_id:   filters.append(f"@form_id:{{{_esc_tag(form_id)}}}")
-    if section:   filters.append(f"@section:{{{_esc_tag(section)}}}")
-    if subsection:filters.append(f"@subsection:{{{_esc_tag(subsection)}}}")
-
-    text_part = ""
-    if text_terms:
-        # search in TEXT field "text" primarily; add label/propertyname for recall
-        ors = []
-        for t in text_terms:
-            t = t.replace('"', r'\"')
-            ors.append(f'(@text:"{t}" | @label:"{t}" | @propertyname:"{t}")')
-        text_part = "(" + " | ".join(ors) + ")"
-
-    left = " ".join(filters + ([text_part] if text_part else [])) or "*"
-    right = f"=>[KNN {k} @vec $BLOB AS __score]"
-    expr = f"{left} {right}"
-
-    q = Query(expr)\
-        .return_fields(*(return_fields or ["label","pointer","value","section","subsection","form_id","__score"]))\
-        .sort_by("__score", asc=True)\
-        .dialect(2)\
-        .with_params({"BLOB": blob})
-    res = r.ft(INDEX_NAME).search(q)
-    out = []
-    for d in res.docs:
-        out.append({
-            "label": d.label.decode() if isinstance(d.label, (bytes,bytearray)) else d.label,
-            "pointer": d.pointer.decode() if isinstance(d.pointer,(bytes,bytearray)) else d.pointer,
-            "value": d.value.decode() if isinstance(d.value,(bytes,bytearray)) else d.value,
-            "section": d.section.decode() if isinstance(d.section,(bytes,bytearray)) else d.section,
-            "subsection": d.subsection.decode() if isinstance(d.subsection,(bytes,bytearray)) else d.subsection,
-            "form_id": d.form_id.decode() if isinstance(d.form_id,(bytes,bytearray)) else d.form_id,
-            "score": float(d.__score),
-        })
-    return out
-
-# Optional: two-call RRF fusion baseline
-def bm25_only(query_text: str, k=20, form_id=None, section=None, subsection=None):
-    filters = []
-    if form_id:    filters.append(f"@form_id:{{{_esc_tag(form_id)}}}")
-    if section:    filters.append(f"@section:{{{_esc_tag(section)}}}")
-    if subsection: filters.append(f"@subsection:{{{_esc_tag(subsection)}}}")
-    text = query_text.replace('"', r'\"')
-    left = " ".join(filters) or "*"
-    expr = f'{left} (@text:"{text}" | @label:"{text}" | @propertyname:"{text}")'
-    q = Query(expr).return_fields("label","pointer","value","section","subsection","form_id")\
-                   .paging(0, k).dialect(2)
-    res = r.ft(INDEX_NAME).search(q)
-    out = []
-    for d in res.docs:
-        out.append({
-            "label": d.label.decode() if isinstance(d.label,(bytes,bytearray)) else d.label,
-            "pointer": d.pointer.decode() if isinstance(d.pointer,(bytes,bytearray)) else d.pointer,
-            "value": d.value.decode() if isinstance(d.value,(bytes,bytearray)) else d.value,
-            "section": d.section.decode() if isinstance(d.section,(bytes,bytearray)) else d.section,
-            "subsection": d.subsection.decode() if isinstance(d.subsection,(bytes,bytearray)) else d.subsection,
-            "form_id": d.form_id.decode() if isinstance(d.form_id,(bytes,bytearray)) else d.form_id,
-        })
-    return out
-
-def knn_only(query_text: str, k=20, form_id=None, section=None, subsection=None):
-    return one_call_hybrid(query_text, k=k, form_id=form_id, section=section, subsection=subsection, text_terms=None)
-
-def rrf_fuse(dense, sparse, k=10, c=60.0):
-    def rankify(lst):
-        for i, it in enumerate(lst, start=1):
-            it["_r"] = i
-    rankify(dense); rankify(sparse)
-    def idf(it):  # prefer pointer as identity
-        return it.get("pointer") or (it.get("label") + "|" + it.get("form_id", ""))
-    scores, best = {}, {}
-    for lst in (dense, sparse):
-        for it in lst:
-            did = idf(it); best.setdefault(did, it)
-            scores[did] = scores.get(did, 0.0) + 1.0 / (c + it.get("_r", 9999))
-    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:k]
-    return [best[did] | {"rrf": sc} for did, sc in ranked]
-
-if __name__ == "__main__":
-    # Example queries
-    print("\n[ONE-CALL HYBRID] query='address city postcode', form_id=A, section=address")
-    res = one_call_hybrid(
-        query_text="address city postcode",
-        k=10,
-        form_id="A",
-        section="address",
-        text_terms=["address","city","postcode"],
-        return_fields=["label","pointer","value","section","subsection","form_id","__score"]
-    )
-    for i, x in enumerate(res, 1):
-        print(f"{i:>2}. {x['label']}  -> {x['pointer']}  (score={x['score']:.6f})")
-
-    print("\n[RRF FUSION] query='date of joining' (BM25 + KNN)")
-    bm = bm25_only("date of joining", k=20, form_id="A")
-    kn = knn_only("date of joining", k=20, form_id="A")
-    fused = rrf_fuse(kn, bm, k=10)
-    for i, x in enumerate(fused, 1):
-        print(f"{i:>2}. {x['label']}  -> {x['pointer']}  (rrf={x['rrf']:.4f})")
