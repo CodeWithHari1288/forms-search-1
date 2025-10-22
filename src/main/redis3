@@ -122,3 +122,77 @@ def ingest_folder(folder: str):
 
 if __name__ == "__main__":
     ensure_index(); ingest_folder(CSV_DIR)
+
+
+
+
+
+
+
+
+#!/usr/bin/env python3
+import os
+import numpy as np
+import redis
+from ollama import Client
+from dotenv import load_dotenv
+from redis.commands.search.query import Query
+
+load_dotenv()
+
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+INDEX_NAME  = os.getenv("INDEX_NAME", "json_field_index")
+PREFIX      = os.getenv("INDEX_PREFIX", "json_field:")
+
+DEFAULT_TEXT_FIELDS = ["text_boost","text_chunk","question_label","json_property","json_value"]
+
+r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=False)
+r.ping()
+ollama_client = Client(host=OLLAMA_HOST)
+ollama_client.show("bge-m3")
+
+def _b(x): return x.decode() if isinstance(x,(bytes,bytearray)) else x
+def _escape_tag(s): return "" if s is None else str(s).strip().replace(" ", r"\ ")
+def _escape_phrase(s): return str(s).replace('"', r'\"')
+
+def get_vec(text: str) -> bytes:
+    resp = ollama_client.embeddings(model="bge-m3", prompt=text)
+    return np.array(resp["embedding"], dtype=np.float32).tobytes()
+
+def _project_fields():
+    return ["vector_score","question_id","question_label","json_property","json_value","json_pointer","section","subsection","shape","shape_size","text_chunk"]
+
+def dense_search(query_text: str, k=5, section=None, subsection=None, equals_filters=None, require_shape=None, return_fields=None):
+    vec = get_vec(f"query: {query_text}")
+    filters=[]
+    if section: filters.append(f"@section:{{{_escape_tag(section)}}}")
+    if subsection: filters.append(f"@subsection:{{{_escape_tag(subsection)}}}")
+    if require_shape in {"list","map","scalar"}: filters.append(f"@shape:{require_shape}")
+    if equals_filters:
+        for fld,val in (equals_filters or {}).items():
+            filters.append(f'@{fld}:"{_escape_phrase(val)}"')
+    prefix = " ".join(filters) if filters else "*"
+    q = Query(f"{prefix}=>[KNN {k} @vector $vec AS vector_score]")\
+        .return_fields(*(return_fields or _project_fields()))\
+        .sort_by("vector_score", asc=True)\
+        .dialect(4)\
+        .with_params({"vec": vec})
+    res = r.ft(INDEX_NAME).search(q)
+    out=[]
+    for d in res.docs:
+        out.append({
+            "distance": float(d.vector_score),
+            "question_id": _b(getattr(d,"question_id","")),
+            "question_label": _b(getattr(d,"question_label","")),
+            "json_property": _b(getattr(d,"json_property","")),
+            "json_value": _b(getattr(d,"json_value","")),
+            "json_pointer": _b(getattr(d,"json_pointer","")),
+            "section": _b(getattr(d,"section","")),
+            "subsection": _b(getattr(d,"subsection","")),
+            "shape": _b(getattr(d,"shape","")),
+            "shape_size": _b(getattr(d,"shape_size","")),
+            "chunk": _b(getattr(d,"text_chunk",""))[:240],
+        })
+    return out
