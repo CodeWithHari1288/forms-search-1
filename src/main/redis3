@@ -11,6 +11,7 @@ from redis.commands.search import IndexType
 
 load_dotenv()
 
+# ---------- Config ----------
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
@@ -19,109 +20,193 @@ PREFIX      = os.getenv("INDEX_PREFIX", "json_field:")
 CSV_DIR     = os.getenv("CSV_DIR", "./data")
 VECTOR_DIM  = int(os.getenv("VECTOR_DIM", "1024"))
 
+# ---------- Connect ----------
 r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=False)
 r.ping()
 ollama_client = Client(host=OLLAMA_HOST)
 ollama_client.show("bge-m3")
 
+# ---------- Embeddings ----------
 def embed(text: str) -> bytes:
     resp = ollama_client.embeddings(model="bge-m3", prompt=text)
-    return np.array(resp["embedding"], dtype=np.float32).tobytes()
+    arr = np.array(resp["embedding"], dtype=np.float32)
+    return arr.tobytes()
 
+# ---------- Helpers ----------
 def norm_tag(v: str) -> str:
-    if v is None: return ""
+    """Escape spaces for Redis TAG fields (' ' -> '\ ')."""
+    if v is None:
+        return ""
     return str(v).strip().replace(" ", r"\ ")
 
 def infer_shape(value: str):
+    """Try to detect list/map/scalar by JSON parsing of `value`."""
     try:
         obj = json.loads(value)
-        if isinstance(obj, list):  return ("list", len(obj))
-        if isinstance(obj, dict):  return ("map",  len(obj))
+        if isinstance(obj, list):
+            return ("list", len(obj))
+        if isinstance(obj, dict):
+            return ("map",  len(obj))
     except Exception:
         pass
     return ("scalar", 1)
 
-def build_text_chunk(row):
-    sec = str(row.get("section","")); sub = str(row.get("subsection",""))
-    val = "" if pd.isna(row.get("json_value")) else str(row.get("json_value"))
-    return f"question: {row.get('question_label','')}\nproperty: {row.get('json_property','')}\nvalue: {val}\njson_pointer: {row.get('json_pointer','')}\nsection: {sec} / subsection: {sub}"
+def build_text_chunk(row: pd.Series) -> str:
+    """Readable chunk for BM25 + context for embeddings."""
+    val = "" if pd.isna(row.get("value")) else str(row.get("value"))
+    ctx = "" if pd.isna(row.get("question_context")) else str(row.get("question_context"))
+    rep = "" if pd.isna(row.get("repeatable")) else str(row.get("repeatable"))
+    sec = str(row.get("section",""))
+    sub = str(row.get("sub_section",""))
+    return (
+        f"question: {row.get('question_label','')}\n"
+        f"property: {row.get('Prop','')}\n"
+        f"value: {val}\n"
+        f"json_pointer: {row.get('json_pointer','')}\n"
+        f"section: {sec} / sub_section: {sub}\n"
+        f"context: {ctx}\n"
+        f"repeatable: {rep}"
+    )
 
-def build_text_boost(row):
+def build_text_boost(row: pd.Series) -> str:
+    """Small lexical booster without external libs (improves BM25)."""
     def toks(s: str):
-        return [t for t in ''.join(ch if ch.isalnum() else ' ' for ch in s).lower().split() if len(t)>2]
-    label = str(row.get("question_label","")); prop = str(row.get("json_property",""))
-    val = "" if pd.isna(row.get("json_value")) else str(row.get("json_value"))
+        return [t for t in "".join(ch if ch.isalnum() else " " for ch in s).lower().split() if len(t) > 2]
+
+    label = str(row.get("question_label","") or "")
+    prop  = str(row.get("Prop","") or "")
+    val   = "" if pd.isna(row.get("value")) else str(row.get("value"))
+    ctx   = "" if pd.isna(row.get("question_context")) else str(row.get("question_context"))
     val_short = val[:160]
-    tokens = toks(label)+toks(prop)+toks(val_short)
-    dup = tokens + tokens
-    low = (label+" "+prop+" "+val_short).lower()
-    hints=[]; 
-    if "addr" in low or "address" in low: hints += ["address"]*4
-    if "id" in low: hints += ["id"]*3
-    if "pointer" in low or "path" in low: hints += ["pointer"]*3
-    if "name" in low: hints += ["name"]*2
-    if "date" in low: hints += ["date"]*2
-    return " ".join(dup+hints)
+    tokens = toks(label) + toks(prop) + toks(val_short) + toks(ctx)
+    dup = tokens + tokens  # x2 frequency to lift BM25 score
+
+    low = (label + " " + prop + " " + val_short + " " + ctx).lower()
+    hints = []
+    if "addr" in low or "address" in low: hints += ["address"] * 4
+    if "id" in low: hints += ["id"] * 3
+    if "pointer" in low or "path" in low: hints += ["pointer"] * 3
+    if "name" in low: hints += ["name"] * 2
+    if "date" in low: hints += ["date"] * 2
+    if "repeat" in low: hints += ["repeatable"] * 2
+
+    return " ".join(dup + hints)
 
 def ensure_index():
+    """Create RediSearch index if it doesn't exist."""
     try:
-        r.ft(INDEX_NAME).info(); print(f"[ok] Index '{INDEX_NAME}' exists."); return
-    except Exception: pass
+        r.ft(INDEX_NAME).info()
+        print(f"[ok] Index '{INDEX_NAME}' exists.")
+        return
+    except Exception:
+        pass
+
     schema = (
+        # BM25 text fields
         TextField("text_chunk"),
         TextField("text_boost"),
-        TextField("json_pointer"),
-        TextField("json_property"),
-        TextField("json_value"),
-        TextField("question_id"),
         TextField("question_label"),
+        TextField("Prop"),
+        TextField("value"),
+        TextField("question_context"),
+        TextField("repeatable"),
+        TextField("json_pointer"),
+        TextField("question_id"),
+
+        # Filterable tags
         TagField("section"),
-        TagField("subsection"),
+        TagField("sub_section"),
+
+        # Shape helpers
         TextField("shape"),
         TextField("shape_size"),
-        VectorField("vector","HNSW",{"TYPE":"FLOAT32","DIM":VECTOR_DIM,"DISTANCE_METRIC":"COSINE","M":16,"EF_CONSTRUCTION":200,"EF_RUNTIME":64}),
+
+        # Dense vector
+        VectorField(
+            "vector", "HNSW",
+            {"TYPE":"FLOAT32","DIM":VECTOR_DIM,"DISTANCE_METRIC":"COSINE","M":16,"EF_CONSTRUCTION":200,"EF_RUNTIME":64}
+        ),
     )
+
     definition = IndexDefinition(prefix=[PREFIX], index_type=IndexType.HASH)
     r.ft(INDEX_NAME).create_index(schema, definition=definition)
     print(f"[ok] Created index '{INDEX_NAME}'.")
 
 def read_and_normalize_csv(path: str) -> pd.DataFrame:
+    """
+    Expecting EXACT columns:
+      Prop, question_id, question_label, section, sub_section,
+      question_context, repeatable, value, json_pointer
+    """
     df = pd.read_csv(path)
-    rename_map = {
-        "Question id":"question_id","Question label":"question_label","Prop":"json_property","Value":"json_value",
-        "Section":"section","Subsection":"subsection","Json pointer":"json_pointer","Json path":"json_pointer"
-    }
-    for k,v in rename_map.items():
-        if k in df.columns: df.rename(columns={k:v}, inplace=True)
-    required = ["question_id","question_label","json_property","json_value","section","subsection","json_pointer"]
+
+    # If incoming file has different casing/spacing, normalize here (optional).
+    # For now we assume exact names as given by you.
+
+    required = [
+        "Prop","question_id","question_label","section","sub_section",
+        "question_context","repeatable","value","json_pointer"
+    ]
     missing = [c for c in required if c not in df.columns]
-    if missing: raise ValueError(f"{os.path.basename(path)} missing columns: {missing}")
+    if missing:
+        raise ValueError(f"{os.path.basename(path)} missing columns: {missing}")
     return df
 
 def ingest_folder(folder: str):
     files = sorted(glob.glob(os.path.join(folder, "*.csv")))
-    if not files: print(f"[warn] No CSV files in {folder}"); return
-    total=0
+    if not files:
+        print(f"[warn] No CSV files in {folder}")
+        return
+    total = 0
     for fp in files:
         print(f"[info] Ingesting {os.path.basename(fp)}")
-        df = read_and_normalize_csv(fp); src=os.path.basename(fp)
-        for i,row in df.iterrows():
-            qid=str(row["question_id"]); qlbl=str(row["question_label"]); prop=str(row["json_property"])
-            val="" if pd.isna(row["json_value"]) else str(row["json_value"]); ptr=str(row["json_pointer"])
-            sec=norm_tag(row["section"]); sub=norm_tag(row["subsection"])
-            text_chunk=build_text_chunk(row); text_boost=build_text_boost(row); vec=embed(f"passage: {text_chunk}")
-            shape,size = infer_shape(val)
-            key=f"{PREFIX}{src}:{qid or i}"
+        df = read_and_normalize_csv(fp)
+        src = os.path.basename(fp)
+        for i, row in df.iterrows():
+            qid   = str(row["question_id"])
+            label = str(row["question_label"])
+            prop  = str(row["Prop"])
+            sec   = norm_tag(row["section"])
+            sub   = norm_tag(row["sub_section"])
+            ctx   = "" if pd.isna(row["question_context"]) else str(row["question_context"])
+            rep   = "" if pd.isna(row["repeatable"]) else str(row["repeatable"])
+            val   = "" if pd.isna(row["value"]) else str(row["value"])
+            ptr   = str(row["json_pointer"])
+
+            text_chunk = build_text_chunk(row)
+            text_boost = build_text_boost(row)
+            vec        = embed(f"passage: {text_chunk}")
+            shape, size = infer_shape(val)
+
+            key = f"{PREFIX}{src}:{qid or i}"
             r.hset(key, mapping={
-                "question_id": qid, "question_label": qlbl, "json_property": prop, "json_value": val,
-                "json_pointer": ptr, "section": sec, "subsection": sub, "shape": shape, "shape_size": str(size),
-                "text_chunk": text_chunk, "text_boost": text_boost, "vector": vec,
+                "question_id": qid,
+                "question_label": label,
+                "Prop": prop,
+                "value": val,
+                "json_pointer": ptr,
+                "section": sec,
+                "sub_section": sub,
+                "question_context": ctx,
+                "repeatable": rep,
+                "shape": shape,
+                "shape_size": str(size),
+                "text_chunk": text_chunk,
+                "text_boost": text_boost,
+                "vector": vec,
             })
-            total+=1
+            total += 1
     print(f"[ok] Ingested {total} rows from {len(files)} files.")
 
 if __name__ == "__main__":
-    ensure_index(); ingest_folder(CSV_DIR)
+    ensure_index()
+    ingest_folder(CSV_DIR)
+
+
+
+
+
+
 
 
 
@@ -140,14 +225,21 @@ from redis.commands.search.query import Query
 
 load_dotenv()
 
+# ---------- Config ----------
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 INDEX_NAME  = os.getenv("INDEX_NAME", "json_field_index")
 PREFIX      = os.getenv("INDEX_PREFIX", "json_field:")
 
-DEFAULT_TEXT_FIELDS = ["text_boost","text_chunk","question_label","json_property","json_value"]
+# Searchable text fields for BM25
+DEFAULT_TEXT_FIELDS = [
+    "text_boost", "text_chunk",
+    "question_label", "Prop", "value",
+    "question_context", "repeatable"
+]
 
+# ---------- Connect ----------
 r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=False)
 r.ping()
 ollama_client = Client(host=OLLAMA_HOST)
@@ -159,26 +251,45 @@ def _escape_phrase(s): return str(s).replace('"', r'\"')
 
 def get_vec(text: str) -> bytes:
     resp = ollama_client.embeddings(model="bge-m3", prompt=text)
-    return np.array(resp["embedding"], dtype=np.float32).tobytes()
+    arr = np.array(resp["embedding"], dtype=np.float32)
+    return arr.tobytes()
 
 def _project_fields():
-    return ["vector_score","question_id","question_label","json_property","json_value","json_pointer","section","subsection","shape","shape_size","text_chunk"]
+    return [
+        "vector_score",
+        "question_id","question_label","Prop","value","json_pointer",
+        "section","sub_section",
+        "question_context","repeatable",
+        "shape","shape_size",
+        "text_chunk"
+    ]
 
-def dense_search(query_text: str, k=5, section=None, subsection=None, equals_filters=None, require_shape=None, return_fields=None):
+# ---------- Dense (KNN) ----------
+def dense_search(
+    query_text: str,
+    k=5,
+    section=None,
+    sub_section=None,
+    equals_filters=None,
+    require_shape=None,
+    return_fields=None
+):
     vec = get_vec(f"query: {query_text}")
     filters=[]
-    if section: filters.append(f"@section:{{{_escape_tag(section)}}}")
-    if subsection: filters.append(f"@subsection:{{{_escape_tag(subsection)}}}")
+    if section:     filters.append(f"@section:{{{_escape_tag(section)}}}")
+    if sub_section: filters.append(f"@sub_section:{{{_escape_tag(sub_section)}}}")
     if require_shape in {"list","map","scalar"}: filters.append(f"@shape:{require_shape}")
     if equals_filters:
         for fld,val in (equals_filters or {}).items():
             filters.append(f'@{fld}:"{_escape_phrase(val)}"')
     prefix = " ".join(filters) if filters else "*"
+
     q = Query(f"{prefix}=>[KNN {k} @vector $vec AS vector_score]")\
         .return_fields(*(return_fields or _project_fields()))\
         .sort_by("vector_score", asc=True)\
         .dialect(4)\
         .with_params({"vec": vec})
+
     res = r.ft(INDEX_NAME).search(q)
     out=[]
     for d in res.docs:
@@ -186,13 +297,150 @@ def dense_search(query_text: str, k=5, section=None, subsection=None, equals_fil
             "distance": float(d.vector_score),
             "question_id": _b(getattr(d,"question_id","")),
             "question_label": _b(getattr(d,"question_label","")),
-            "json_property": _b(getattr(d,"json_property","")),
-            "json_value": _b(getattr(d,"json_value","")),
+            "Prop": _b(getattr(d,"Prop","")),
+            "value": _b(getattr(d,"value","")),
             "json_pointer": _b(getattr(d,"json_pointer","")),
             "section": _b(getattr(d,"section","")),
-            "subsection": _b(getattr(d,"subsection","")),
+            "sub_section": _b(getattr(d,"sub_section","")),
+            "question_context": _b(getattr(d,"question_context","")),
+            "repeatable": _b(getattr(d,"repeatable","")),
             "shape": _b(getattr(d,"shape","")),
             "shape_size": _b(getattr(d,"shape_size","")),
             "chunk": _b(getattr(d,"text_chunk",""))[:240],
         })
     return out
+
+# ---------- BM25 ----------
+def build_bm25_expr(
+    query_text=None, fields=None,
+    include_terms=None, exclude_terms=None,
+    equals_filters=None, section=None, sub_section=None,
+    require_shape=None
+):
+    fields = fields or DEFAULT_TEXT_FIELDS
+    parts=[]
+    if section:     parts.append(f"@section:{{{_escape_tag(section)}}}")
+    if sub_section: parts.append(f"@sub_section:{{{_escape_tag(sub_section)}}}")
+    if require_shape in {"list","map","scalar"}: parts.append(f"@shape:{require_shape}")
+    if equals_filters:
+        for fld,val in (equals_filters or {}).items():
+            parts.append(f'@{fld}:"{_escape_phrase(val)}"')
+
+    ors=[]
+    if query_text:
+        phrase=_escape_phrase(query_text)
+        ors=[f'@{f}:"{phrase}"' for f in fields]
+    if ors: parts.append("(" + " | ".join(ors) + ")")
+
+    if include_terms:
+        for t in include_terms:
+            tt=_escape_phrase(t)
+            parts.append("(" + " | ".join([f'@{f}:"{tt}"' for f in fields]) + ")")
+    if exclude_terms:
+        for t in exclude_terms:
+            tt=_escape_phrase(t)
+            parts.append("(" + " | ".join([f'-@{f}:"{tt}"' for f in fields]) + ")")
+
+    return " ".join(parts) if parts else "*"
+
+def bm25_search(
+    query_text=None, k=5, fields=None,
+    include_terms=None, exclude_terms=None,
+    equals_filters=None, section=None, sub_section=None,
+    require_shape=None, return_fields=None
+):
+    expr = build_bm25_expr(query_text, fields, include_terms, exclude_terms, equals_filters, section, sub_section, require_shape)
+    q = Query(expr)\
+        .return_fields(*(return_fields or [f for f in _project_fields() if f != "vector_score"]))\
+        .paging(0, k)\
+        .dialect(4)
+    res = r.ft(INDEX_NAME).search(q)
+    out=[]
+    for d in res.docs:
+        out.append({
+            "distance": None,
+            "question_id": _b(getattr(d,"question_id","")),
+            "question_label": _b(getattr(d,"question_label","")),
+            "Prop": _b(getattr(d,"Prop","")),
+            "value": _b(getattr(d,"value","")),
+            "json_pointer": _b(getattr(d,"json_pointer","")),
+            "section": _b(getattr(d,"section","")),
+            "sub_section": _b(getattr(d,"sub_section","")),
+            "question_context": _b(getattr(d,"question_context","")),
+            "repeatable": _b(getattr(d,"repeatable","")),
+            "shape": _b(getattr(d,"shape","")),
+            "shape_size": _b(getattr(d,"shape_size","")),
+            "chunk": _b(getattr(d,"text_chunk",""))[:240],
+        })
+    return out
+
+# ---------- Hybrid (RRF fusion) ----------
+def rrf_fuse(dense_results, bm25_results, k=5, c=60.0):
+    def rankify(items):
+        for i, it in enumerate(items, start=1):
+            it["_rank"] = i
+    rankify(dense_results); rankify(bm25_results)
+
+    def doc_id(it):
+        return it.get("question_id") or f"{it.get('Prop')}|{it.get('json_pointer')}"
+
+    scores, by_id = {}, {}
+    for lst in (dense_results, bm25_results):
+        for it in lst:
+            did = doc_id(it); by_id.setdefault(did, it)
+            rnk = it.get("_rank", 9999)
+            scores[did] = scores.get(did, 0.0) + 1.0/(c + rnk)
+    fused = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:k]
+    return [by_id[did] | {"rrf": sc} for did, sc in fused]
+
+# ---------- Utilities ----------
+def unique(field: str, limit=5000):
+    cursor, seen = 0, set()
+    while True:
+        cursor, keys = r.scan(cursor=cursor, match=f"{PREFIX}*", count=1000)
+        for k in keys:
+            v = r.hget(k, field)
+            if v is not None:
+                seen.add(_b(v))
+                if len(seen) >= limit:
+                    return sorted(seen)
+        if cursor == 0: break
+    return sorted(seen)
+
+def find_equals(field: str, value: str, k=50):
+    expr = f'@{field}:"{_escape_phrase(value)}"'
+    q = Query(expr)\
+        .return_fields(*[f for f in _project_fields() if f != "vector_score"])\
+        .paging(0, k)\
+        .dialect(4)
+    res = r.ft(INDEX_NAME).search(q)
+    return [{
+        fld: _b(getattr(d, fld, ""))
+        for fld in ["question_id","question_label","Prop","value","json_pointer",
+                    "section","sub_section","question_context","repeatable",
+                    "shape","shape_size"]
+    } for d in res.docs]
+
+# ---------- Demo ----------
+if __name__ == "__main__":
+    print("\n[HYBRID] query='current compensation'")
+    d = dense_search("current compensation", k=5)
+    b = bm25_search("current compensation", k=5)
+    fused = rrf_fuse(d, b, k=5)
+    for i, x in enumerate(fused, 1):
+        print(f"{i:>2}. rrf={x.get('rrf'):.4f} | {x.get('question_label')} -> {x.get('value')} | {x.get('json_pointer')}")
+
+    print("\n[UNIQUE] question_id (first 20)")
+    print(unique("question_id")[:20])
+
+    print("\n[POINTER by exact label] 'Employee Name'")
+    print(find_equals("question_label", "Employee Name", k=5))
+
+    print("\n[Filter] section='Personnel', require list, query='address'")
+    fused2 = rrf_fuse(
+        dense_search("address", k=10, section="Personnel", require_shape="list"),
+        bm25_search("address", k=10, section="Personnel", require_shape="list"),
+        k=10
+    )
+    for i, x in enumerate(fused2, 1):
+        print(f"{i:>2}. {x.get('question_label')} | shape={x.get('shape')} size={x.get('shape_size')} -> {x.get('json_pointer')}")
