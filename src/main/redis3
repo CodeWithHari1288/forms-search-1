@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+import os, glob, json
+import numpy as np
+import pandas as pd
+import redis
+from ollama import Client
+from dotenv import load_dotenv
+from redis.commands.search.field import TextField, VectorField, TagField
+from redis.commands.search.indexDefinition import IndexDefinition
+from redis.commands.search import IndexType
+
+load_dotenv()
+
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+INDEX_NAME  = os.getenv("INDEX_NAME", "json_field_index")
+PREFIX      = os.getenv("INDEX_PREFIX", "json_field:")
+CSV_DIR     = os.getenv("CSV_DIR", "./data")
+VECTOR_DIM  = int(os.getenv("VECTOR_DIM", "1024"))
+
+r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=False)
+r.ping()
+ollama_client = Client(host=OLLAMA_HOST)
+ollama_client.show("bge-m3")
+
+def embed(text: str) -> bytes:
+    resp = ollama_client.embeddings(model="bge-m3", prompt=text)
+    return np.array(resp["embedding"], dtype=np.float32).tobytes()
+
+def norm_tag(v: str) -> str:
+    if v is None: return ""
+    return str(v).strip().replace(" ", r"\ ")
+
+def infer_shape(value: str):
+    try:
+        obj = json.loads(value)
+        if isinstance(obj, list):  return ("list", len(obj))
+        if isinstance(obj, dict):  return ("map",  len(obj))
+    except Exception:
+        pass
+    return ("scalar", 1)
+
+def build_text_chunk(row):
+    sec = str(row.get("section","")); sub = str(row.get("subsection",""))
+    val = "" if pd.isna(row.get("json_value")) else str(row.get("json_value"))
+    return f"question: {row.get('question_label','')}\nproperty: {row.get('json_property','')}\nvalue: {val}\njson_pointer: {row.get('json_pointer','')}\nsection: {sec} / subsection: {sub}"
+
+def build_text_boost(row):
+    def toks(s: str):
+        return [t for t in ''.join(ch if ch.isalnum() else ' ' for ch in s).lower().split() if len(t)>2]
+    label = str(row.get("question_label","")); prop = str(row.get("json_property",""))
+    val = "" if pd.isna(row.get("json_value")) else str(row.get("json_value"))
+    val_short = val[:160]
+    tokens = toks(label)+toks(prop)+toks(val_short)
+    dup = tokens + tokens
+    low = (label+" "+prop+" "+val_short).lower()
+    hints=[]; 
+    if "addr" in low or "address" in low: hints += ["address"]*4
+    if "id" in low: hints += ["id"]*3
+    if "pointer" in low or "path" in low: hints += ["pointer"]*3
+    if "name" in low: hints += ["name"]*2
+    if "date" in low: hints += ["date"]*2
+    return " ".join(dup+hints)
+
+def ensure_index():
+    try:
+        r.ft(INDEX_NAME).info(); print(f"[ok] Index '{INDEX_NAME}' exists."); return
+    except Exception: pass
+    schema = (
+        TextField("text_chunk"),
+        TextField("text_boost"),
+        TextField("json_pointer"),
+        TextField("json_property"),
+        TextField("json_value"),
+        TextField("question_id"),
+        TextField("question_label"),
+        TagField("section"),
+        TagField("subsection"),
+        TextField("shape"),
+        TextField("shape_size"),
+        VectorField("vector","HNSW",{"TYPE":"FLOAT32","DIM":VECTOR_DIM,"DISTANCE_METRIC":"COSINE","M":16,"EF_CONSTRUCTION":200,"EF_RUNTIME":64}),
+    )
+    definition = IndexDefinition(prefix=[PREFIX], index_type=IndexType.HASH)
+    r.ft(INDEX_NAME).create_index(schema, definition=definition)
+    print(f"[ok] Created index '{INDEX_NAME}'.")
+
+def read_and_normalize_csv(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    rename_map = {
+        "Question id":"question_id","Question label":"question_label","Prop":"json_property","Value":"json_value",
+        "Section":"section","Subsection":"subsection","Json pointer":"json_pointer","Json path":"json_pointer"
+    }
+    for k,v in rename_map.items():
+        if k in df.columns: df.rename(columns={k:v}, inplace=True)
+    required = ["question_id","question_label","json_property","json_value","section","subsection","json_pointer"]
+    missing = [c for c in required if c not in df.columns]
+    if missing: raise ValueError(f"{os.path.basename(path)} missing columns: {missing}")
+    return df
+
+def ingest_folder(folder: str):
+    files = sorted(glob.glob(os.path.join(folder, "*.csv")))
+    if not files: print(f"[warn] No CSV files in {folder}"); return
+    total=0
+    for fp in files:
+        print(f"[info] Ingesting {os.path.basename(fp)}")
+        df = read_and_normalize_csv(fp); src=os.path.basename(fp)
+        for i,row in df.iterrows():
+            qid=str(row["question_id"]); qlbl=str(row["question_label"]); prop=str(row["json_property"])
+            val="" if pd.isna(row["json_value"]) else str(row["json_value"]); ptr=str(row["json_pointer"])
+            sec=norm_tag(row["section"]); sub=norm_tag(row["subsection"])
+            text_chunk=build_text_chunk(row); text_boost=build_text_boost(row); vec=embed(f"passage: {text_chunk}")
+            shape,size = infer_shape(val)
+            key=f"{PREFIX}{src}:{qid or i}"
+            r.hset(key, mapping={
+                "question_id": qid, "question_label": qlbl, "json_property": prop, "json_value": val,
+                "json_pointer": ptr, "section": sec, "subsection": sub, "shape": shape, "shape_size": str(size),
+                "text_chunk": text_chunk, "text_boost": text_boost, "vector": vec,
+            })
+            total+=1
+    print(f"[ok] Ingested {total} rows from {len(files)} files.")
+
+if __name__ == "__main__":
+    ensure_index(); ingest_folder(CSV_DIR)
