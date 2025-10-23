@@ -281,3 +281,53 @@ if __name__ == "__main__":
             print(f"{i:>2}. {x.get('question_label','')} | {x.get('pointer','')} | value={x.get('value','')}")
     except Exception as e:
         print("Error:", e)
+
+
+
+
+
+
+
+
+
+
+
+def _embed_vec(client: Client, text: str, dim: int | str = VECTOR_DIM) -> list[float]:
+    # ensure dim is an int even if env gave us a string
+    try:
+        dim = int(dim)
+    except Exception:
+        raise ValueError(f"Bad VECTOR_DIM type: {type(dim)} value={dim!r}")
+
+    resp = client.embeddings(model=EMBED_MODEL, prompt=text)
+
+    # Accept multiple shapes/keys from Ollama
+    vec = resp.get("embedding", resp.get("embeddings"))
+    if vec is None:
+        raise ValueError(f"Embedding payload missing 'embedding'/'embeddings' keys: keys={list(resp.keys())}")
+
+    # Flatten if nested [[...]]
+    if isinstance(vec, list) and vec and isinstance(vec[0], list):
+        vec = vec[0]
+
+    # Convert numpy arrays -> list
+    try:
+        import numpy as _np
+        if isinstance(vec, _np.ndarray):
+            vec = vec.tolist()
+    except Exception:
+        pass
+
+    if not isinstance(vec, list):
+        raise ValueError(f"Embedding vector is not a list (got {type(vec)}).")
+
+    n = len(vec)
+    if n != dim:
+        # Helpful diagnostics if there’s a REAL mismatch
+        raise ValueError(
+            f"Embedding DIM mismatch: expected {dim} (int), got {n} "
+            f"(type(dim)={type(dim)}, nested={isinstance(vec[0], list)})"
+        )
+
+    # Ensure plain Python floats for JSON compatibility
+    return [float(x) for x in vec]
