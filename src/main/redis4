@@ -330,3 +330,43 @@ if __name__ == "__main__":
     fused = rrf_fuse(kn, bm, k=10)
     for i, x in enumerate(fused, 1):
         print(f"{i:>2}. {x['label']}  -> {x['pointer']}  (rrf={x['rrf']:.4f})")
+
+
+
+
+
+
+
+import ssl
+
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_USERNAME = os.getenv("REDIS_USERNAME") or None
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
+REDIS_SSL = os.getenv("REDIS_SSL", "false").lower() == "true"
+
+SSL_CA = os.getenv("REDIS_SSL_CA_CERT") or None
+SSL_CERT = os.getenv("REDIS_SSL_CLIENT_CERT") or None
+SSL_KEY = os.getenv("REDIS_SSL_CLIENT_KEY") or None
+
+ssl_ctx = None
+if REDIS_SSL:
+    ssl_ctx = ssl.create_default_context(cafile=SSL_CA)
+    if SSL_CERT and SSL_KEY:
+        ssl_ctx.load_cert_chain(certfile=SSL_CERT, keyfile=SSL_KEY)
+
+r = redis.Redis(
+    host=REDIS_HOST,
+    port=REDIS_PORT,
+    username=REDIS_USERNAME,
+    password=REDIS_PASSWORD,
+    ssl=REDIS_SSL,
+    ssl_certfile=SSL_CERT if SSL_CERT else None,
+    ssl_keyfile=SSL_KEY if SSL_KEY else None,
+    ssl_ca_certs=SSL_CA if SSL_CA else None,
+    ssl_cert_reqs=None if not SSL_CA else ssl.CERT_REQUIRED,
+    ssl_context=ssl_ctx if ssl_ctx else None,
+    decode_responses=False,
+)
+r.ping()
+print("[ok] Connected to Redis securely.")
