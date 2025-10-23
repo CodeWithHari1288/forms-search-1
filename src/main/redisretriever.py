@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""
+retriever.py — LangGraph-friendly Redis retriever (BM25 + Vector + RRF)
+
+Usage from a node:
+    from retriever import retrieve
+    results = retrieve("address city postcode", top_k=10, form_id="A", mode="rrf")
+
+Env (.env):
+    INDEX_NAME=idx:forms
+    VECTOR_DIM=1024
+    KEY_PREFIX=form:
+
+    REDIS_HOST=localhost
+    REDIS_PORT=6379
+    REDIS_USERNAME=
+    REDIS_PASSWORD=
+    REDIS_SSL=false
+    REDIS_SSL_CA_CERT=/path/to/ca.pem
+    REDIS_SSL_CLIENT_CERT=
+    REDIS_SSL_CLIENT_KEY=
+
+    OLLAMA_HOST=http://localhost:11434
+    EMBED_MODEL=bge-m3
+"""
+
+from __future__ import annotations
+import os, ssl, typing as T
+import numpy as np
+import redis
+from dotenv import load_dotenv
+from ollama import Client
+from redis.commands.search.query import Query
+
+# ---------- ENV ----------
+load_dotenv()
+
+INDEX_NAME  = os.getenv("INDEX_NAME", "idx:forms")
+VECTOR_DIM  = int(os.getenv("VECTOR_DIM", "1024"))
+KEY_PREFIX  = os.getenv("KEY_PREFIX", "form:")
+
+# Redis
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_USERNAME = os.getenv("REDIS_USERNAME") or None
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
+REDIS_SSL      = os.getenv("REDIS_SSL", "false").lower() == "true"
+SSL_CA   = os.getenv("REDIS_SSL_CA_CERT") or None     # e.g., /home/you/redis-ca.pem
+SSL_CERT = os.getenv("REDIS_SSL_CLIENT_CERT") or None # optional (mTLS)
+SSL_KEY  = os.getenv("REDIS_SSL_CLIENT_KEY") or None  # optional (mTLS)
+
+# Ollama
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "bge-m3")
+
+# Which TEXT fields to use for BM25 sparse search.
+# Make sure these match your FT schema aliases.
+SPARSE_FIELDS = ["text", "question_label", "propertyname_text"]
+
+# ---------- CLIENTS ----------
+def _redis_client() -> redis.Redis:
+    ssl_ctx = None
+    if REDIS_SSL:
+        # Build an SSL context; CA may be required to validate server
+        ssl_ctx = ssl.create_default_context(cafile=SSL_CA) if SSL_CA else ssl.create_default_context()
+        if SSL_CERT and SSL_KEY:
+            ssl_ctx.load_cert_chain(certfile=SSL_CERT, keyfile=SSL_KEY)
+
+    r = redis.Redis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        username=REDIS_USERNAME,
+        password=REDIS_PASSWORD,
+        ssl=REDIS_SSL,
+        ssl_cert_reqs=ssl.CERT_REQUIRED if REDIS_SSL else None,
+        ssl_ca_certs=SSL_CA if SSL_CA else None,
+        ssl_certfile=SSL_CERT or None,
+        ssl_keyfile=SSL_KEY or None,
+        ssl_context=ssl_ctx if REDIS_SSL else None,
+        decode_responses=False,  # keep raw bytes; we normalize later
+    )
+    r.ping()  # fail fast if not reachable
+    return r
+
+def _ollama_client() -> Client:
+    c = Client(host=OLLAMA_HOST)
+    # Fail fast if model not present
+    c.show(EMBED_MODEL)
+    return c
+
+# ---------- EMBEDDING HELPERS ----------
+def _embed_vec(client: Client, text: str, dim: int = VECTOR_DIM) -> list[float]:
+    """Robust embedding extractor (handles nested shapes and key variants)."""
+    resp = client.embeddings(model=EMBED_MODEL, prompt=text)
+    vec = resp.get("embedding", resp.get("embeddings"))
+    if isinstance(vec, list) and len(vec) > 0 and isinstance(vec[0], list):
+        vec = vec[0]  # flatten [[...]] -> [...]
+    if not isinstance(vec, list):
+        raise ValueError(f"Unexpected embedding payload type: {type(vec)}")
+    if len(vec) != dim:
+        raise ValueError(f"Embedding DIM mismatch: expected {dim}, got {len(vec)}")
+    # Convert to plain floats (not numpy types) for JSON compatibility
+    return [float(x) for x in vec]
+
+def _to_blob(vec: T.List[float]) -> bytes:
+    """Convert to float32 bytes for FT.SEARCH KNN."""
+    return np.asarray(vec, dtype=np.float32).tobytes()
+
+def _esc_tag(v: str) -> str:
+    """Escape spaces for RediSearch TAG filters."""
+    return str(v).replace(" ", r"\ ")
+
+# ---------- LOW-LEVEL SEARCH HELPERS ----------
+def _bm25_search(
+    r: redis.Redis,
+    query_text: str,
+    top_k: int,
+    left_filter: str,
+    sparse_fields: list[str],
+):
+    q = query_text.replace('"', r'\"')
+    ors = [f'@{f}:"{q}"' for f in sparse_fields]
+    text_part = "(" + " | ".join(ors) + ")" if ors else ""
+    expr = (left_filter + " " + text_part).strip() or "*"
+
+    return r.ft(INDEX_NAME).search(
+        Query(expr)
+        .return_fields(
+            "question_label","propertyname","value","pointer",
+            "form_id","section","subsection","question_id"
+        )
+        .paging(0, top_k)
+        .dialect(2)
+    )
+
+def _knn_search(
+    r: redis.Redis,
+    blob: bytes,
+    top_k: int,
+    left_filter: str,
+):
+    expr = f'{left_filter or "*"} =>[KNN {top_k} @vec $BLOB AS __score]'
+    return r.ft(INDEX_NAME).search(
+        Query(expr)
+        .return_fields(
+            "question_label","propertyname","value","pointer",
+            "form_id","section","subsection","question_id","__score"
+        )
+        .sort_by("__score", asc=True)
+        .dialect(2)
+        .with_params({"BLOB": blob})
+    )
+
+def _normalize_doc(d) -> dict:
+    def tostr(v):
+        return v.decode() if isinstance(v, (bytes, bytearray)) else v
+    item = {
+        "question_label": tostr(getattr(d, "question_label", "")),
+        "propertyname":   tostr(getattr(d, "propertyname", getattr(d, "propertyname_text", ""))),
+        "value":          tostr(getattr(d, "value", "")),
+        "pointer":        tostr(getattr(d, "pointer", "")),
+        "form_id":        tostr(getattr(d, "form_id", "")),
+        "section":        tostr(getattr(d, "section", "")),
+        "subsection":     tostr(getattr(d, "subsection", "")),
+        "question_id":    tostr(getattr(d, "question_id", "")),
+    }
+    if hasattr(d, "__score"):
+        try:
+            item["score"] = float(getattr(d, "__score"))
+        except Exception:
+            pass
+    return item
+
+def _rrf_fuse(dense_docs, sparse_docs, k=10, c=60.0) -> list[dict]:
+    """Reciprocal Rank Fusion (RRF) — robust hybrid fusion."""
+    dlist = [_normalize_doc(d) for d in getattr(dense_docs, "docs", [])]
+    slist = [_normalize_doc(d) for d in getattr(sparse_docs, "docs", [])]
+
+    for i, x in enumerate(dlist, start=1): x["_rank_dense"]  = i
+    for i, x in enumerate(slist, start=1): x["_rank_sparse"] = i
+
+    def did(x):  # stable doc id for fusion
+        return x.get("pointer") or (x.get("form_id","") + "|" + x.get("question_id",""))
+
+    best, score = {}, {}
+    for x in dlist:
+        id_ = did(x); best.setdefault(id_, x)
+        score[id_] = score.get(id_, 0.0) + 1.0/(c + x["_rank_dense"])
+    for x in slist:
+        id_ = did(x); best.setdefault(id_, x)
+        score[id_] = score.get(id_, 0.0) + 1.0/(c + x["_rank_sparse"])
+
+    ranked = sorted(score.items(), key=lambda kv: kv[1], reverse=True)[:k]
+    out = []
+    for id_, sc in ranked:
+        item = best[id_].copy()
+        item["rrf"] = sc
+        out.append(item)
+    return out
+
+# ---------- PUBLIC API ----------
+def retrieve(
+    query_text: str,
+    top_k: int = 10,
+    *,
+    form_id: str | None = None,
+    section: str | None = None,
+    subsection: str | None = None,
+    mode: str = "hybrid",  # "hybrid" | "dense" | "sparse" | "rrf"
+    return_fields: T.Iterable[str] = (
+        "question_label","propertyname","value","pointer",
+        "form_id","section","subsection","question_id","__score"
+    ),
+) -> T.List[dict]:
+    """
+    LangGraph-friendly retriever over Redis Stack (RediSearch + RedisJSON + Vector).
+    - hybrid: one-call BM25 filter + KNN (vector score sorts)
+    - dense:  KNN only
+    - sparse: BM25 only
+    - rrf:    true two-call hybrid with Reciprocal Rank Fusion
+    """
+    r = _redis_client()
+    ollama = _ollama_client()
+
+    # Build TAG filters
+    filters = []
+    if form_id:    filters.append(f"@form_id:{{{_esc_tag(form_id)}}}")
+    if section:    filters.append(f"@section:{{{_esc_tag(section)}}}")
+    if subsection: filters.append(f"@subsection:{{{_esc_tag(subsection)}}}")
+    left = " ".join(filters) or "*"
+
+    if mode == "hybrid":
+        qvec = _embed_vec(ollama, query_text, VECTOR_DIM)
+        blob = _to_blob(qvec)
+        # add sparse clause to restrict candidates
+        q = query_text.replace('"', r'\"')
+        ors = [f'@{f}:"{q}"' for f in SPARSE_FIELDS]
+        text_part = "(" + " | ".join(ors) + ")" if ors else ""
+        expr_left = (left + " " + text_part).strip()
+        expr = f'{expr_left} =>[KNN {top_k} @vec $BLOB AS __score]'
+        res = r.ft(INDEX_NAME).search(
+            Query(expr)
+            .return_fields(*return_fields)
+            .sort_by("__score", asc=True)
+            .dialect(2)
+            .with_params({"BLOB": blob})
+        )
+        return [_normalize_doc(d) for d in getattr(res, "docs", [])]
+
+    elif mode == "dense":
+        qvec = _embed_vec(ollama, query_text, VECTOR_DIM)
+        blob = _to_blob(qvec)
+        res = _knn_search(r, blob, top_k, left)
+        return [_normalize_doc(d) for d in getattr(res, "docs", [])]
+
+    elif mode == "sparse":
+        res = _bm25_search(r, query_text, top_k, left, SPARSE_FIELDS)
+        return [_normalize_doc(d) for d in getattr(res, "docs", [])]
+
+    elif mode == "rrf":
+        qvec = _embed_vec(ollama, query_text, VECTOR_DIM)
+        blob = _to_blob(qvec)
+        dense_res  = _knn_search(r, blob, top_k, left)
+        sparse_res = _bm25_search(r, query_text, top_k, left, SPARSE_FIELDS)
+        return _rrf_fuse(dense_res, sparse_res, k=top_k, c=60.0)
+
+    else:
+        raise ValueError("mode must be one of: 'hybrid', 'dense', 'sparse', 'rrf'")
+
+# ---------- OPTIONAL: quick local smoke test ----------
+if __name__ == "__main__":
+    try:
+        out = retrieve(
+            "address city postcode",
+            top_k=5,
+            form_id=os.getenv("TEST_FORM_ID", "A"),
+            section=os.getenv("TEST_SECTION"),  # e.g., "address"
+            mode=os.getenv("TEST_MODE", "rrf"),
+        )
+        for i, x in enumerate(out, 1):
+            print(f"{i:>2}. {x.get('question_label','')} | {x.get('pointer','')} | value={x.get('value','')}")
+    except Exception as e:
+        print("Error:", e)
