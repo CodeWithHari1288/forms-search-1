@@ -362,3 +362,49 @@ try:
         print(attr)
 except Exception as e:
     print("Index not found or FT.INFO failed:", e)
+
+
+
+
+
+
+
+
+
+
+import redis
+
+r = redis.Redis(
+    host="localhost",
+    port=6379,
+    password=None,      # <-- add your password
+    decode_responses=True,
+)
+
+print("\n=== MODULE LIST ===")
+mods = r.execute_command("MODULE", "LIST")
+for mod in mods:
+    # Newer redis-py: dict-like structure
+    if isinstance(mod, dict):
+        print(f"Name: {mod.get('name')} | Version: {mod.get('ver')}")
+    # Older redis-py: list of alternating keys/values
+    elif isinstance(mod, (list, tuple)):
+        d = dict(zip(mod[::2], mod[1::2]))
+        print(f"Name: {d.get('name')} | Version: {d.get('ver')}")
+print()
+
+print("=== INDEXES ===")
+try:
+    indexes = r.execute_command("FT._LIST")
+    print("Indexes:", indexes)
+except Exception as e:
+    print("Error listing indexes:", e)
+
+print("\n=== VECTOR FIELDS ===")
+try:
+    info = r.ft("idx:forms").info()
+    for attr in info.get("attributes", []):
+        if attr.get("type") == "VECTOR":
+            print("Vector field:", attr)
+except Exception as e:
+    print("Index not found or no vector field:", e)
