@@ -161,6 +161,7 @@ def _normalize_doc_map(d: dict) -> dict:
     }
 
 def _knn_search_raw(r: redis.Redis, expr: str, blob: bytes, return_fields: list[str]):
+    # No space before '=>'
     return r.execute_command(
         "FT.SEARCH", INDEX_NAME, expr,
         "PARAMS", 2, "BLOB", blob,
@@ -246,11 +247,12 @@ def retrieve(
         qtxt = query_text.replace('"', r'\"')
         ors = [f'@{f}:"{qtxt}"' for f in SPARSE_FIELDS]
         text_part = "(" + " | ".join(ors) + ")" if ors else ""
-        expr_left = (left + " " + text_part).strip()
+        expr_base = (f'{left} {text_part}'.strip()) if text_part else left
+        # IMPORTANT: no space before '=>'
+        expr = f'{expr_base}=>[KNN {top_k} @vec $BLOB AS __score]'
 
         vec = _embed_vec(ollama, query_text, VECTOR_DIM)
         blob = _to_blob(vec)
-        expr = f'{expr_left} =>[KNN {top_k} @vec $BLOB AS __score]'
 
         raw = _knn_search_raw(r, expr, blob, fields)
         docs = _parse_search_result(raw)
@@ -259,7 +261,8 @@ def retrieve(
     elif mode == "dense":
         vec = _embed_vec(ollama, query_text, VECTOR_DIM)
         blob = _to_blob(vec)
-        expr = f'{left} =>[KNN {top_k} @vec $BLOB AS __score]'
+        # IMPORTANT: no space before '=>'
+        expr = f'{left}=>[KNN {top_k} @vec $BLOB AS __score]'
         raw = _knn_search_raw(r, expr, blob, fields)
         docs = _parse_search_result(raw)
         return [_normalize_doc_map(d) for d in docs]
@@ -268,7 +271,7 @@ def retrieve(
         qtxt = query_text.replace('"', r'\"')
         ors = [f'@{f}:"{qtxt}"' for f in SPARSE_FIELDS]
         text_part = "(" + " | ".join(ors) + ")" if ors else ""
-        expr = (left + " " + text_part).strip() or "*"
+        expr = (f'{left} {text_part}'.strip()) if text_part else left
         docs = _bm25_search(r, expr, fields, top_k)
         return [_normalize_doc_map(d) for d in docs]
 
@@ -276,14 +279,14 @@ def retrieve(
         # dense branch
         vec = _embed_vec(ollama, query_text, VECTOR_DIM)
         blob = _to_blob(vec)
-        expr_dense = f'{left} =>[KNN {top_k} @vec $BLOB AS __score]'
+        expr_dense = f'{left}=>[KNN {top_k} @vec $BLOB AS __score]'
         raw_dense = _knn_search_raw(r, expr_dense, blob, fields)
         dense_docs = [_normalize_doc_map(d) for d in _parse_search_result(raw_dense)]
         # sparse branch
         qtxt = query_text.replace('"', r'\"')
         ors = [f'@{f}:"{qtxt}"' for f in SPARSE_FIELDS]
         text_part = "(" + " | ".join(ors) + ")" if ors else ""
-        expr_sparse = (left + " " + text_part).strip() or "*"
+        expr_sparse = (f'{left} {text_part}'.strip()) if text_part else left
         sparse_docs = _bm25_search(r, expr_sparse, fields, top_k)
         sparse_docs = [_normalize_doc_map(d) for d in sparse_docs]
         # fuse
