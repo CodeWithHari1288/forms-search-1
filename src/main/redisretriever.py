@@ -3,7 +3,7 @@
 retriever.py — Redis (RediSearch + RedisJSON) retriever for LangGraph steps.
 Fields used (exact, per your CSV & index):
     question_label, Prop, Value, Json_pointer, Section, Sub_section
-No form_id and no field fallbacks.
+No section/subsection args — searches across all docs.
 
 Env (.env):
     INDEX_NAME=idx:forms
@@ -48,7 +48,7 @@ SSL_KEY  = os.getenv("REDIS_SSL_CLIENT_KEY") or None
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "bge-m3")
 
-# BM25 (sparse) fields — these must exist in your FT schema as TEXT
+# BM25 (sparse) fields — these must be TEXT fields in your FT schema
 SPARSE_FIELDS = ["text", "question_label", "Prop"]
 
 # ---------------- Clients ----------------
@@ -114,9 +114,6 @@ def _embed_vec(client: Client, text: str, dim: int | str = VECTOR_DIM) -> list[f
 
 def _to_blob(vec: T.List[float]) -> bytes:
     return np.asarray(vec, dtype=np.float32).tobytes()
-
-def _esc_tag(v: str) -> str:
-    return str(v).replace(" ", r"\ ")
 
 # ---------------- FT.SEARCH helpers ----------------
 def _parse_search_result(raw) -> list[dict]:
@@ -227,8 +224,6 @@ def retrieve(
     query_text: str,
     top_k: int = 10,
     *,
-    section: str | None = None,       # filter by Section (exact TAG)
-    subsection: str | None = None,    # filter by Sub_section (exact TAG)
     mode: str = "hybrid",             # "hybrid" | "dense" | "sparse" | "rrf"
     # RETURN fields: exactly your names + __score
     return_fields: T.Iterable[str] = (
@@ -238,18 +233,13 @@ def retrieve(
     ),
 ) -> T.List[dict]:
     """
-    Retrieve results using your exact field names only.
-    Filters (optional): Section, Sub_section (as TAGs in your index).
+    Retrieve results across ALL docs (no section/subsection filters).
     """
     r = _redis_client()
     ollama = _ollama_client()
 
-    # TAG filters (your exact aliases)
-    filters = []
-    if section:    filters.append(f"@Section:{{{_esc_tag(section)}}}")
-    if subsection: filters.append(f"@Sub_section:{{{_esc_tag(subsection)}}}")
-    left = " ".join(filters) or "*"
-
+    # No filters — search across everything
+    left = "*"
     fields = list(return_fields)
 
     if mode == "hybrid":
@@ -269,7 +259,7 @@ def retrieve(
     elif mode == "dense":
         vec = _embed_vec(ollama, query_text, VECTOR_DIM)
         blob = _to_blob(vec)
-        expr = f'{left or "*"} =>[KNN {top_k} @vec $BLOB AS __score]'
+        expr = f'{left} =>[KNN {top_k} @vec $BLOB AS __score]'
         raw = _knn_search_raw(r, expr, blob, fields)
         docs = _parse_search_result(raw)
         return [_normalize_doc_map(d) for d in docs]
@@ -286,7 +276,7 @@ def retrieve(
         # dense branch
         vec = _embed_vec(ollama, query_text, VECTOR_DIM)
         blob = _to_blob(vec)
-        expr_dense = f'{left or "*"} =>[KNN {top_k} @vec $BLOB AS __score]'
+        expr_dense = f'{left} =>[KNN {top_k} @vec $BLOB AS __score]'
         raw_dense = _knn_search_raw(r, expr_dense, blob, fields)
         dense_docs = [_normalize_doc_map(d) for d in _parse_search_result(raw_dense)]
         # sparse branch
@@ -309,8 +299,6 @@ if __name__ == "__main__":
         out = retrieve(
             "address city postcode",
             top_k=5,
-            section=os.getenv("TEST_SECTION"),      # e.g., "address"
-            subsection=os.getenv("TEST_SUBSECTION"),# e.g., "current"
             mode=mode,
         )
         for i, x in enumerate(out, 1):
