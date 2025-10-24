@@ -308,3 +308,57 @@ if __name__ == "__main__":
             print(f"{i:>2}. {x.get('question_label','')} | Prop={x.get('Prop','')} | Ptr={x.get('Json_pointer','')} | Val={x.get('Value','')} | score={x.get('score')} | rrf={x.get('rrf')}")
     except Exception as e:
         print("Error:", e)
+
+
+
+
+
+
+
+
+
+import redis
+
+# Connect to Redis (adjust host, port, password, ssl options)
+r = redis.Redis(
+    host="localhost",
+    port=6379,
+    password=None,    # or your password
+    decode_responses=True,
+)
+
+print("\n=== MODULE LIST ===")
+mods = r.execute_command("MODULE", "LIST")
+for mod in mods:
+    print(f"Name: {mod['name']}, Version: {mod['ver']}")
+print()
+
+print("=== SEARCH MODULE INFO ===")
+try:
+    info = r.ft("_dummy_").info()
+    print("Found RediSearch index (unexpected).")
+except Exception as e:
+    # this just confirms that the FT command exists
+    try:
+        r.execute_command("FT._LIST")
+        print("✅ RediSearch is installed and FT commands are available.")
+    except Exception as ex:
+        print("❌ RediSearch not installed or not loaded.", ex)
+print()
+
+print("=== EXISTING INDEXES ===")
+try:
+    indexes = r.execute_command("FT._LIST")
+    print("Indexes:", indexes)
+except Exception as e:
+    print("Error listing indexes:", e)
+print()
+
+# Check vector field presence if you already have your index (replace idx:forms)
+try:
+    info = r.ft("idx:forms").info()
+    print("=== idx:forms ATTRIBUTES ===")
+    for attr in info.get("attributes", []):
+        print(attr)
+except Exception as e:
+    print("Index not found or FT.INFO failed:", e)
