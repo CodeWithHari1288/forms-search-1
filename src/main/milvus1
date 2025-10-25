@@ -1,0 +1,511 @@
+# generate_company_csvs.py
+import copy
+import csv
+import datetime
+import os
+import random
+import re
+import zipfile
+from typing import Any, Dict, List
+
+import pandas as pd
+
+random.seed(123)
+
+# -----------------------------
+# Normalization helpers
+# -----------------------------
+COUNTRY_TO_ISO2 = {
+    "India": "IN", "USA": "US", "United States": "US",
+    "Germany": "DE", "UK": "GB", "United Kingdom": "GB",
+    "Canada": "CA", "Singapore": "SG", "Australia": "AU"
+}
+IDENTIFIER_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
+def iso2_country(name: str) -> str:
+    return COUNTRY_TO_ISO2.get(str(name), str(name).upper()[:2])
+
+def norm_phone(s: str) -> str:
+    """Return E.164-like without dashes; assume +91 if 10 digits without CC."""
+    if s is None:
+        return ""
+    digits = re.sub(r"\D", "", s)
+    if s.strip().startswith("+"):
+        return "+" + digits
+    if len(digits) == 10:
+        return "+91" + digits
+    return "+" + digits if digits else ""
+
+def norm_date(s: str) -> str:
+    """Normalize to YYYY-MM-DD if possible, else leave as-is."""
+    if not s:
+        return s
+    try:
+        dt = datetime.datetime.fromisoformat(s.replace("Z", "").replace("T", " "))
+        return dt.date().isoformat()
+    except Exception:
+        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y"):
+            try:
+                return datetime.datetime.strptime(s, fmt).date().isoformat()
+            except Exception:
+                continue
+    return s
+
+def humanize(token: str) -> str:
+    token = token.replace("_", " ")
+    token = re.sub(r'(?<!^)(?=[A-Z])', ' ', token)
+    return token.strip().title()
+
+def bracket_key(val: str) -> str:
+    esc = val.replace("\\", "\\\\").replace("'", "\\'")
+    return "['" + esc + "']"
+
+def to_jsonpath(path_parts: List[tuple]) -> str:
+    """RFC 9535 JSONPath-ish: $.a.b[0].c  or $['weird-key']"""
+    s = "$"
+    for typ, val in path_parts:
+        if typ == "key":
+            if IDENTIFIER_RE.match(val):
+                s += "." + val
+            else:
+                s += bracket_key(str(val))
+        else:
+            s += f"[{val}]"
+    return s
+
+# -----------------------------
+# Label/entity heuristics
+# -----------------------------
+SECTION_MAP = {
+    "headquarters": "Headquarters", "contact": "Contact", "business_units": "Business Units",
+    "financials": "Financials", "compliance": "Compliance", "sustainability": "Sustainability",
+    "hr": "HR", "subsidiaries": "Subsidiaries", "metadata": "Metadata"
+}
+SUBSECTION_KEYS = {
+    "departments", "manufacturing_units", "partners", "servers", "cost_centers", "accounts",
+    "employees", "projects", "campaigns", "machines", "licenses", "audits", "quarterly",
+    "policies", "carbon_footprint", "yearly", "tags"
+}
+ENTITY_MAP = {
+    "employees": "Employee", "departments": "Department", "projects": "Project", "campaigns": "Campaign",
+    "machines": "Machine", "servers": "Server", "cost_centers": "Cost Center", "accounts": "Account",
+    "partners": "Partner", "subsidiaries": "Subsidiary", "manufacturing_units": "Factory", "business_units": "Business Unit",
+    "licenses": "License", "audits": "Audit", "policies": "Policy", "yearly": "Yearly", "quarterly": "Quarter", "tags": "Tag",
+    "headquarters": "Headquarters", "contact": "Contact", "hr": "HR", "financials": "Financials", "carbon_footprint": "Carbon Footprint",
+}
+GENERIC_PROPS = {
+    "name": "name", "id": "ID", "title": "title", "location": "location", "country": "country", "city": "city",
+    "address": "address", "postal_code": "postal code", "phone": "phone", "email": "email", "website": "website",
+    "revenue": "revenue", "currency": "currency", "instances": "instances", "region": "region", "status": "status",
+    "type": "type", "budget": "budget", "spend": "spend", "salary": "salary", "role": "role",
+    "version": "version", "last_updated": "last updated",
+}
+
+def extract_keys_from_jsonpath(path: str) -> List[str]:
+    s = path.strip()
+    if s.startswith("$"):
+        s = s[1:]
+    keys: List[str] = []
+    i = 0
+    while i < len(s):
+        if s[i] == ".":
+            i += 1
+            j = i
+            while j < len(s) and re.match(r"[A-Za-z0-9_]", s[j]):
+                j += 1
+            if j > i:
+                keys.append(s[i:j])
+            i = j
+        elif s[i] == "[":
+            j = i + 1
+            if j < len(s) and s[j].isdigit():
+                while j < len(s) and s[j] != "]":
+                    j += 1
+                i = j + 1 if j < len(s) else j
+            else:
+                end = s.find("']", j)
+                if end != -1:
+                    inner = s[j:end]
+                    if inner.startswith("'"):
+                        inner = inner[1:]
+                    keys.append(inner)
+                    i = end + 2
+                else:
+                    break
+        else:
+            i += 1
+    return keys
+
+def pick_entity(keys: List[str]) -> str:
+    for k in reversed(keys[:-1]):
+        if k in ENTITY_MAP:
+            return ENTITY_MAP[k]
+    if len(keys) >= 2 and keys[-2] in ENTITY_MAP:
+        return ENTITY_MAP[keys[-2]]
+    return ""
+
+def make_label(prop: str, keys: List[str]) -> str:
+    """Question_label: concise but informative. If prop is generic, prefix with entity."""
+    base_prop = (prop or "").strip()
+    prop_lower = base_prop.lower()
+    entity = pick_entity(keys)
+    if prop_lower in GENERIC_PROPS and entity:
+        term = GENERIC_PROPS[prop_lower]
+        return f"{entity} {term}".title() if term != "ID" else f"{entity} ID"
+    if entity and not base_prop.lower().startswith(entity.lower()):
+        return f"{entity} {humanize(base_prop)}"
+    return humanize(base_prop)
+
+def build_context(path_parts: List[tuple], ancestors_meta: Dict[str, str]) -> str:
+    bits: List[str] = []
+    if ancestors_meta.get("unit_name"):
+        bits.append(f"Unit: {ancestors_meta['unit_name']}")
+    if ancestors_meta.get("dept_name"):
+        bits.append(f"Department: {ancestors_meta['dept_name']}")
+    if ancestors_meta.get("factory_id"):
+        bits.append(f"Factory: {ancestors_meta['factory_id']}")
+    if ancestors_meta.get("subsidiary_name"):
+        bits.append(f"Subsidiary: {ancestors_meta['subsidiary_name']}")
+    if not bits:
+        keys = [val for typ, val in path_parts if typ == "key"]
+        if "manufacturing_units" in keys:
+            bits.append("Manufacturing")
+        elif "departments" in keys:
+            bits.append("Department")
+        elif "financials" in keys:
+            bits.append("Financials")
+        elif "compliance" in keys:
+            bits.append("Compliance")
+        elif "sustainability" in keys:
+            bits.append("Sustainability")
+        elif "hr" in keys:
+            bits.append("HR")
+        elif "subsidiaries" in keys:
+            bits.append("Subsidiaries")
+        else:
+            bits.append("General")
+    return " / ".join(bits)
+
+# -----------------------------
+# Random data pools
+# -----------------------------
+cities = [
+    "Bangalore", "Chennai", "Pune", "Hyderabad", "Mumbai", "Delhi", "Noida", "Gurugram", "Kolkata",
+    "San Francisco", "New York", "Berlin", "Munich", "London", "Toronto", "Singapore"
+]
+countries_full = ["India", "USA", "Germany", "UK", "Canada", "Singapore", "Australia"]
+regions = ["ap-south-1", "ap-southeast-1", "eu-central-1", "eu-west-1", "us-east-1", "us-west-2"]
+unit_names = ["Consumer Electronics", "Cloud Services", "Healthcare Solutions", "FinTech Platforms", "EdTech Suite", "IoT Devices", "Security Products"]
+dept_names = ["Research and Development", "Marketing", "Infrastructure", "Customer Success", "Sales", "Support", "Engineering", "Data Platform"]
+project_titles = ["SmartHome AI Assistant", "Energy Efficient TV", "Vision Analytics", "Predictive Maintenance", "Zero Trust Gateway", "Edge Compute Kit", "Contract Extractor"]
+statuses = ["In Progress", "Completed", "On Hold"]
+roles = ["Lead Engineer", "Data Scientist", "Account Manager", "Customer Engineer", "Marketing Head", "SEO Specialist", "DevOps Engineer", "QA Lead"]
+first_names = ["Anita", "Karthik", "Priya", "Vikram", "Ayesha", "Rahul", "Ravi", "Neha", "Meera", "Sanjay", "Arjun", "Isha", "Varun", "Anil", "Deepa"]
+last_names = ["Rao", "Kumar", "Singh", "Patel", "Khan", "Das", "Sharma", "Kapoor", "Menon", "Nair", "Gupta", "Mehta"]
+partners = ["DataBridge", "CloudNova", "VectorBeam", "QuantumLeap", "NeuroLink", "GraphWise"]
+subsidiary_names = ["GlobalTech USA Inc", "GlobalTech Europe GmbH", "GlobalTech APAC Pte Ltd", "GlobalTech UK Ltd"]
+
+def rand_name() -> str:
+    return f"{random.choice(first_names)} {random.choice(last_names)}"
+
+def rand_phone() -> str:
+    digits = "".join(str(random.randint(0, 9)) for _ in range(10))
+    return "+91" + digits
+
+def rand_email(domain="globaltech.com") -> str:
+    fn = random.choice(first_names).lower()
+    ln = random.choice(last_names).lower()
+    return f"{fn}.{ln}@{domain}"
+
+def rand_address() -> str:
+    return f"{random.randint(1, 999)} {random.choice(['Silicon','Innovation','Tech','Harmony','Lake'])} {random.choice(['Avenue','Street','Road'])}"
+
+def rand_postal() -> str:
+    return f"{random.randint(100000, 999999)}"
+
+def rand_geo() -> Dict[str, float]:
+    return {"lat": round(random.uniform(-60, 60), 4), "lon": round(random.uniform(-150, 150), 4)}
+
+def rand_currency() -> str:
+    return random.choice(["INR", "USD", "EUR", "GBP", "CAD", "SGD", "AUD"])
+
+def rand_money(lo=5_000_000, hi=1_800_000_000) -> int:
+    return int(random.uniform(lo, hi))
+
+# -----------------------------
+# Build randomized company JSON
+# -----------------------------
+def build_company(i: int, overlaps: Dict[str, Any]) -> Dict[str, Any]:
+    c: Dict[str, Any] = {
+        "company": {
+            "id": f"C{i:03d}",
+            "name": f"GlobalTech Variant {i}",
+            "founded": "1999-05-18",
+            "headquarters": {"address": "", "city": "", "country": "", "postal_code": "", "geo": {"lat": 0.0, "lon": 0.0}},
+            "contact": {"phone": "", "email": "", "website": ""},
+            "business_units": [],
+            "financials": {"fiscal_year": "2024-2025", "currency": "INR",
+                           "quarterly": [{"quarter": "Q1", "revenue": 0, "expenses": 0},
+                                         {"quarter": "Q2", "revenue": 0, "expenses": 0},
+                                         {"quarter": "Q3", "revenue": 0, "expenses": 0},
+                                         {"quarter": "Q4", "revenue": 0, "expenses": 0}]},
+            "compliance": {"licenses": [{"id": "LIC001", "type": "ISO9001", "valid_till": "2027-05-30"},
+                                        {"id": "LIC002", "type": "GDPR", "valid_till": "2026-12-31"}],
+                           "audits": [{"year": 2023, "status": "Passed", "remarks": "No major findings"},
+                                      {"year": 2024, "status": "In Progress", "remarks": ""}]},
+            "sustainability": {"carbon_footprint": {"units": "tonnes", "yearly": [{"year": 2022, "value": 14500}, {"year": 2023, "value": 12800}]},
+                               "renewable_energy_use": 42.5,
+                               "initiatives": ["Plastic-free packaging", "Electric vehicle logistics", "Solar-powered data centers"]},
+            "hr": {"total_employees": 1200, "avg_salary": 1_350_000, "gender_ratio": {"male": 0.62, "female": 0.38},
+                   "policies": [{"id": "HR01", "title": "Remote Work Flexibility"}, {"id": "HR02", "title": "Performance Bonus Scheme"}]},
+            "subsidiaries": [{"id": "SUB001", "name": "GlobalTech USA Inc", "country": "United States",
+                              "revenue": 540_000_000, "departments": [{"id": "D01", "name": "Sales", "employees": 120},
+                                                                       {"id": "D02", "name": "Support", "employees": 80}]}],
+            "metadata": {"tags": ["electronics", "cloud", "AI", "manufacturing"], "version": "2.1",
+                         "last_updated": "2025-10-25T14:20:00Z"}
+        }
+    }
+
+    # HQ overlaps
+    if overlaps.get("hq_india"):
+        city, country = "Bangalore", "India"
+    else:
+        city, country = random.choice(cities), random.choice(countries_full)
+    c["company"]["headquarters"]["city"] = city
+    c["company"]["headquarters"]["country"] = country
+    c["company"]["headquarters"]["address"] = rand_address()
+    c["company"]["headquarters"]["postal_code"] = rand_postal()
+    c["company"]["headquarters"]["geo"] = rand_geo()
+
+    # Contact
+    c["company"]["contact"]["phone"] = rand_phone()
+    c["company"]["contact"]["email"] = rand_email()
+    c["company"]["contact"]["website"] = f"https://variant{i}.globaltech.com"
+
+    # Business units (3–5 to increase rows)
+    bu_count = random.randint(3, 5)
+    for b in range(bu_count):
+        bu = {
+            "unit_id": f"BU{i}{b+1:02d}",
+            "unit_name": random.choice(unit_names),
+            "unit_head": overlaps.get("unit_head") or rand_name(),
+            "revenue": rand_money(300_000_000, 2_000_000_000),
+            "currency": rand_currency(),
+            "departments": [],
+            "manufacturing_units": []
+        }
+        # Departments (3–5)
+        for dpt in range(random.randint(3, 5)):
+            dept = {
+                "dept_id": f"DE{i}{b+1:02d}{dpt+1:02d}",
+                "name": random.choice(dept_names),
+            }
+            # Employees (3–6)
+            dept["employees"] = [{
+                "id": f"E{i}{b+1:02d}{dpt+1:02d}{e+1:02d}",
+                "name": rand_name(),
+                "role": random.choice(roles),
+                "salary": rand_money(700_000, 3_500_000)
+            } for e in range(random.randint(3, 6))]
+
+            # Dept-specific arrays
+            if dept["name"] in ["Research and Development", "Engineering", "Data Platform"]:
+                dept["projects"] = [{
+                    "project_id": f"P{i}{b+1:02d}{dpt+1:02d}{p+1:02d}",
+                    "title": random.choice(project_titles),
+                    "status": random.choice(statuses),
+                    "budget": rand_money(6_000_000, 60_000_000)
+                } for p in range(random.randint(1, 3))]
+            elif dept["name"] == "Marketing":
+                dept["campaigns"] = [{
+                    "id": f"M{i}{b+1:02d}{dpt+1:02d}{m+1:02d}",
+                    "title": random.choice(["Brand Lift", "Digital Ad Blitz", "Product Launch"]),
+                    "region": random.choice(["APAC", "US", "EU"]),
+                    "spend": rand_money(1_000_000, 20_000_000)
+                } for m in range(random.randint(1, 3))]
+            elif dept["name"] == "Infrastructure":
+                dept["servers"] = [{
+                    "server_id": f"S{i}{b+1:02d}{dpt+1:02d}{s+1:02d}",
+                    "region": random.choice(regions),
+                    "instances": random.randint(50, 800)
+                } for s in range(random.randint(1, 3))]
+                dept["cost_centers"] = [{
+                    "id": f"CC{i}{b+1:02d}{dpt+1:02d}{c+1:02d}",
+                    "month": random.choice(["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]),
+                    "cost": rand_money(500_000, 12_000_000)
+                } for c in range(random.randint(1, 2))]
+            elif dept["name"] in ["Customer Success", "Sales", "Support"]:
+                dept["accounts"] = [{
+                    "account_id": f"A{i}{b+1:02d}{dpt+1:02d}{a+1:02d}",
+                    "client_name": random.choice(["FinServe Corp","EduCloud","HealthHub","RetailPro","InsureAI","MediSoft"]),
+                    "revenue": rand_money(2_000_000, 120_000_000)
+                } for a in range(random.randint(1, 4))]
+
+            bu["departments"].append(dept)
+
+        # Manufacturing units (2–3)
+        for f in range(random.randint(2, 3)):
+            fac = {
+                "factory_id": f"F{i}{b+1:02d}{f+1:02d}",
+                "location": random.choice(cities),
+                "capacity_units": random.randint(80_000, 320_000),
+                "machines": [{
+                    "machine_id": f"MC{i}{b+1:02d}{f+1:02d}{m+1:02d}",
+                    "type": random.choice(["CNC", "Assembly Robot", "Soldering Line", "Inspection Bot"]),
+                    "status": random.choice(["Active", "Under Maintenance"])
+                } for m in range(random.randint(1, 3))]
+            }
+            bu["manufacturing_units"].append(fac)
+
+        # Partners (1–3)
+        bu["partners"] = [{
+            "partner_id": f"PT{i}{b+1:02d}{p+1:02d}",
+            "name": random.choice(partners),
+            "country": random.choice(["USA", "Germany", "India", "UK", "Canada"])
+        } for p in range(random.randint(1, 3))]
+
+        c["company"]["business_units"].append(bu)
+
+    # Financials tweaks
+    c["company"]["financials"]["fiscal_year"] = f"{2021 + random.randint(0, 4)}-{2022 + random.randint(0, 4)}"
+    c["company"]["financials"]["currency"] = rand_currency()
+    for q in c["company"]["financials"]["quarterly"]:
+        q["revenue"] = rand_money(700_000_000, 1_700_000_000)
+        q["expenses"] = rand_money(400_000_000, 1_300_000_000)
+
+    # Compliance tweaks
+    for lic in c["company"]["compliance"]["licenses"]:
+        lic["valid_till"] = f"{2026 + random.randint(0, 4)}-{random.randint(1, 12):02d}-{random.randint(1, 28):02d}"
+    for aud in c["company"]["compliance"]["audits"]:
+        aud["year"] = 2022 + random.randint(0, 3)
+        aud["status"] = random.choice(["Passed", "In Progress", "Pending"])
+        aud["remarks"] = random.choice(["No major findings", "Minor issues noted", ""])
+
+    # Sustainability tweaks
+    c["company"]["sustainability"]["renewable_energy_use"] = round(random.uniform(20, 75), 1)
+    for yr in c["company"]["sustainability"]["carbon_footprint"]["yearly"]:
+        yr["value"] = random.randint(9000, 22000)
+
+    # HR tweaks
+    c["company"]["hr"]["total_employees"] = random.randint(800, 4000)
+    c["company"]["hr"]["avg_salary"] = rand_money(900_000, 2_800_000)
+    c["company"]["hr"]["gender_ratio"]["male"] = round(random.uniform(0.4, 0.7), 2)
+    c["company"]["hr"]["gender_ratio"]["female"] = round(1 - c["company"]["hr"]["gender_ratio"]["male"], 2)
+
+    # Subsidiaries (2–3)
+    c["company"]["subsidiaries"] = []
+    for s in range(random.randint(2, 3)):
+        c["company"]["subsidiaries"].append({
+            "id": f"SUB{i}{s+1:02d}",
+            "name": random.choice(subsidiary_names),
+            "country": random.choice(["United States", "Germany", "India", "UK", "Canada"]),
+            "revenue": rand_money(250_000_000, 1_000_000_000),
+            "departments": [
+                {"id": f"D{i}{s+1:02d}01", "name": random.choice(["Sales", "Support", "Research", "Engineering"]), "employees": random.randint(40, 220)},
+                {"id": f"D{i}{s+1:02d}02", "name": random.choice(["Sales", "Support", "Research", "Engineering"]), "employees": random.randint(40, 220)}
+            ]
+        })
+
+    # Metadata tweaks
+    c["company"]["metadata"]["tags"] = random.sample(["electronics", "cloud", "AI", "manufacturing", "fintech", "edtech", "iot", "security"], k=4)
+    c["company"]["metadata"]["version"] = f"{random.randint(1, 3)}.{random.randint(0, 9)}"
+    c["company"]["metadata"]["last_updated"] = f"2025-{random.randint(1, 12):02d}-{random.randint(1, 28):02d}T{random.randint(0, 23):02d}:{random.randint(0, 59):02d}:00Z"
+
+    return c
+
+# -----------------------------
+# Flattening
+# -----------------------------
+def traverse(node: Any, path_parts: List[tuple], rows: List[Dict[str, Any]], ancestors_meta: Dict[str, str]):
+    """Depth-first traversal to produce rows."""
+    if isinstance(node, dict):
+        local_meta = dict(ancestors_meta)
+        if "unit_name" in node and isinstance(node["unit_name"], (str, int, float)):
+            local_meta["unit_name"] = str(node["unit_name"])
+        if "dept_id" in node and "name" in node and isinstance(node["name"], (str, int, float)):
+            local_meta["dept_name"] = str(node["name"])
+        if "factory_id" in node:
+            local_meta["factory_id"] = str(node["factory_id"])
+        if "id" in node and "subsidiaries" in [p for t, p in path_parts if t == "key"] and "name" in node:
+            local_meta["subsidiary_name"] = str(node["name"])
+        for k, v in node.items():
+            traverse(v, path_parts + [("key", k)], rows, local_meta)
+
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            traverse(v, path_parts + [("index", i)], rows, ancestors_meta)
+
+    else:
+        keys = [val for typ, val in path_parts if typ == "key"]
+        section_key = keys[1] if (len(keys) >= 2 and keys[0] == "company") else None
+        section = SECTION_MAP.get(section_key, humanize(section_key) if section_key else "Company")
+
+        subsection = ""
+        if section_key:
+            after = keys[2:]
+            for k in after:
+                if k in SUBSECTION_KEYS:
+                    subsection = humanize(k)
+                    break
+
+        prop_name = next((val for typ, val in reversed(path_parts) if typ == "key"), "value")
+        json_path = to_jsonpath(path_parts)
+        context = build_context(path_parts, ancestors_meta)
+        label = make_label(prop_name, keys)
+
+        rows.append({
+            "Question_label": label,
+            "Prop": prop_name,
+            "Value": node if node is not None else "",
+            "Json_pointer": json_path,
+            "Question_context": context,
+            "Section": section,
+            "Subsection": subsection
+        })
+
+def flatten_to_csv(data: Dict[str, Any], out_csv_path: str):
+    rows: List[Dict[str, Any]] = []
+    traverse(data, [], rows, ancestors_meta={})
+    df = pd.DataFrame(rows, columns=["Question_label", "Prop", "Value", "Json_pointer", "Question_context", "Section", "Subsection"])
+
+    # Normalize certain Value fields by Prop
+    def norm_row(row):
+        prop = str(row["Prop"]).lower()
+        val = row["Value"]
+        if prop == "country":
+            return iso2_country(str(val))
+        if prop == "phone":
+            return norm_phone(str(val))
+        if prop in ("founded", "valid_till", "last_updated"):
+            return norm_date(str(val))
+        return val
+
+    df["Value"] = df.apply(norm_row, axis=1)
+    df.to_csv(out_csv_path, index=False)
+
+# -----------------------------
+# Main: generate 10 CSVs + ZIP
+# -----------------------------
+def main():
+    out_csvs: List[str] = []
+    for i in range(1, 11):
+        overlaps = {}
+        if i in (1, 4, 7):           # enforce HQ Bangalore, India
+            overlaps["hq_india"] = True
+        if i in (2, 5):              # enforce same unit_head in some files
+            overlaps["unit_head"] = "Ravi Sharma"
+
+        data = build_company(i, overlaps)
+        out_csv = f"company_norm_bundle_{i:02d}.csv"
+        flatten_to_csv(data, out_csv)
+        out_csvs.append(out_csv)
+        print(f"✓ Wrote {out_csv}")
+
+    zip_name = "company_norm_bundle_10.zip"
+    with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in out_csvs:
+            zf.write(p, arcname=os.path.basename(p))
+    print(f"\nAll done! Bundled into {zip_name}")
+
+if __name__ == "__main__":
+    main()
