@@ -20,3 +20,70 @@ const CustomUserMessage = (props: UserMessageProps) => {
 <CopilotSidebar UserMessage={CustomUserMessage} />```
 
 Also, feel free to use our [support channel](https://discord.gg/79q9drkg) for questions - we track it more frequently and have a bot that provides instant replies.
+
+
+
+
+
+_This solution has been AI generated_ 
+
+When embedding CopilotKit chat in an iframe, global styles often don't penetrate, so avatar and font overrides via external CSS may not apply. The most reliable fix is to replace the built‑in message components with custom ones and/or use CopilotKit CSS variables on the CopilotChat container.
+
+### Recommended approach: replace message components (works best in iframes)
+```tsx
+import { CopilotChat, UserMessage, AssistantMessage, UserMessageProps, AssistantMessageProps } from "@copilotkit/react-ui";
+import { SparklesIcon } from "@heroicons/react/24/outline";
+
+const CustomUserMessage = ({ message, ...props }: UserMessageProps) => (
+  <UserMessage
+    {...props}
+    message={message}
+    avatar={
+      <div className="bg-blue-500 shadow-sm min-h-10 min-w-10 rounded-full text-white flex items-center justify-center font-semibold">
+        U
+      </div>
+    }
+  />
+);
+
+const CustomAssistantMessage = ({ message, ...props }: AssistantMessageProps) => (
+  <AssistantMessage
+    {...props}
+    message={message}
+    avatar={
+      <div className="bg-zinc-400 border-zinc-500 shadow-lg min-h-10 min-w-10 rounded-full flex items-center justify-center">
+        <SparklesIcon className="h-5 w-5 text-white" />
+      </div>
+    }
+  />
+);
+
+export default function Chat() {
+  return (
+    <CopilotChat UserMessage={CustomUserMessage} AssistantMessage={CustomAssistantMessage} />
+  );
+}
+```
+
+### Use CopilotKit CSS variables on the chat container
+```tsx
+import { CopilotKitCSSProperties } from "@copilotkit/react-ui";
+
+const styles: CopilotKitCSSProperties = {
+  "--copilot-kit-primary-color": "#007bff",
+  "--copilot-kit-contrast-color": "#ffffff",
+  "--copilot-kit-background-color": "#f8f9fa",
+};
+
+<CopilotChat style={styles} />
+```
+
+### Optional: class-based overrides (may not apply in iframes)
+```c
+
+**Was this helpful?**
+
+If this solution worked for you, please click on the appropriate option below to help us improve:
+
+
+
