@@ -481,3 +481,26 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+Hi <@1282063416198172703>, I understand that. But in the scenario, you dont need to consume the
+const CustomAssistantMessage = ({ message, ...props }: AssistantMessageProps) => (
+<AssistantMessage
+{...props}
+message={message}
+avatar={
+<div className="bg-zinc-400 border-zinc-500 shadow-lg min-h-10 min-w-10 rounded-full flex items-center justify-center">
+<SparklesIcon className="h-5 w-5 text-white" />
+</div>
+}
+/>
+);
+
+You can build your own custom component and assign it to AssistantMessage= {....} in <CopilotChat>
