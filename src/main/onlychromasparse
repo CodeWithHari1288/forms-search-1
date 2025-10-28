@@ -1,0 +1,244 @@
+# ingest_csv_chroma_dual.py
+# Usage:
+#   ollama pull bge-m3
+#   pip install chromadb rank_bm25 pandas requests
+#   python ingest_csv_chroma_dual.py --csv your.csv --collection forms_demo
+#
+# Creates Chroma collections:
+#   <collection>_dense_full     (question_label | value | prop)
+#   <collection>_dense_novalue  (question_label | prop)
+# And a BM25 side index (value-included):
+#   <DB_DIR>/<collection>_side/bm25_full.pkl
+
+import os, argparse, uuid, pickle, re
+import pandas as pd
+import requests
+import chromadb
+from chromadb.config import Settings
+from rank_bm25 import BM25Okapi
+
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+MODEL      = os.environ.get("OLLAMA_MODEL", "bge-m3")
+DB_DIR     = os.environ.get("CHROMA_DIR", "./chroma_db")
+TOKEN_SPLIT = re.compile(r"[A-Za-z0-9_]+")
+
+def tok(s: str): return TOKEN_SPLIT.findall((s or "").lower())
+
+def embed_ollama(texts):
+    out = []
+    for t in texts:
+        r = requests.post(f"{OLLAMA_URL}/api/embeddings",
+                          json={"model": MODEL, "prompt": t}, timeout=90)
+        r.raise_for_status()
+        out.append(r.json()["embedding"])
+    return out
+
+def text_full(row):      # includes value (sparse target)
+    parts = []
+    ql = str(row.get("question_label","")).strip()
+    val = str(row.get("value","")).strip()
+    prop = str(row.get("prop","")).strip()
+    if ql:  parts.append(ql)
+    if val: parts.append(val)
+    if prop: parts.append(prop)
+    return " | ".join(parts)
+
+def text_novalue(row):   # excludes value (dense-no-value variant)
+    parts = []
+    ql = str(row.get("question_label","")).strip()
+    prop = str(row.get("prop","")).strip()
+    if ql:  parts.append(ql)
+    if prop: parts.append(prop)
+    return " | ".join(parts)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv", required=True)
+    ap.add_argument("--collection", required=True)
+    args = ap.parse_args()
+
+    df = pd.read_csv(args.csv)
+    req = ["question_label","prop","value","json_pointer","section","subsection"]
+    miss = [c for c in req if c not in df.columns]
+    if miss: raise SystemExit(f"CSV missing columns: {miss}")
+
+    # Build data
+    ids, metas = [], []
+    texts_full_list, texts_novalue_list = [], []
+    for i, row in df.iterrows():
+        t_full = text_full(row)
+        t_noval = text_novalue(row)
+        if not (t_full or t_noval):  # skip empty
+            continue
+        rid = str(uuid.uuid4())
+        ids.append(rid)
+        metas.append({
+            "question_label": str(row.get("question_label","")),
+            "prop": str(row.get("prop","")),
+            "value": str(row.get("value","")),
+            "json_pointer": str(row.get("json_pointer","")),
+            "section": str(row.get("section","")),
+            "subsection": str(row.get("subsection","")),
+            "source_row": int(i),
+        })
+        texts_full_list.append(t_full)
+        texts_novalue_list.append(t_noval)
+
+    if not ids: raise SystemExit("No rows to index.")
+
+    # Embed both dense variants
+    print(f"Embedding dense FULL ({len(texts_full_list)}) with Ollama/{MODEL} ...")
+    vec_full = embed_ollama(texts_full_list)
+    print(f"Embedding dense NOVALUE ({len(texts_novalue_list)}) with Ollama/{MODEL} ...")
+    vec_noval = embed_ollama(texts_novalue_list)
+
+    # Persist to two Chroma collections
+    client = chromadb.PersistentClient(path=DB_DIR, settings=Settings(allow_reset=False))
+    name_full = f"{args.collection}_dense_full"
+    name_noval = f"{args.collection}_dense_novalue"
+
+    def get_or_create(coll_name):
+        try: return client.get_collection(coll_name)
+        except: return client.create_collection(coll_name, metadata={"hnsw:space":"cosine"})
+
+    coll_full  = get_or_create(name_full)
+    coll_noval = get_or_create(name_noval)
+
+    coll_full.add(ids=ids, documents=texts_full_list,  metadatas=metas, embeddings=vec_full)
+    coll_noval.add(ids=ids, documents=texts_novalue_list, metadatas=metas, embeddings=vec_noval)
+    print(f"Added {len(ids)} docs to '{name_full}' and '{name_noval}' in {DB_DIR}")
+
+    # Build BM25 over value-included text (sparse target)
+    tokenized = [tok(t) for t in texts_full_list]
+    bm25 = BM25Okapi(tokenized)
+    side_dir = os.path.join(DB_DIR, f"{args.collection}_side")
+    os.makedirs(side_dir, exist_ok=True)
+    with open(os.path.join(side_dir, "bm25_full.pkl"), "wb") as f:
+        pickle.dump({"bm25": bm25, "ids": ids,
+                     "texts_full": texts_full_list,
+                     "texts_novalue": texts_novalue_list,
+                     "metas": metas}, f)
+    print(f"BM25 (value-included) saved to {side_dir}/bm25_full.pkl")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+# retrieve_compare.py
+# Usage examples:
+#   python retrieve_compare.py --collection forms_demo --query "city is Hyderabad" --k 5 --mode A
+#   python retrieve_compare.py --collection forms_demo --query "city is Hyderabad" --k 5 --mode B
+#   python retrieve_compare.py --collection forms_demo --query "city is Hyderabad" --k 5 --mode ALL
+#
+# Modes:
+#   A = Dense(FULL)     + BM25(value)
+#   B = Dense(NOVALUE)  + BM25(value)
+#
+# Env (optional): OLLAMA_URL, OLLAMA_MODEL, CHROMA_DIR
+
+import os, argparse, pickle, requests, chromadb, re
+from chromadb.config import Settings
+
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+MODEL      = os.environ.get("OLLAMA_MODEL", "bge-m3")
+DB_DIR     = os.environ.get("CHROMA_DIR", "./chroma_db")
+
+def embed(text: str):
+    r = requests.post(f"{OLLAMA_URL}/api/embeddings",
+                      json={"model": MODEL, "prompt": text}, timeout=60)
+    r.raise_for_status()
+    return r.json()["embedding"]
+
+def rrf(ranklists, k=60):
+    scores = {}
+    for rl in ranklists:
+        for rank, _id in enumerate(rl, start=1):
+            scores[_id] = scores.get(_id, 0.0) + 1.0/(k+rank)
+    return scores
+
+def dense_rank(coll, qvec, n):
+    r = coll.query(query_embeddings=[qvec], n_results=n, include=["distances","ids"])
+    ids = r["ids"][0]
+    dists = r["distances"][0]
+    return [x for _, x in sorted(zip(dists, ids), key=lambda t: t[0])]
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--collection", required=True)
+    ap.add_argument("--query", required=True)
+    ap.add_argument("--k", type=int, default=5)
+    ap.add_argument("--dense_candidates", type=int, default=30)
+    ap.add_argument("--mode", choices=["A","B","ALL"], default="ALL")
+    args = ap.parse_args()
+
+    # Load BM25 (value-included)
+    side_dir = os.path.join(DB_DIR, f"{args.collection}_side")
+    pkl = os.path.join(side_dir, "bm25_full.pkl")
+    if not os.path.exists(pkl):
+        raise SystemExit(f"Missing BM25 index at {pkl}. Run ingest first.")
+    with open(pkl, "rb") as f:
+        side = pickle.load(f)
+    bm25 = side["bm25"]; ids = side["ids"]; metas = side["metas"]
+    texts_full = side["texts_full"]; texts_noval = side["texts_novalue"]
+    id2meta = {i:m for i,m in zip(ids, metas)}
+    id2text_full = {i:t for i,t in zip(ids, texts_full)}
+    id2text_novl = {i:t for i,t in zip(ids, texts_noval)}
+
+    # Chroma collections
+    client = chromadb.PersistentClient(path=DB_DIR, settings=Settings(allow_reset=False))
+    coll_full  = client.get_collection(f"{args.collection}_dense_full")
+    coll_noval = client.get_collection(f"{args.collection}_dense_novalue")
+
+    # Query embeddings
+    qvec = embed(args.query)
+
+    # Dense candidates
+    dense_full_rank  = dense_rank(coll_full,  qvec, min(args.dense_candidates, len(ids)))
+    dense_noval_rank = dense_rank(coll_noval, qvec, min(args.dense_candidates, len(ids)))
+
+    # BM25 candidates (value-included)
+    # We reuse the same corpus BM25 was built on (texts_full)
+    # rank ids by BM25 score:
+    from numpy import argsort
+    import numpy as np
+    # Quick score:
+    # Re-tokenize query consistently with BM25’s internal tokenization
+    # BM25Okapi doesn’t expose tokenizer; we set during ingest by pre-tokenizing corpus.
+    # For query, it tokenizes by .lower().split() on whitespace by default. Good enough:
+    q_tokens = args.query.lower().split()
+    bm25_scores = bm25.get_scores(q_tokens)
+    bm25_rank = [x for _, x in sorted(zip(bm25_scores, ids), key=lambda t: t[0], reverse=True)][:args.dense_candidates]
+
+    def show_list(title, id_list, which="full"):
+        print(f"\n{title}")
+        for r, fid in enumerate(id_list[:args.k], start=1):
+            m = id2meta[fid]
+            t = id2text_full[fid] if which=="full" else id2text_novl[fid]
+            print(f"#{r}  {t}")
+            print(f"    label={m.get('question_label')} prop={m.get('prop')} value={m.get('value')}")
+            print(f"    section={m.get('section')} / {m.get('subsection')}  pointer={m.get('json_pointer')}")
+
+    # Mode A: Dense(FULL) + BM25(value)
+    if args.mode in ("A","ALL"):
+        fusedA = rrf([dense_full_rank, bm25_rank])
+        fusedA_sorted = [i for i,_ in sorted(fusedA.items(), key=lambda t: t[1], reverse=True)]
+        show_list("Mode A — Dense(FULL) + Sparse(value) [RRF]", fusedA_sorted, which="full")
+
+    # Mode B: Dense(NOVALUE) + BM25(value)
+    if args.mode in ("B","ALL"):
+        fusedB = rrf([dense_noval_rank, bm25_rank])
+        fusedB_sorted = [i for i,_ in sorted(fusedB.items(), key=lambda t: t[1], reverse=True)]
+        show_list("Mode B — Dense(NO VALUE) + Sparse(value) [RRF]", fusedB_sorted, which="novalue")
+
+    # (Optional) diagnostics
+    print("\nDense(FULL) top-5:", dense_full_rank[:5])
+    print("Dense(NOVALUE) top-5:", dense_noval_rank[:5])
+    print("BM25(value) top-5:", bm25_rank[:5])
+
+if __name__ == "__main__":
+    main()
