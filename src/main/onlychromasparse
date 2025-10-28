@@ -606,3 +606,38 @@ export default function ChatMessage({ role, message }) {
   border-radius: 10px;
   padding: 12px;
 }
+
+
+
+
+
+
+
+const [messages, setMessages] = useState([]);
+
+function handleSend(userInput) {
+    const tempId = generateUniqueId();
+    
+    setMessages(old => [
+        ...old,
+        { id: tempId, role: "assistant", content: "Thinking...", isPending: true }
+    ]);
+    
+    fetch("/api/...", {
+        method: "POST",
+        body: JSON.stringify({ input: userInput, tempId }),
+        headers: { "Content-Type": "application/json" }
+    })
+    .then(response => response.json())
+    .then(data => {
+        setMessages(old => 
+            old.map(msg => 
+                msg.id === tempId 
+                    ? { ...msg, content: data.content, isPending: false }
+                    : msg
+            )
+        );
+    });
+}
+
+
