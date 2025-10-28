@@ -242,3 +242,242 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+# benchmark_compare.py
+# Compare Mode A (dense with value + BM25(value)) vs Mode B (dense without value + BM25(value))
+# across multiple queries and export CSV reports.
+#
+# Usage:
+#   pip install chromadb rank_bm25 pandas requests numpy
+#   python benchmark_compare.py --collection forms_demo --queries_csv queries.csv --out_dir ./reports
+#
+# Inputs produced by your previous ingest step:
+#   - Chroma collections: <collection>_dense_full, <collection>_dense_novalue
+#   - Side BM25 pickle:   <CHROMA_DIR>/<collection>_side/bm25_full.pkl
+#
+# Outputs:
+#   - reports/<collection>_detailed.csv   (per query/mode/rank row-level)
+#   - reports/<collection>_summary.csv    (per query/mode metrics)
+
+import os, re, argparse, csv, pickle, json, math
+import numpy as np
+import pandas as pd
+import requests
+import chromadb
+from chromadb.config import Settings
+
+# Env (optional)
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+MODEL      = os.environ.get("OLLAMA_MODEL", "bge-m3")
+DB_DIR     = os.environ.get("CHROMA_DIR", "./chroma_db")
+
+def embed(text: str):
+    r = requests.post(f"{OLLAMA_URL}/api/embeddings",
+                      json={"model": MODEL, "prompt": text}, timeout=90)
+    r.raise_for_status()
+    return r.json()["embedding"]
+
+def rrf(ranklists, k=60):
+    scores = {}
+    for rl in ranklists:
+        for rank, _id in enumerate(rl, start=1):
+            scores[_id] = scores.get(_id, 0.0) + 1.0/(k+rank)
+    # return sorted id list by fused score desc
+    return [i for i,_ in sorted(scores.items(), key=lambda t: t[1], reverse=True)]
+
+def dense_rank(coll, qvec, n):
+    r = coll.query(query_embeddings=[qvec], n_results=n, include=["distances","ids"])
+    ids = r["ids"][0]
+    dists = r["distances"][0]
+    # cosine distance: smaller is better
+    return [x for _, x in sorted(zip(dists, ids), key=lambda t: t[0])]
+
+def load_queries(path):
+    df = pd.read_csv(path)
+    if "query" not in df.columns:
+        raise SystemExit("queries.csv must have a 'query' column")
+    for col in ("gold_ids", "gold_patterns"):
+        if col not in df.columns:
+            df[col] = ""
+    # normalize to lists
+    def split_or_empty(s):
+        s = str(s) if not (isinstance(s, float) and math.isnan(s)) else ""
+        s = s.strip()
+        return [x.strip() for x in s.split(";") if x.strip()] if s else []
+    df["gold_ids"] = df["gold_ids"].apply(split_or_empty)
+    df["gold_patterns"] = df["gold_patterns"].apply(split_or_empty)
+    return df
+
+def compile_patterns(patterns):
+    compiled = []
+    for p in patterns:
+        try:
+            compiled.append(re.compile(p, re.IGNORECASE))
+        except re.error:
+            # fallback to plain substring by escaping
+            compiled.append(re.compile(re.escape(p), re.IGNORECASE))
+    return compiled
+
+def text_for_eval(meta, text_full, text_noval):
+    # We’ll evaluate patterns on the FULL text (label|value|prop) primarily,
+    # because your “sparse with value” gold is typically value-aware.
+    return text_full
+
+def compute_metrics(ranked_ids, relevant_set, k_list=(1,3,5,10)):
+    # Binary relevance
+    hits = [1 if rid in relevant_set else 0 for rid in ranked_ids]
+    # Precision@K, Recall@K, Hits@K, MRR
+    metrics = {}
+    rel_total = len(relevant_set) if relevant_set else None
+
+    # MRR (first relevant)
+    mrr = 0.0
+    for idx, h in enumerate(hits, start=1):
+        if h:
+            mrr = 1.0/idx
+            break
+    metrics["MRR"] = mrr if relevant_set else None
+
+    for k in k_list:
+        k = min(k, len(hits))
+        if k == 0:
+            metrics[f"Precision@{k}"] = None
+            metrics[f"Recall@{k}"] = None
+            metrics[f"Hits@{k}"] = None
+            continue
+        topk = hits[:k]
+        prec = sum(topk)/k
+        metrics[f"Precision@{k}"] = prec if relevant_set is not None else None
+        metrics[f"Hits@{k}"] = int(sum(topk))
+        if relevant_set is not None and rel_total > 0:
+            rec = sum(topk)/rel_total
+            metrics[f"Recall@{k}"] = rec
+        else:
+            metrics[f"Recall@{k}"] = None
+    return metrics
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--collection", required=True)
+    ap.add_argument("--queries_csv", required=True)
+    ap.add_argument("--out_dir", default="./reports")
+    ap.add_argument("--dense_candidates", type=int, default=50)
+    ap.add_argument("--top_k_export", type=int, default=20, help="export top-K rows to detailed CSV")
+    args = ap.parse_args()
+
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    # Load side BM25 and corpus
+    side_dir = os.path.join(DB_DIR, f"{args.collection}_side")
+    pkl = os.path.join(side_dir, "bm25_full.pkl")
+    if not os.path.exists(pkl):
+        raise SystemExit(f"Missing BM25 index at {pkl}. Run ingest first.")
+    with open(pkl, "rb") as f:
+        side = pickle.load(f)
+    bm25 = side["bm25"]
+    ids = side["ids"]
+    metas = side["metas"]
+    texts_full = side["texts_full"]
+    texts_noval = side["texts_novalue"]
+    id2meta = {i:m for i,m in zip(ids, metas)}
+    id2text_full = {i:t for i,t in zip(ids, texts_full)}
+    id2text_noval = {i:t for i,t in zip(ids, texts_noval)}
+
+    # Chroma collections
+    client = chromadb.PersistentClient(path=DB_DIR, settings=Settings(allow_reset=False))
+    coll_full  = client.get_collection(f"{args.collection}_dense_full")
+    coll_noval = client.get_collection(f"{args.collection}_dense_novalue")
+
+    # Load queries
+    queries_df = load_queries(args.queries_csv)
+
+    detailed_rows = []
+    summary_rows = []
+
+    for _, row in queries_df.iterrows():
+        q = row["query"]
+        gold_ids = set(row["gold_ids"])
+        gold_patterns = compile_patterns(row["gold_patterns"])
+
+        # Build a relevance set by IDs and/or patterns
+        pattern_relevant_ids = set()
+        if gold_patterns:
+            for rid in ids:
+                text = id2text_full[rid]
+                if any(p.search(text) for p in gold_patterns):
+                    pattern_relevant_ids.add(rid)
+        relevant_ids = gold_ids.union(pattern_relevant_ids)
+
+        # Embed query
+        qvec = embed(q)
+
+        # Dense ranks
+        n = min(args.dense_candidates, len(ids))
+        dense_full_rank  = dense_rank(coll_full,  qvec, n)
+        dense_noval_rank = dense_rank(coll_noval, qvec, n)
+
+        # BM25 rank (value-included) — keep same candidate pool size
+        q_tokens = q.lower().split()
+        bm_scores = bm25.get_scores(q_tokens)
+        bm_rank = [x for _, x in sorted(zip(bm_scores, ids), key=lambda t: t[0], reverse=True)][:n]
+
+        # Fusions
+        fused_A = rrf([dense_full_rank, bm_rank])   # Mode A
+        fused_B = rrf([dense_noval_rank, bm_rank])  # Mode B
+
+        def export_mode(mode_name, fused_list, which="full"):
+            topk = fused_list[:args.top_k_export]
+            for rank, rid in enumerate(topk, start=1):
+                m = id2meta[rid]
+                t = id2text_full[rid] if which=="full" else id2text_noval[rid]
+                detailed_rows.append({
+                    "query": q,
+                    "mode": mode_name,
+                    "rank": rank,
+                    "id": rid,
+                    "question_label": m.get("question_label"),
+                    "prop": m.get("prop"),
+                    "value": m.get("value"),
+                    "section": m.get("section"),
+                    "subsection": m.get("subsection"),
+                    "json_pointer": m.get("json_pointer"),
+                    "text": t,
+                    "is_relevant": int(rid in relevant_ids) if len(relevant_ids)>0 else None,
+                })
+
+            # metrics
+            metrics = compute_metrics(fused_list, relevant_ids, k_list=(1,3,5,10))
+            summary_row = {
+                "query": q,
+                "mode": mode_name,
+                "num_gold_relevant": len(relevant_ids) if len(relevant_ids)>0 else None,
+                **metrics
+            }
+            summary_rows.append(summary_row)
+
+        export_mode("A (dense+value + sparse+value)", fused_A, which="full")
+        export_mode("B (dense-no-value + sparse+value)", fused_B, which="novalue")
+
+    # Write CSVs
+    detailed_path = os.path.join(args.out_dir, f"{args.collection}_detailed.csv")
+    summary_path  = os.path.join(args.out_dir, f"{args.collection}_summary.csv")
+    pd.DataFrame(detailed_rows).to_csv(detailed_path, index=False)
+    pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
+
+    print(f"✅ Wrote detailed rankings to: {detailed_path}")
+    print(f"✅ Wrote summary metrics to : {summary_path}")
+    print("Done.")
+
+if __name__ == "__main__":
+    main()
