@@ -531,3 +531,78 @@ const CustomUserMessage = (props: UserMessageProps) => {
 <CopilotSidebar UserMessage={CustomUserMessage} />```
 
 Also, feel free to use our [support channel](https://discord.gg/79q9drkg) for questions - we track it more frequently and have a bot that provides instant replies.
+
+
+
+
+
+
+import { Avatar, Box, Typography, Stack } from "@mui/material";
+import SmartToyIcon from "@mui/icons-material/SmartToy";
+import PersonIcon from "@mui/icons-material/Person";
+
+export default function ChatMessage({ role, message }) {
+  const isUser = role === "user";
+
+  return (
+    <div
+      className={`copilot-message ${
+        isUser ? "copilot-message-user" : "copilot-message-assistant"
+      }`}
+    >
+      <Stack
+        direction={isUser ? "row-reverse" : "row"}
+        alignItems="flex-start"
+        spacing={1.5}
+        sx={{
+          mb: 2,
+          justifyContent: isUser ? "flex-end" : "flex-start",
+        }}
+      >
+        <Avatar
+          sx={{
+            bgcolor: isUser ? "#1976d2" : "#9c27b0",
+            width: 36,
+            height: 36,
+          }}
+        >
+          {isUser ? <PersonIcon /> : <SmartToyIcon />}
+        </Avatar>
+
+        <Box
+          className="copilot-message-content"
+          sx={{
+            p: 1.5,
+            borderRadius: 2,
+            bgcolor: isUser ? "#e3f2fd" : "#f3e5f5",
+            maxWidth: "70%",
+            textAlign: isUser ? "right" : "left",
+          }}
+        >
+          <Typography variant="body1" sx={{ whiteSpace: "pre-wrap" }}>
+            {message}
+          </Typography>
+        </Box>
+      </Stack>
+    </div>
+  );
+}
+
+
+
+
+
+.copilot-message-user {
+  justify-content: flex-end !important;
+  background-color: #e3f2fd !important;
+}
+
+.copilot-message-assistant {
+  justify-content: flex-start !important;
+  background-color: #f3e5f5 !important;
+}
+
+.copilot-message-content {
+  border-radius: 10px;
+  padding: 12px;
+}
