@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """
-ingest_milvus_v3_ollama_bm25_crfpk_single.py
+ingest_milvus_v3_ollama_bm25_crf_intpk.py
 
-Same as before:
-- PK = "<CRF_VALUE>_<row_number>"
-- dense from Ollama (bge-m3)
-- sparse from rank-bm25
-- value_vec from Ollama for short values
-BUT:
-- we INSERT **one row at a time** to avoid
-  "id should be varchar but got list" shape issues.
-
-Run:
-    python ingest_milvus_v3_ollama_bm25_crfpk_single.py --csv ./forms.csv
+- PK = INT64
+- PK value = <CRF_INTEGER><sequence>  (no underscore)
+  e.g. CRF=1001 → 10011, 10012, 10013 ...
+- CRF value is read from the CSV row where question_label == "crf"
+  or Prop == "crf" (case-insensitive)
+- dense: Ollama bge-m3
+- sparse: rank-bm25 over schema text
+- value_vec: Ollama for short/non-JSON values
+- insert: **one row at a time** (to avoid shape issues)
 """
 
 import os
@@ -80,27 +78,36 @@ def build_schema_text(row: Dict[str, str]) -> str:
     return " ".join(parts)
 
 
-def find_crf_value(rows: List[Dict[str, str]]) -> str:
+def find_crf_int(rows: List[Dict[str, str]]) -> int:
+    """
+    Find CRF row and return its Value as int.
+    You said: "crf value we will get from csv will be integers only" → so we cast to int.
+    If not found or not int → fallback 1.
+    """
     for r in rows:
         ql = (r.get("question_label") or r.get("Question_label") or "").strip().lower()
         prop = (r.get("Prop") or "").strip().lower()
         if ql == "crf" or prop == "crf":
             val = (r.get("Value") or "").strip()
-            if val:
-                return val
-    return "CRF"
+            try:
+                return int(val)
+            except Exception:
+                pass
+    return 1  # safe fallback
 
 
 # -------- COLLECTION --------
 def ensure_collection(client: MilvusClient):
-    # if collection already exists with correct schema, we skip
+    # IMPORTANT:
+    # if you previously created `forms_hybrid_v3` with VARCHAR PK,
+    # drop it once and recreate with this schema.
     if client.has_collection(COLLECTION):
         return
 
     schema = client.create_schema(auto_id=False)
 
-    # PK is VARCHAR so we can do CRF_1, CRF_2, ...
-    schema.add_field("id", DataType.VARCHAR, is_primary=True, max_length=128)
+    # PK is now INT64 ✅
+    schema.add_field("id", DataType.INT64, is_primary=True)
 
     schema.add_field("question_label", DataType.VARCHAR, max_length=256)
     schema.add_field("prop", DataType.VARCHAR, max_length=256)
@@ -133,7 +140,7 @@ def ensure_collection(client: MilvusClient):
 def ingest_csv(client: MilvusClient, csv_path: str):
     ensure_collection(client)
 
-    # 1) read all rows first (we need whole corpus for BM25)
+    # 1) read all rows
     rows: List[Dict[str, str]] = []
     schema_texts: List[str] = []
     with open(csv_path, "r", encoding="utf-8-sig") as f:
@@ -142,20 +149,20 @@ def ingest_csv(client: MilvusClient, csv_path: str):
             rows.append(r)
             schema_texts.append(build_schema_text(r))
 
-    # 2) find CRF value for this file
-    crf_val = find_crf_value(rows).strip()
-    if not crf_val:
-        crf_val = "CRF"
-    crf_val = crf_val.replace(" ", "_")  # sanitize
+    # 2) get CRF as integer
+    crf_int = find_crf_int(rows)
+    print(f"[i] Using CRF base: {crf_int} (from CSV)")
 
-    # 3) build BM25 over schema texts
+    # 3) build BM25 over all schema texts
     tokenized_docs = [txt.lower().split() for txt in schema_texts]
     bm25 = BM25Okapi(tokenized_docs)
     vocab = {tok: i for i, tok in enumerate(sorted({t for doc in tokenized_docs for t in doc}))}
 
-    # 4) now insert ONE BY ONE
+    # 4) insert rows ONE BY ONE
     count = 0
-    for idx, (row, doc_tokens, schema_text) in enumerate(zip(rows, tokenized_docs, schema_texts), start=1):
+    for seq, (row, doc_tokens, schema_text) in enumerate(
+        zip(rows, tokenized_docs, schema_texts), start=1
+    ):
         ql = row.get("question_label") or row.get("Question_label") or ""
         prop = row.get("Prop") or ""
         val = row.get("Value") or ""
@@ -193,11 +200,12 @@ def ingest_csv(client: MilvusClient, csv_path: str):
         else:
             value_dense = [0.0] * BGE_DIM
 
-        # PK for this row
-        pk_str = f"{crf_val}_{idx}"
+        # ✅ INT64 PK: concat crf_int and seq as string, then cast to int
+        # crf_int = 1001, seq = 3 → "10013" → int("10013")
+        pk_int = int(f"{crf_int}{seq}")
 
         one_row = {
-            "id": pk_str,
+            "id": pk_int,
             "question_label": ql,
             "prop": prop,
             "value_text": val_norm,
@@ -210,20 +218,17 @@ def ingest_csv(client: MilvusClient, csv_path: str):
             "value_vec": value_dense,
         }
 
-        # 👉 insert single row (as list-of-dicts)
         client.insert(COLLECTION, [one_row])
         count += 1
 
-        # flush every 100 to keep things clean
         if count % 100 == 0:
             client.flush(COLLECTION)
-            print(f"[i] Inserted {count} rows so far...")
+            print(f"[i] Inserted {count} rows...")
 
-    # final flush
     client.flush(COLLECTION)
-    print(f"[OK] Inserted {count} rows from {csv_path} (CRF={crf_val})")
+    print(f"[OK] Inserted {count} rows from {csv_path} into {COLLECTION}")
 
-    # 5) save BM25 model (so retrieval can reuse vocab)
+    # 5) save BM25 model
     bm25_state = {
         "k1": bm25.k1,
         "b": bm25.b,
