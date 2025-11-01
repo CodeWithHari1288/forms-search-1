@@ -238,3 +238,260 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+#!/usr/bin/env python3
+"""
+retrieve_milvus_v3_ollama_bm25_rrf.py
+
+Hybrid retrieval (dense + BM25 sparse) from Milvus, matching:
+- collection: forms_hybrid_v3
+- schema: INT64 PK, question_label, prop, value_text, json_pointer, section, subsection, status,
+          dense (1024), sparse, value_vec (1024)
+- query encoder: Ollama bge-m3
+- sparse leg: BM25, loaded from bm25_model.json
+- ranker: RRF (as requested)
+
+Usage:
+    python retrieve_milvus_v3_ollama_bm25_rrf.py --query "address city"
+    python retrieve_milvus_v3_ollama_bm25_rrf.py --query "address" --section "Address" --value "hyderabad"
+    python retrieve_milvus_v3_ollama_bm25_rrf.py --query "gstin" --status "active" --topk 20
+    python retrieve_milvus_v3_ollama_bm25_rrf.py --query "address hyderabad" --value-fuzzy "hyderabad"
+
+Notes:
+- If bm25_model.json is missing, we fall back to dense-only.
+- If you want fuzzy on value, pass --value-fuzzy; otherwise we just filter exact on value_text.
+"""
+
+import os
+import json
+import argparse
+import requests
+from typing import Dict, Any, List, Optional
+
+from pymilvus import (
+    MilvusClient,
+    AnnSearchRequest,
+    RRFRanker,
+)
+
+# -------- CONFIG --------
+MILVUS_URI = os.environ.get("MILVUS_URI", "http://localhost:19530")
+MILVUS_TOKEN = os.environ.get("MILVUS_TOKEN", "root:Milvus")
+COLLECTION = os.environ.get("MILVUS_COLLECTION", "forms_hybrid_v3")
+
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "bge-m3")
+
+BM25_MODEL_FILE = os.environ.get("BM25_MODEL_FILE", "bm25_model.json")
+
+
+# -------- OLLAMA --------
+def ollama_embed(text: str) -> List[float]:
+    payload = {"model": OLLAMA_MODEL, "prompt": text}
+    r = requests.post(f"{OLLAMA_URL}/api/embeddings", json=payload, timeout=20)
+    r.raise_for_status()
+    return r.json()["embedding"]
+
+
+# -------- BM25 LOAD / QUERY → SPARSE VEC --------
+def load_bm25_model(path: str) -> Optional[Dict[str, Any]]:
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def bm25_query_to_sparse(query: str, bm25_state: Dict[str, Any]) -> Dict[int, float]:
+    """
+    Convert a text query into the same sparse format we used when ingesting.
+
+    We approximate BM25 scoring for the query terms using the stored idf, k1, b, avgdl.
+    Query is treated as a short doc.
+    """
+    tokens = query.lower().split()
+    if not tokens:
+        return {}
+
+    k1 = bm25_state["k1"]
+    b = bm25_state["b"]
+    avgdl = bm25_state["avgdl"]
+    idf_map = bm25_state["idf"]
+    vocab = bm25_state["vocab"]
+
+    # query treated as doc
+    doc_len = len(tokens)
+    tf_in_q = {}
+    for t in tokens:
+        tf_in_q[t] = tf_in_q.get(t, 0) + 1
+
+    sparse: Dict[int, float] = {}
+    for tok, tf in tf_in_q.items():
+        if tok not in idf_map:
+            continue
+        idf = idf_map[tok]
+        score = idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * (doc_len / avgdl)))
+        if tok in vocab:
+            term_id = vocab[tok]
+            sparse[term_id] = float(score)
+
+    return sparse
+
+
+# -------- FILTER BUILDER --------
+def build_expr(section: str, subsection: str, status: str, value_text: str) -> str:
+    clauses = []
+    if section:
+        clauses.append(f'section == "{section}"')
+    if subsection:
+        clauses.append(f'subsection == "{subsection}"')
+    if status:
+        clauses.append(f'status == "{status}"')
+    if value_text:
+        # we normalized to lowercase at ingest
+        vt = value_text.strip().lower()
+        clauses.append(f'value_text == "{vt}"')
+    return " and ".join(clauses)
+
+
+# -------- MAIN RETRIEVE --------
+def retrieve(
+    query: str,
+    section: str = "",
+    subsection: str = "",
+    status: str = "",
+    value_text: str = "",
+    value_fuzzy: str = "",
+    topk: int = 20,
+):
+    client = MilvusClient(uri=MILVUS_URI, token=MILVUS_TOKEN)
+
+    # embed query for dense leg
+    q_dense = ollama_embed(query)
+
+    # try to load BM25 model
+    bm25_state = load_bm25_model(BM25_MODEL_FILE)
+    q_sparse = None
+    if bm25_state is not None:
+        q_sparse = bm25_query_to_sparse(query, bm25_state)
+
+    expr = build_expr(section, subsection, status, value_text)
+
+    reqs: List[AnnSearchRequest] = []
+
+    # 1) DENSE leg
+    req_dense = AnnSearchRequest(
+        data=[q_dense],
+        anns_field="dense",
+        limit=topk,
+        param={"metric_type": "COSINE", "params": {}},
+        expr=expr if expr else None,
+    )
+    reqs.append(req_dense)
+
+    # 2) SPARSE (BM25) leg — only if we have the model
+    if q_sparse:
+        req_sparse = AnnSearchRequest(
+            data=[q_sparse],
+            anns_field="sparse",
+            limit=topk,
+            param={
+                "metric_type": "IP",
+                "params": {
+                    # this is optional; trims tiny weights
+                    "drop_ratio_search": 0.2
+                },
+            },
+            expr=expr if expr else None,
+        )
+        reqs.append(req_sparse)
+
+    # 3) OPTIONAL: value fuzzy leg (search in value_vec)
+    if value_fuzzy:
+        q_val_dense = ollama_embed(value_fuzzy)
+        req_val = AnnSearchRequest(
+            data=[q_val_dense],
+            anns_field="value_vec",
+            limit=topk,
+            param={"metric_type": "COSINE", "params": {}},
+            # we probably still want section/status filter here:
+            expr=build_expr(section, subsection, status, ""),  # no exact value filter
+        )
+        reqs.append(req_val)
+
+    # RRF: robust across unequal legs
+    ranker = RRFRanker()  # default k=60; can tune if needed
+
+    res = client.hybrid_search(
+        collection_name=COLLECTION,
+        reqs=reqs,
+        ranker=ranker,
+        limit=topk,
+        output_fields=[
+            "question_label",
+            "prop",
+            "value_text",
+            "json_pointer",
+            "section",
+            "subsection",
+            "status",
+        ],
+    )
+
+    # print results
+    print(f"\n=== Results for query: {query!r} ===")
+    for hits in res:  # we sent one query, so this is 1 list
+        for h in hits:
+            print("-" * 60)
+            print(f"id:            {h.id}")
+            print(f"distance:      {h.distance}")
+            print(f"label:         {h.get('question_label')}")
+            print(f"prop:          {h.get('prop')}")
+            print(f"value_text:    {h.get('value_text')}")
+            print(f"pointer:       {h.get('json_pointer')}")
+            print(f"section:       {h.get('section')}  |  subsection: {h.get('subsection')}")
+            print(f"status:        {h.get('status')}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--query", required=True, help="Natural language query, e.g. 'address city'")
+    ap.add_argument("--section", default="", help="Filter by section")
+    ap.add_argument("--subsection", default="", help="Filter by subsection")
+    ap.add_argument("--status", default="", help="Filter by status")
+    ap.add_argument(
+        "--value",
+        default="",
+        help="Exact value_text filter (we stored values lowercased). e.g. --value hyderabad",
+    )
+    ap.add_argument(
+        "--value-fuzzy",
+        default="",
+        help="If provided, we also search value_vec with this text (fuzzy match on values).",
+    )
+    ap.add_argument("--topk", type=int, default=20, help="How many results to return")
+    args = ap.parse_args()
+
+    retrieve(
+        query=args.query,
+        section=args.section,
+        subsection=args.subsection,
+        status=args.status,
+        value_text=args.value,
+        value_fuzzy=args.value_fuzzy,
+        topk=args.topk,
+    )
+
+
+if __name__ == "__main__":
+    main()
