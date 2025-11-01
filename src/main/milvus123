@@ -1,0 +1,539 @@
+#!/usr/bin/env python3
+"""
+test_milvus.py
+
+Quick local health-check for Milvus/Zilliz.
+- Tries to connect
+- Prints server info (if available)
+- Lists collections
+- Optionally creates a tiny test collection and drops it
+
+Usage:
+    python test_milvus.py
+"""
+
+import os
+from pymilvus import (
+    MilvusClient,
+    DataType,
+)
+
+MILVUS_URI = os.environ.get("MILVUS_URI", "http://localhost:19530")
+MILVUS_TOKEN = os.environ.get("MILVUS_TOKEN", "root:Milvus")
+TEST_COLLECTION = "milvus_connect_test"
+
+def main():
+    print(f"[i] Connecting to Milvus at: {MILVUS_URI}")
+
+    try:
+        client = MilvusClient(uri=MILVUS_URI, token=MILVUS_TOKEN)
+    except Exception as e:
+        print("[FAIL] Could not connect to Milvus.")
+        print(e)
+        return
+
+    print("[OK] Connected.")
+
+    # Try listing collections
+    try:
+        cols = client.list_collections()
+        print(f"[OK] Collections found: {cols}")
+    except Exception as e:
+        print("[WARN] Could not list collections:")
+        print(e)
+
+    # Try creating a tiny test collection (id + vec)
+    try:
+        if not client.has_collection(TEST_COLLECTION):
+            schema = client.create_schema(auto_id=False)
+            schema.add_field("id", DataType.INT64, is_primary=True)
+            schema.add_field("vec", DataType.FLOAT_VECTOR, dim=8)
+
+            index_params = client.prepare_index_params()
+            index_params.add_index(
+                field_name="vec",
+                index_name="vec_idx",
+                index_type="AUTOINDEX",
+                metric_type="COSINE",
+            )
+
+            client.create_collection(
+                collection_name=TEST_COLLECTION,
+                schema=schema,
+                index_params=index_params,
+            )
+            print(f"[OK] Created test collection: {TEST_COLLECTION}")
+
+        client.load_collection(TEST_COLLECTION)
+        print(f"[OK] Loaded test collection: {TEST_COLLECTION}")
+
+        # Insert 1 dummy row
+        data = {
+            "id": [1],
+            "vec": [[0.1] * 8],
+        }
+        client.insert(TEST_COLLECTION, data)
+        client.flush(TEST_COLLECTION)
+        print("[OK] Inserted 1 test row.")
+
+        # Run a quick search
+        from pymilvus import AnnSearchRequest
+        req = AnnSearchRequest(
+            data=[[0.1] * 8],
+            anns_field="vec",
+            limit=1,
+            param={"metric_type": "COSINE", "params": {}},
+        )
+        res = client.search(
+            collection_name=TEST_COLLECTION,
+            data=req.data,
+            anns_field=req.anns_field,
+            param=req.param,
+            limit=req.limit,
+        )
+        print("[OK] Test search ran. Result:")
+        for hits in res:
+            for h in hits:
+                print(f"  -> id={h.id}, distance={h.distance}")
+
+    except Exception as e:
+        print("[WARN] Could not run test collection flow:")
+        print(e)
+
+    print("[DONE] Milvus basic test finished.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+#!/usr/bin/env python3
+"""
+ingest_milvus_v3.py
+
+Option 3: 3-leg hybrid in Milvus
+- schema_dense: FLOAT_VECTOR(1024)
+- schema_sparse: SPARSE_FLOAT_VECTOR
+- value_vec: FLOAT_VECTOR(1024)  <-- for fuzzy on values
+
+Usage:
+    python ingest_milvus_v3.py --csv ./forms.csv
+
+Env:
+    MILVUS_URI (default: http://localhost:19530)
+    MILVUS_TOKEN (default: root:Milvus)
+    MILVUS_COLLECTION (default: forms_hybrid_v3)
+"""
+
+import os
+import csv
+import argparse
+from typing import Dict, Any
+
+from pymilvus import (
+    MilvusClient,
+    DataType,
+)
+
+# ------------------------------------------------------------
+# CONFIG
+# ------------------------------------------------------------
+MILVUS_URI = os.environ.get("MILVUS_URI", "http://localhost:19530")
+MILVUS_TOKEN = os.environ.get("MILVUS_TOKEN", "root:Milvus")
+COLLECTION = os.environ.get("MILVUS_COLLECTION", "forms_hybrid_v3")
+BGE_DIM = 1024
+DEFAULT_STATUS = "active"
+
+
+# ------------------------------------------------------------
+# EMBEDDING STUBS — REPLACE WITH REAL BGE-M3
+# ------------------------------------------------------------
+def embed_bge_m3_schema(text: str) -> Dict[str, Any]:
+    """
+    For label/prop/section/subsection/pointer
+    Should return BOTH dense (len=1024) and sparse ({token_id: weight})
+    """
+    dense = [0.0] * BGE_DIM
+    sparse = {1: 0.75, 7: 0.33}  # fake
+    return {"dense": dense, "sparse": sparse}
+
+
+def embed_bge_m3_value(text: str) -> Dict[str, Any]:
+    """
+    For actual values (short strings like 'hyderabad')
+    Value side usually only needs dense, but we return same structure for symmetry.
+    """
+    dense = [0.0] * BGE_DIM
+    sparse = {3: 0.9}
+    return {"dense": dense, "sparse": sparse}
+
+
+# ------------------------------------------------------------
+# COLLECTION CREATION
+# ------------------------------------------------------------
+def ensure_collection(client: MilvusClient):
+    if client.has_collection(COLLECTION):
+        return
+
+    schema = client.create_schema(auto_id=False)
+
+    # PK
+    schema.add_field("id", DataType.INT64, is_primary=True)
+
+    # CSV fields
+    schema.add_field("question_label", DataType.VARCHAR, max_length=256)
+    schema.add_field("prop", DataType.VARCHAR, max_length=256)
+    schema.add_field("value_text", DataType.VARCHAR, max_length=2048)
+    schema.add_field("json_pointer", DataType.VARCHAR, max_length=512)
+    schema.add_field("section", DataType.VARCHAR, max_length=256)
+    schema.add_field("subsection", DataType.VARCHAR, max_length=256)
+    schema.add_field("status", DataType.VARCHAR, max_length=64)
+
+    # 3 vector legs
+    schema.add_field("dense", DataType.FLOAT_VECTOR, dim=BGE_DIM)             # schema dense
+    schema.add_field("sparse", DataType.SPARSE_FLOAT_VECTOR)                  # schema sparse
+    schema.add_field("value_vec", DataType.FLOAT_VECTOR, dim=BGE_DIM)         # value dense
+
+    index_params = client.prepare_index_params()
+
+    # 1) schema dense
+    index_params.add_index(
+        field_name="dense",
+        index_name="dense_idx",
+        index_type="AUTOINDEX",
+        metric_type="COSINE",
+    )
+    # 2) schema sparse
+    index_params.add_index(
+        field_name="sparse",
+        index_name="sparse_idx",
+        index_type="SPARSE_INVERTED_INDEX",
+        metric_type="IP",
+        params={"inverted_index_algo": "DAAT_MAXSCORE"},
+    )
+    # 3) value dense
+    index_params.add_index(
+        field_name="value_vec",
+        index_name="value_vec_idx",
+        index_type="AUTOINDEX",
+        metric_type="COSINE",
+    )
+
+    client.create_collection(
+        collection_name=COLLECTION,
+        schema=schema,
+        index_params=index_params,
+    )
+
+    client.load_collection(COLLECTION)
+
+
+# ------------------------------------------------------------
+# HELPERS
+# ------------------------------------------------------------
+def normalize_value(val: str) -> str:
+    return (val or "").strip().lower()
+
+
+def is_json_like(val: str) -> bool:
+    if not val:
+        return False
+    v = val.strip()
+    return v.startswith("{") or v.startswith("[")
+
+
+def build_schema_text(row: Dict[str, str]) -> str:
+    ql = row.get("question_label") or row.get("Question_label") or ""
+    prop = row.get("Prop") or ""
+    sec = row.get("Section") or ""
+    sub = row.get("Sub_section") or row.get("Subsection") or ""
+    ptr = row.get("Json_pointer") or row.get("Json_Pointer") or ""
+
+    parts = []
+    if ql:
+        parts.append(f"label: {ql}")
+    if prop:
+        parts.append(f"property: {prop}")
+    if sec:
+        parts.append(f"section: {sec}")
+    if sub:
+        parts.append(f"subsection: {sub}")
+    if ptr:
+        parts.append(f"pointer: {ptr}")
+
+    return " ; ".join(parts)
+
+
+# ------------------------------------------------------------
+# INGEST
+# ------------------------------------------------------------
+def ingest_csv(client: MilvusClient, csv_path: str):
+    ensure_collection(client)
+
+    buf = {
+        "id": [],
+        "question_label": [],
+        "prop": [],
+        "value_text": [],
+        "json_pointer": [],
+        "section": [],
+        "subsection": [],
+        "status": [],
+        "dense": [],
+        "sparse": [],
+        "value_vec": [],
+    }
+
+    pk = 1
+    with open(csv_path, "r", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            ql = row.get("question_label") or row.get("Question_label") or ""
+            prop = row.get("Prop") or ""
+            val = row.get("Value") or ""
+            ptr = row.get("Json_pointer") or row.get("Json_Pointer") or ""
+            sec = row.get("Section") or ""
+            sub = row.get("Sub_section") or row.get("Subsection") or ""
+
+            val_norm = normalize_value(val)
+
+            # 1) schema embedding (always)
+            schema_text = build_schema_text(row)
+            schema_emb = embed_bge_m3_schema(schema_text)
+
+            # 2) value embedding (only for short, non-JSON)
+            if val and not is_json_like(val) and len(val) < 120:
+                value_emb = embed_bge_m3_value(val)
+                value_vec = value_emb["dense"]
+            else:
+                value_vec = [0.0] * BGE_DIM
+
+            buf["id"].append(pk)
+            buf["question_label"].append(ql)
+            buf["prop"].append(prop)
+            buf["value_text"].append(val_norm)
+            buf["json_pointer"].append(ptr)
+            buf["section"].append(sec)
+            buf["subsection"].append(sub)
+            buf["status"].append(DEFAULT_STATUS)
+            buf["dense"].append(schema_emb["dense"])
+            buf["sparse"].append(schema_emb["sparse"])
+            buf["value_vec"].append(value_vec)
+
+            pk += 1
+
+    client.insert(COLLECTION, buf)
+    client.flush(COLLECTION)
+    print(f"[OK] Inserted {len(buf['id'])} rows into {COLLECTION}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv", required=True, help="CSV file to ingest")
+    args = ap.parse_args()
+
+    client = MilvusClient(uri=MILVUS_URI, token=MILVUS_TOKEN)
+    ingest_csv(client, args.csv)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+#!/usr/bin/env python3
+"""
+retrieve_milvus_v3.py
+
+3-leg hybrid search in Milvus:
+  1. schema dense   (field: dense)
+  2. schema sparse  (field: sparse)
+  3. value dense    (field: value_vec)
+
+Supports scalar filters:
+  - section
+  - subsection
+  - status
+  - value_text  (normalized, exact)
+
+Examples:
+
+1) schema-only
+    python retrieve_milvus_v3.py --query "address"
+
+2) schema + value filter (your Hyderabad case)
+    python retrieve_milvus_v3.py --query "address" --section "Address" --value "hyderabad"
+
+3) fuzzy on value (uses value_vec)
+    python retrieve_milvus_v3.py --query "address hyderbad"
+"""
+
+import os
+import argparse
+from typing import Any, Dict
+
+from pymilvus import (
+    MilvusClient,
+    AnnSearchRequest,
+    WeightedRanker,
+)
+
+MILVUS_URI = os.environ.get("MILVUS_URI", "http://localhost:19530")
+MILVUS_TOKEN = os.environ.get("MILVUS_TOKEN", "root:Milvus")
+COLLECTION = os.environ.get("MILVUS_COLLECTION", "forms_hybrid_v3")
+BGE_DIM = 1024
+
+
+# ---------------- EMBEDDING (same stubs as ingest) ----------------
+def embed_bge_m3_schema(text: str) -> Dict[str, Any]:
+    dense = [0.0] * BGE_DIM
+    sparse = {1: 0.8, 5: 0.4}
+    return {"dense": dense, "sparse": sparse}
+
+
+def embed_bge_m3_value(text: str) -> Dict[str, Any]:
+    dense = [0.0] * BGE_DIM
+    sparse = {3: 0.7}
+    return {"dense": dense, "sparse": sparse}
+
+
+# ---------------- FILTER BUILDER ----------------
+def build_expr(section: str, subsection: str, status: str, value_text: str) -> str:
+    clauses = []
+    if section:
+        clauses.append(f'section == "{section}"')
+    if subsection:
+        clauses.append(f'subsection == "{subsection}"')
+    if status:
+        clauses.append(f'status == "{status}"')
+    if value_text:
+        v = value_text.strip().lower()
+        clauses.append(f'value_text == "{v}"')
+    return " and ".join(clauses)
+
+
+def run_hybrid_3leg(
+    client: MilvusClient,
+    query_text: str,
+    section: str = "",
+    subsection: str = "",
+    status: str = "active",
+    value_text: str = "",
+    topk: int = 10,
+):
+    # Embed query for schema
+    schema_emb = embed_bge_m3_schema(query_text)
+    q_schema_dense = schema_emb["dense"]
+    q_schema_sparse = schema_emb["sparse"]
+
+    # Embed query for value
+    value_emb = embed_bge_m3_value(query_text)
+    q_value_dense = value_emb["dense"]
+
+    expr = build_expr(section, subsection, status, value_text)
+
+    # 1) schema dense request
+    req_schema_dense = AnnSearchRequest(
+        data=[q_schema_dense],
+        anns_field="dense",
+        limit=topk,
+        param={"metric_type": "COSINE", "params": {}},
+        expr=expr if expr else None,
+    )
+
+    # 2) schema sparse request
+    req_schema_sparse = AnnSearchRequest(
+        data=[q_schema_sparse],
+        anns_field="sparse",
+        limit=topk,
+        param={
+            "metric_type": "IP",
+            "params": {"drop_ratio_search": 0.2},
+        },
+        expr=expr if expr else None,
+    )
+
+    # 3) value dense request
+    req_value_dense = AnnSearchRequest(
+        data=[q_value_dense],
+        anns_field="value_vec",
+        limit=topk,
+        param={"metric_type": "COSINE", "params": {}},
+        expr=expr if expr else None,
+    )
+
+    # weights: tune! 0.5 schema dense, 0.3 schema sparse, 0.2 value
+    ranker = WeightedRanker(0.5, 0.3, 0.2)
+
+    res = client.hybrid_search(
+        collection_name=COLLECTION,
+        reqs=[req_schema_dense, req_schema_sparse, req_value_dense],
+        ranker=ranker,
+        limit=topk,
+        output_fields=[
+            "question_label",
+            "prop",
+            "value_text",
+            "json_pointer",
+            "section",
+            "subsection",
+            "status",
+        ],
+    )
+
+    return res
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--query", required=True, help="NL query, ex: 'address hyderabad'")
+    ap.add_argument("--section", default="", help="Filter: section")
+    ap.add_argument("--subsection", default="", help="Filter: subsection")
+    ap.add_argument("--status", default="active", help="Filter: status")
+    ap.add_argument("--value", default="", help="Filter: exact value_text (normalized)")
+    ap.add_argument("--topk", type=int, default=10, help="Top-k")
+    args = ap.parse_args()
+
+    client = MilvusClient(uri=MILVUS_URI, token=MILVUS_TOKEN)
+
+    results = run_hybrid_3leg(
+        client,
+        query_text=args.query,
+        section=args.section,
+        subsection=args.subsection,
+        status=args.status,
+        value_text=args.value,
+        topk=args.topk,
+    )
+
+    for hits in results:
+        for rank, h in enumerate(hits, start=1):
+            print("--------------------------------------------------")
+            print(f"rank: {rank}")
+            print(f"id: {h.id}")
+            print(f"distance (fused): {h.distance}")
+            print(f"label: {h.get('question_label')}")
+            print(f"prop: {h.get('prop')}")
+            print(f"value_text: {h.get('value_text')}")
+            print(f"json_pointer: {h.get('json_pointer')}")
+            print(f"section: {h.get('section')} | subsection: {h.get('subsection')}")
+            print(f"status: {h.get('status')}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
