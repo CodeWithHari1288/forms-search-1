@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-ingest_milvus_v3_ollama_bm25_crf_intpk_pandas.py
+ingest_milvus_v3_ollama_bm25_crf_intpk_pandas_dir.py
 
-- Reads CSV using pandas
-- PK = INT64  (id = <CRF_INTEGER><sequence>)
-  e.g. CRF=1001 → 10011, 10012, 10013 ...
-- CRF value is detected automatically (from 'question_label' or 'Prop' == 'crf')
-- Dense vectors from Ollama bge-m3
-- Sparse vectors from rank-bm25
-- Value vectors (short/non-JSON values) from Ollama
-- Inserts rows one by one (safe for Milvus shape issues)
+- Reads ALL CSV files in a directory
+- PK = INT64 → id = <CRF_INT><row_sequence>  (e.g. 10011, 10012)
+- CRF integer detected per file
+- Uses pandas + rank-bm25 + Ollama bge-m3
+- Inserts one row at a time (safe for Milvus)
 """
 
 import os
@@ -18,9 +15,11 @@ import argparse
 import requests
 import pandas as pd
 from typing import Dict, Any, List
+from glob import glob
 
 from pymilvus import MilvusClient, DataType
 from rank_bm25 import BM25Okapi
+
 
 # -------- CONFIG --------
 MILVUS_URI = os.environ.get("MILVUS_URI", "http://localhost:19530")
@@ -92,10 +91,7 @@ def ensure_collection(client: MilvusClient):
         return
 
     schema = client.create_schema(auto_id=False)
-
-    # PK is INT64 ✅
     schema.add_field("id", DataType.INT64, is_primary=True)
-
     schema.add_field("question_label", DataType.VARCHAR, max_length=256)
     schema.add_field("prop", DataType.VARCHAR, max_length=256)
     schema.add_field("value_text", DataType.VARCHAR, max_length=2048)
@@ -103,7 +99,6 @@ def ensure_collection(client: MilvusClient):
     schema.add_field("section", DataType.VARCHAR, max_length=256)
     schema.add_field("subsection", DataType.VARCHAR, max_length=256)
     schema.add_field("status", DataType.VARCHAR, max_length=64)
-
     schema.add_field("dense", DataType.FLOAT_VECTOR, dim=BGE_DIM)
     schema.add_field("sparse", DataType.SPARSE_FLOAT_VECTOR)
     schema.add_field("value_vec", DataType.FLOAT_VECTOR, dim=BGE_DIM)
@@ -123,27 +118,19 @@ def ensure_collection(client: MilvusClient):
     client.load_collection(COLLECTION)
 
 
-# -------- INGEST --------
-def ingest_csv(client: MilvusClient, csv_path: str):
-    ensure_collection(client)
-
-    # 1) Read CSV via pandas
+# -------- INGEST ONE FILE --------
+def ingest_one_csv(client: MilvusClient, csv_path: str):
     df = pd.read_csv(csv_path, encoding="utf-8-sig").fillna("")
-    print(f"[i] Loaded {len(df)} rows from {csv_path}")
+    print(f"\n[+] Reading {os.path.basename(csv_path)} ({len(df)} rows)")
 
-    # 2) Detect CRF integer
     crf_int = find_crf_int(df)
-    print(f"[i] Using CRF base integer: {crf_int}")
+    print(f"    CRF base: {crf_int}")
 
-    # 3) Build schema texts
     schema_texts = df.apply(build_schema_text, axis=1).tolist()
-
-    # 4) Build BM25 model
     tokenized_docs = [txt.lower().split() for txt in schema_texts]
     bm25 = BM25Okapi(tokenized_docs)
     vocab = {tok: i for i, tok in enumerate(sorted({t for doc in tokenized_docs for t in doc}))}
 
-    # 5) Iterate over DataFrame rows
     count = 0
     for idx, (i, row) in enumerate(df.iterrows(), start=1):
         ql = row.get("question_label", "")
@@ -157,10 +144,8 @@ def ingest_csv(client: MilvusClient, csv_path: str):
         schema_text = schema_texts[idx - 1]
         doc_tokens = schema_text.lower().split()
 
-        # Dense vector for schema
         schema_dense = ollama_embed(schema_text)
 
-        # Sparse BM25 vector
         doc_len = len(doc_tokens)
         avgdl = bm25.avgdl
         k1 = bm25.k1
@@ -179,13 +164,11 @@ def ingest_csv(client: MilvusClient, csv_path: str):
             term_id = vocab[tok]
             sparse_vec[term_id] = float(score)
 
-        # Dense vector for value
         if val and not is_json_like(val) and len(val) < 120:
             value_dense = ollama_embed(val)
         else:
             value_dense = [0.0] * BGE_DIM
 
-        # INT64 ID = CRF + sequence (no underscore)
         pk_int = int(f"{crf_int}{idx}")
 
         one_row = {
@@ -204,33 +187,53 @@ def ingest_csv(client: MilvusClient, csv_path: str):
 
         client.insert(COLLECTION, [one_row])
         count += 1
+
         if count % 100 == 0:
             client.flush(COLLECTION)
-            print(f"[i] Inserted {count} rows...")
+            print(f"    Inserted {count} rows...")
 
     client.flush(COLLECTION)
-    print(f"[OK] Inserted {count} rows into {COLLECTION}")
+    print(f"[OK] {os.path.basename(csv_path)} → {count} rows ingested (CRF={crf_int})")
 
-    # 6) Save BM25 model
-    bm25_state = {
-        "k1": bm25.k1,
-        "b": bm25.b,
-        "avgdl": bm25.avgdl,
-        "idf": bm25.idf,
-        "vocab": vocab,
-    }
-    with open(BM25_MODEL_FILE, "w", encoding="utf-8") as f:
-        json.dump(bm25_state, f, ensure_ascii=False, indent=2)
-    print(f"[OK] Saved BM25 model to {BM25_MODEL_FILE}")
+    return vocab, bm25
+
+
+# -------- MAIN --------
+def ingest_directory(client: MilvusClient, dir_path: str):
+    ensure_collection(client)
+    csv_files = sorted(glob(os.path.join(dir_path, "*.csv")))
+    if not csv_files:
+        print(f"[!] No CSV files found in {dir_path}")
+        return
+
+    print(f"[i] Found {len(csv_files)} CSV files in {dir_path}")
+
+    last_vocab, last_bm25 = None, None
+    for csv_file in csv_files:
+        vocab, bm25 = ingest_one_csv(client, csv_file)
+        last_vocab, last_bm25 = vocab, bm25
+
+    # Save last BM25 model (can be shared for similar schema)
+    if last_vocab and last_bm25:
+        bm25_state = {
+            "k1": last_bm25.k1,
+            "b": last_bm25.b,
+            "avgdl": last_bm25.avgdl,
+            "idf": last_bm25.idf,
+            "vocab": last_vocab,
+        }
+        with open(BM25_MODEL_FILE, "w", encoding="utf-8") as f:
+            json.dump(bm25_state, f, ensure_ascii=False, indent=2)
+        print(f"[OK] Saved BM25 model to {BM25_MODEL_FILE}")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", required=True, help="CSV file to ingest")
+    ap.add_argument("--dir", required=True, help="Directory containing CSV files")
     args = ap.parse_args()
 
     client = MilvusClient(uri=MILVUS_URI, token=MILVUS_TOKEN)
-    ingest_csv(client, args.csv)
+    ingest_directory(client, args.dir)
 
 
 if __name__ == "__main__":
