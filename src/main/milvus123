@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 """
-ingest_milvus_v3_ollama_bm25.py
+ingest_milvus_v3_ollama_bm25_crfpk.py
 
 Ingest CSV into Milvus with:
+- PK = string, built as "<CRF_VALUE>_<row_number>"
 - dense: from Ollama bge-m3
-- sparse: from rank-bm25 (real lexical weights)
-- value_vec: from Ollama bge-m3, only for short/non-JSON values
+- sparse: from rank-bm25
+- value_vec: from Ollama (for short/non-JSON values)
+- BM25 model saved to bm25_model.json
 
-Also writes a BM25 model file (JSON) so retrieval can reuse vocab & IDF.
-
-Usage:
-    python ingest_milvus_v3_ollama_bm25.py --csv ./forms.csv
-
-Requires:
-    pip install pymilvus rank-bm25 requests
+Run:
+    python ingest_milvus_v3_ollama_bm25_crfpk.py --csv ./forms.csv
 """
 
 import os
@@ -26,29 +23,28 @@ from typing import Dict, Any, List
 from pymilvus import MilvusClient, DataType
 from rank_bm25 import BM25Okapi
 
-# ---------------- CONFIG ----------------
+# ---------- CONFIG ----------
 MILVUS_URI = os.environ.get("MILVUS_URI", "http://localhost:19530")
 MILVUS_TOKEN = os.environ.get("MILVUS_TOKEN", "root:Milvus")
 COLLECTION = os.environ.get("MILVUS_COLLECTION", "forms_hybrid_v3")
 BGE_DIM = 1024
 DEFAULT_STATUS = "active"
+
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "bge-m3")
+
 BM25_MODEL_FILE = os.environ.get("BM25_MODEL_FILE", "bm25_model.json")
 
 
-# ---------------- OLLAMA EMBEDDING ----------------
+# ---------- OLLAMA EMBEDDING ----------
 def ollama_embed(text: str) -> List[float]:
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": text,
-    }
+    payload = {"model": OLLAMA_MODEL, "prompt": text}
     resp = requests.post(f"{OLLAMA_URL}/api/embeddings", json=payload, timeout=25)
     resp.raise_for_status()
     return resp.json()["embedding"]
 
 
-# ---------------- HELPERS ----------------
+# ---------- HELPERS ----------
 def normalize_value(val: str) -> str:
     return (val or "").strip().lower()
 
@@ -81,14 +77,33 @@ def build_schema_text(row: Dict[str, str]) -> str:
     return " ".join(parts)
 
 
-# ---------------- COLLECTION ----------------
+def find_crf_value(rows: List[Dict[str, str]]) -> str:
+    """
+    Look for a row where question_label == 'crf' or prop == 'crf' (case-insensitive)
+    and return its Value.
+    If not found, return 'CRF'.
+    """
+    for r in rows:
+        ql = (r.get("question_label") or r.get("Question_label") or "").strip().lower()
+        prop = (r.get("Prop") or "").strip().lower()
+        if ql == "crf" or prop == "crf":
+            val = (r.get("Value") or "").strip()
+            if val:
+                return val
+    return "CRF"
+
+
+# ---------- COLLECTION ----------
 def ensure_collection(client: MilvusClient):
+    # we are changing PK to VARCHAR
     if client.has_collection(COLLECTION):
         return
 
     schema = client.create_schema(auto_id=False)
 
-    schema.add_field("id", DataType.INT64, is_primary=True)
+    # <-- PK is now VARCHAR
+    schema.add_field("id", DataType.VARCHAR, is_primary=True, max_length=128)
+
     schema.add_field("question_label", DataType.VARCHAR, max_length=256)
     schema.add_field("prop", DataType.VARCHAR, max_length=256)
     schema.add_field("value_text", DataType.VARCHAR, max_length=2048)
@@ -97,20 +112,18 @@ def ensure_collection(client: MilvusClient):
     schema.add_field("subsection", DataType.VARCHAR, max_length=256)
     schema.add_field("status", DataType.VARCHAR, max_length=64)
 
-    # 3 vector legs
-    schema.add_field("dense", DataType.FLOAT_VECTOR, dim=BGE_DIM)      # schema dense
-    schema.add_field("sparse", DataType.SPARSE_FLOAT_VECTOR)           # BM25 weights
-    schema.add_field("value_vec", DataType.FLOAT_VECTOR, dim=BGE_DIM)  # value dense
+    # vectors
+    schema.add_field("dense", DataType.FLOAT_VECTOR, dim=BGE_DIM)
+    schema.add_field("sparse", DataType.SPARSE_FLOAT_VECTOR)
+    schema.add_field("value_vec", DataType.FLOAT_VECTOR, dim=BGE_DIM)
 
     index_params = client.prepare_index_params()
-    # dense
     index_params.add_index(
         field_name="dense",
         index_name="dense_idx",
         index_type="AUTOINDEX",
         metric_type="COSINE",
     )
-    # sparse
     index_params.add_index(
         field_name="sparse",
         index_name="sparse_idx",
@@ -118,7 +131,6 @@ def ensure_collection(client: MilvusClient):
         metric_type="IP",
         params={"inverted_index_algo": "DAAT_MAXSCORE"},
     )
-    # value dense
     index_params.add_index(
         field_name="value_vec",
         index_name="value_vec_idx",
@@ -126,30 +138,40 @@ def ensure_collection(client: MilvusClient):
         metric_type="COSINE",
     )
 
-    client.create_collection(COLLECTION, schema=schema, index_params=index_params)
+    client.create_collection(
+        collection_name=COLLECTION,
+        schema=schema,
+        index_params=index_params,
+    )
     client.load_collection(COLLECTION)
 
 
-# ---------------- INGEST ----------------
+# ---------- INGEST ----------
 def ingest_csv(client: MilvusClient, csv_path: str):
     ensure_collection(client)
 
-    # 1) read all rows first (we need corpus for BM25)
-    rows = []
-    schema_texts = []
+    # 1) read all rows first
+    rows: List[Dict[str, str]] = []
+    schema_texts: List[str] = []
     with open(csv_path, "r", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
-        for row in reader:
-            rows.append(row)
-            schema_texts.append(build_schema_text(row))
+        for r in reader:
+            rows.append(r)
+            schema_texts.append(build_schema_text(r))
 
-    # 2) build BM25 over schema texts
+    # 2) find CRF value from this CSV
+    crf_val = find_crf_value(rows).strip()
+    if not crf_val:
+        crf_val = "CRF"
+    # normalize a bit (optional)
+    crf_val = crf_val.replace(" ", "_")
+
+    # 3) build BM25 on ALL schema texts
     tokenized_docs = [txt.lower().split() for txt in schema_texts]
     bm25 = BM25Okapi(tokenized_docs)
-    # build vocab: token -> int
     vocab = {tok: i for i, tok in enumerate(sorted({t for doc in tokenized_docs for t in doc}))}
 
-    # 3) prepare insert buffer
+    # 4) prepare buffer
     buf = {
         "id": [],
         "question_label": [],
@@ -164,9 +186,9 @@ def ingest_csv(client: MilvusClient, csv_path: str):
         "value_vec": [],
     }
 
-    # 4) for each row, build milvus-friendly sparse dict using BM25 formula
-    pk = 1
-    for row, doc_tokens in zip(rows, tokenized_docs):
+    # 5) fill buffer
+    row_seq = 1
+    for row, doc_tokens, schema_text in zip(rows, tokenized_docs, schema_texts):
         ql = row.get("question_label") or row.get("Question_label") or ""
         prop = row.get("Prop") or ""
         val = row.get("Value") or ""
@@ -176,12 +198,10 @@ def ingest_csv(client: MilvusClient, csv_path: str):
 
         val_norm = normalize_value(val)
 
-        # --- dense for schema (Ollama) ---
-        schema_text = schema_texts[pk - 1]
+        # --- schema dense from Ollama
         schema_dense = ollama_embed(schema_text)
 
-        # --- sparse from BM25 ---
-        # we re-compute BM25 *per term in this doc*
+        # --- BM25 sparse for this doc
         doc_len = len(doc_tokens)
         avgdl = bm25.avgdl
         k1 = bm25.k1
@@ -196,18 +216,20 @@ def ingest_csv(client: MilvusClient, csv_path: str):
             if tok not in bm25.idf:
                 continue
             idf = bm25.idf[tok]
-            # standard BM25 scoring per term
             score = idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * (doc_len / avgdl)))
             term_id = vocab[tok]
             sparse_vec[term_id] = float(score)
 
-        # --- value embedding (optional) ---
+        # --- value dense (optional)
         if val and not is_json_like(val) and len(val) < 120:
             value_dense = ollama_embed(val)
         else:
             value_dense = [0.0] * BGE_DIM
 
-        buf["id"].append(pk)
+        # --- PRIMARY KEY (string): "<crf>_<seq>"
+        pk_str = f"{crf_val}_{row_seq}"
+
+        buf["id"].append(pk_str)          # 👈 now string, no int64 errors
         buf["question_label"].append(ql)
         buf["prop"].append(prop)
         buf["value_text"].append(val_norm)
@@ -219,19 +241,29 @@ def ingest_csv(client: MilvusClient, csv_path: str):
         buf["sparse"].append(sparse_vec)
         buf["value_vec"].append(value_dense)
 
-        pk += 1
+        row_seq += 1
 
+    # 6) debug shapes
+    print("[debug] column shapes before insert:")
+    for k, v in buf.items():
+        if not v:
+            print(f"  {k}: EMPTY")
+        else:
+            print(f"  {k}: len={len(v)}, first_type={type(v[0])}")
+
+    # 7) insert
     client.insert(COLLECTION, buf)
     client.flush(COLLECTION)
-    print(f"[OK] Inserted {len(buf['id'])} rows into {COLLECTION}")
+    print(f"[OK] Inserted {len(buf['id'])} rows from {csv_path} into {COLLECTION}")
+    print(f"[OK] Used CRF prefix: {crf_val}")
 
-    # 5) save BM25 model to JSON so retriever can reuse
+    # 8) save BM25 model
     bm25_state = {
         "k1": bm25.k1,
         "b": bm25.b,
         "avgdl": bm25.avgdl,
-        "idf": bm25.idf,      # dict: token -> idf
-        "vocab": vocab,       # dict: token -> term_id
+        "idf": bm25.idf,
+        "vocab": vocab,
     }
     with open(BM25_MODEL_FILE, "w", encoding="utf-8") as f:
         json.dump(bm25_state, f, ensure_ascii=False, indent=2)
