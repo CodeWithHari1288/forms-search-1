@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """
-ingest_milvus_v3_ollama_bm25_crf_intpk.py
+ingest_milvus_v3_ollama_bm25_crf_intpk_pandas.py
 
-- PK = INT64
-- PK value = <CRF_INTEGER><sequence>  (no underscore)
+- Reads CSV using pandas
+- PK = INT64  (id = <CRF_INTEGER><sequence>)
   e.g. CRF=1001 → 10011, 10012, 10013 ...
-- CRF value is read from the CSV row where question_label == "crf"
-  or Prop == "crf" (case-insensitive)
-- dense: Ollama bge-m3
-- sparse: rank-bm25 over schema text
-- value_vec: Ollama for short/non-JSON values
-- insert: **one row at a time** (to avoid shape issues)
+- CRF value is detected automatically (from 'question_label' or 'Prop' == 'crf')
+- Dense vectors from Ollama bge-m3
+- Sparse vectors from rank-bm25
+- Value vectors (short/non-JSON values) from Ollama
+- Inserts rows one by one (safe for Milvus shape issues)
 """
 
 import os
-import csv
 import json
 import argparse
 import requests
+import pandas as pd
 from typing import Dict, Any, List
 
 from pymilvus import MilvusClient, DataType
@@ -47,66 +46,54 @@ def ollama_embed(text: str) -> List[float]:
 
 # -------- HELPERS --------
 def normalize_value(val: str) -> str:
-    return (val or "").strip().lower()
+    return (str(val) or "").strip().lower()
 
 
 def is_json_like(val: str) -> bool:
     if not val:
         return False
-    v = val.strip()
+    v = str(val).strip()
     return v.startswith("{") or v.startswith("[")
 
 
-def build_schema_text(row: Dict[str, str]) -> str:
-    ql = row.get("question_label") or row.get("Question_label") or ""
-    prop = row.get("Prop") or ""
-    sec = row.get("Section") or ""
-    sub = row.get("Sub_section") or row.get("Subsection") or ""
-    ptr = row.get("Json_pointer") or row.get("Json_Pointer") or ""
-
+def build_schema_text(row: pd.Series) -> str:
     parts = []
-    if ql:
-        parts.append(f"label: {ql}")
-    if prop:
-        parts.append(f"property: {prop}")
-    if sec:
-        parts.append(f"section: {sec}")
-    if sub:
-        parts.append(f"subsection: {sub}")
-    if ptr:
-        parts.append(f"pointer: {ptr}")
+    if pd.notna(row.get("question_label")):
+        parts.append(f"label: {row['question_label']}")
+    if pd.notna(row.get("Prop")):
+        parts.append(f"property: {row['Prop']}")
+    if pd.notna(row.get("Section")):
+        parts.append(f"section: {row['Section']}")
+    if pd.notna(row.get("Sub_section")):
+        parts.append(f"subsection: {row['Sub_section']}")
+    if pd.notna(row.get("Json_pointer")):
+        parts.append(f"pointer: {row['Json_pointer']}")
     return " ".join(parts)
 
 
-def find_crf_int(rows: List[Dict[str, str]]) -> int:
-    """
-    Find CRF row and return its Value as int.
-    You said: "crf value we will get from csv will be integers only" → so we cast to int.
-    If not found or not int → fallback 1.
-    """
-    for r in rows:
-        ql = (r.get("question_label") or r.get("Question_label") or "").strip().lower()
-        prop = (r.get("Prop") or "").strip().lower()
-        if ql == "crf" or prop == "crf":
-            val = (r.get("Value") or "").strip()
-            try:
-                return int(val)
-            except Exception:
-                pass
-    return 1  # safe fallback
+def find_crf_int(df: pd.DataFrame) -> int:
+    mask = (
+        (df["question_label"].astype(str).str.lower() == "crf")
+        | (df["Prop"].astype(str).str.lower() == "crf")
+    )
+    subset = df.loc[mask]
+    if not subset.empty:
+        val = subset.iloc[0]["Value"]
+        try:
+            return int(val)
+        except Exception:
+            pass
+    return 1
 
 
 # -------- COLLECTION --------
 def ensure_collection(client: MilvusClient):
-    # IMPORTANT:
-    # if you previously created `forms_hybrid_v3` with VARCHAR PK,
-    # drop it once and recreate with this schema.
     if client.has_collection(COLLECTION):
         return
 
     schema = client.create_schema(auto_id=False)
 
-    # PK is now INT64 ✅
+    # PK is INT64 ✅
     schema.add_field("id", DataType.INT64, is_primary=True)
 
     schema.add_field("question_label", DataType.VARCHAR, max_length=256)
@@ -140,42 +127,40 @@ def ensure_collection(client: MilvusClient):
 def ingest_csv(client: MilvusClient, csv_path: str):
     ensure_collection(client)
 
-    # 1) read all rows
-    rows: List[Dict[str, str]] = []
-    schema_texts: List[str] = []
-    with open(csv_path, "r", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for r in reader:
-            rows.append(r)
-            schema_texts.append(build_schema_text(r))
+    # 1) Read CSV via pandas
+    df = pd.read_csv(csv_path, encoding="utf-8-sig").fillna("")
+    print(f"[i] Loaded {len(df)} rows from {csv_path}")
 
-    # 2) get CRF as integer
-    crf_int = find_crf_int(rows)
-    print(f"[i] Using CRF base: {crf_int} (from CSV)")
+    # 2) Detect CRF integer
+    crf_int = find_crf_int(df)
+    print(f"[i] Using CRF base integer: {crf_int}")
 
-    # 3) build BM25 over all schema texts
+    # 3) Build schema texts
+    schema_texts = df.apply(build_schema_text, axis=1).tolist()
+
+    # 4) Build BM25 model
     tokenized_docs = [txt.lower().split() for txt in schema_texts]
     bm25 = BM25Okapi(tokenized_docs)
     vocab = {tok: i for i, tok in enumerate(sorted({t for doc in tokenized_docs for t in doc}))}
 
-    # 4) insert rows ONE BY ONE
+    # 5) Iterate over DataFrame rows
     count = 0
-    for seq, (row, doc_tokens, schema_text) in enumerate(
-        zip(rows, tokenized_docs, schema_texts), start=1
-    ):
-        ql = row.get("question_label") or row.get("Question_label") or ""
-        prop = row.get("Prop") or ""
-        val = row.get("Value") or ""
-        ptr = row.get("Json_pointer") or row.get("Json_Pointer") or ""
-        sec = row.get("Section") or ""
-        sub = row.get("Sub_section") or row.get("Subsection") or ""
-
+    for idx, (i, row) in enumerate(df.iterrows(), start=1):
+        ql = row.get("question_label", "")
+        prop = row.get("Prop", "")
+        val = row.get("Value", "")
+        ptr = row.get("Json_pointer", "")
+        sec = row.get("Section", "")
+        sub = row.get("Sub_section", "")
         val_norm = normalize_value(val)
 
-        # dense for schema
+        schema_text = schema_texts[idx - 1]
+        doc_tokens = schema_text.lower().split()
+
+        # Dense vector for schema
         schema_dense = ollama_embed(schema_text)
 
-        # BM25 sparse for this doc
+        # Sparse BM25 vector
         doc_len = len(doc_tokens)
         avgdl = bm25.avgdl
         k1 = bm25.k1
@@ -194,15 +179,14 @@ def ingest_csv(client: MilvusClient, csv_path: str):
             term_id = vocab[tok]
             sparse_vec[term_id] = float(score)
 
-        # value_vec
+        # Dense vector for value
         if val and not is_json_like(val) and len(val) < 120:
             value_dense = ollama_embed(val)
         else:
             value_dense = [0.0] * BGE_DIM
 
-        # ✅ INT64 PK: concat crf_int and seq as string, then cast to int
-        # crf_int = 1001, seq = 3 → "10013" → int("10013")
-        pk_int = int(f"{crf_int}{seq}")
+        # INT64 ID = CRF + sequence (no underscore)
+        pk_int = int(f"{crf_int}{idx}")
 
         one_row = {
             "id": pk_int,
@@ -220,15 +204,14 @@ def ingest_csv(client: MilvusClient, csv_path: str):
 
         client.insert(COLLECTION, [one_row])
         count += 1
-
         if count % 100 == 0:
             client.flush(COLLECTION)
             print(f"[i] Inserted {count} rows...")
 
     client.flush(COLLECTION)
-    print(f"[OK] Inserted {count} rows from {csv_path} into {COLLECTION}")
+    print(f"[OK] Inserted {count} rows into {COLLECTION}")
 
-    # 5) save BM25 model
+    # 6) Save BM25 model
     bm25_state = {
         "k1": bm25.k1,
         "b": bm25.b,
