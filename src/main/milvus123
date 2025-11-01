@@ -1,191 +1,89 @@
 #!/usr/bin/env python3
 """
-test_milvus.py
+ingest_milvus_v3_ollama.py
 
-Quick local health-check for Milvus/Zilliz.
-- Tries to connect
-- Prints server info (if available)
-- Lists collections
-- Optionally creates a tiny test collection and drops it
+Ingest CSV -> Milvus with 3 vector legs, using **Ollama bge-m3** for dense.
 
-Usage:
-    python test_milvus.py
-"""
+Requires:
+    - Milvus running (http://localhost:19530 by default)
+    - Ollama running (http://localhost:11434) with model "bge-m3"
+      Run first:  ollama pull bge-m3
 
-import os
-from pymilvus import (
-    MilvusClient,
-    DataType,
-)
-
-MILVUS_URI = os.environ.get("MILVUS_URI", "http://localhost:19530")
-MILVUS_TOKEN = os.environ.get("MILVUS_TOKEN", "root:Milvus")
-TEST_COLLECTION = "milvus_connect_test"
-
-def main():
-    print(f"[i] Connecting to Milvus at: {MILVUS_URI}")
-
-    try:
-        client = MilvusClient(uri=MILVUS_URI, token=MILVUS_TOKEN)
-    except Exception as e:
-        print("[FAIL] Could not connect to Milvus.")
-        print(e)
-        return
-
-    print("[OK] Connected.")
-
-    # Try listing collections
-    try:
-        cols = client.list_collections()
-        print(f"[OK] Collections found: {cols}")
-    except Exception as e:
-        print("[WARN] Could not list collections:")
-        print(e)
-
-    # Try creating a tiny test collection (id + vec)
-    try:
-        if not client.has_collection(TEST_COLLECTION):
-            schema = client.create_schema(auto_id=False)
-            schema.add_field("id", DataType.INT64, is_primary=True)
-            schema.add_field("vec", DataType.FLOAT_VECTOR, dim=8)
-
-            index_params = client.prepare_index_params()
-            index_params.add_index(
-                field_name="vec",
-                index_name="vec_idx",
-                index_type="AUTOINDEX",
-                metric_type="COSINE",
-            )
-
-            client.create_collection(
-                collection_name=TEST_COLLECTION,
-                schema=schema,
-                index_params=index_params,
-            )
-            print(f"[OK] Created test collection: {TEST_COLLECTION}")
-
-        client.load_collection(TEST_COLLECTION)
-        print(f"[OK] Loaded test collection: {TEST_COLLECTION}")
-
-        # Insert 1 dummy row
-        data = {
-            "id": [1],
-            "vec": [[0.1] * 8],
-        }
-        client.insert(TEST_COLLECTION, data)
-        client.flush(TEST_COLLECTION)
-        print("[OK] Inserted 1 test row.")
-
-        # Run a quick search
-        from pymilvus import AnnSearchRequest
-        req = AnnSearchRequest(
-            data=[[0.1] * 8],
-            anns_field="vec",
-            limit=1,
-            param={"metric_type": "COSINE", "params": {}},
-        )
-        res = client.search(
-            collection_name=TEST_COLLECTION,
-            data=req.data,
-            anns_field=req.anns_field,
-            param=req.param,
-            limit=req.limit,
-        )
-        print("[OK] Test search ran. Result:")
-        for hits in res:
-            for h in hits:
-                print(f"  -> id={h.id}, distance={h.distance}")
-
-    except Exception as e:
-        print("[WARN] Could not run test collection flow:")
-        print(e)
-
-    print("[DONE] Milvus basic test finished.")
-
-
-if __name__ == "__main__":
-    main()
-
-
-
-
-
-
-
-#!/usr/bin/env python3
-"""
-ingest_milvus_v3.py
-
-Option 3: 3-leg hybrid in Milvus
-- schema_dense: FLOAT_VECTOR(1024)
-- schema_sparse: SPARSE_FLOAT_VECTOR
-- value_vec: FLOAT_VECTOR(1024)  <-- for fuzzy on values
-
-Usage:
-    python ingest_milvus_v3.py --csv ./forms.csv
-
-Env:
-    MILVUS_URI (default: http://localhost:19530)
-    MILVUS_TOKEN (default: root:Milvus)
-    MILVUS_COLLECTION (default: forms_hybrid_v3)
+CSV columns (case-insensitive):
+    question_label, Prop, Value, Json_pointer, Section, Sub_section
 """
 
 import os
 import csv
 import argparse
-from typing import Dict, Any
+import requests
+from typing import Dict, Any, List
 
 from pymilvus import (
     MilvusClient,
     DataType,
 )
 
-# ------------------------------------------------------------
-# CONFIG
-# ------------------------------------------------------------
+# ---------------- CONFIG ----------------
 MILVUS_URI = os.environ.get("MILVUS_URI", "http://localhost:19530")
 MILVUS_TOKEN = os.environ.get("MILVUS_TOKEN", "root:Milvus")
 COLLECTION = os.environ.get("MILVUS_COLLECTION", "forms_hybrid_v3")
 BGE_DIM = 1024
 DEFAULT_STATUS = "active"
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "bge-m3")
 
 
-# ------------------------------------------------------------
-# EMBEDDING STUBS — REPLACE WITH REAL BGE-M3
-# ------------------------------------------------------------
-def embed_bge_m3_schema(text: str) -> Dict[str, Any]:
+# ---------------- OLLAMA EMBEDDING ----------------
+def ollama_embed(text: str) -> List[float]:
     """
-    For label/prop/section/subsection/pointer
-    Should return BOTH dense (len=1024) and sparse ({token_id: weight})
+    Call Ollama /api/embeddings to get a dense vector.
+    Assumes Ollama model returns 1024 dims (bge-m3 does).
     """
-    dense = [0.0] * BGE_DIM
-    sparse = {1: 0.75, 7: 0.33}  # fake
-    return {"dense": dense, "sparse": sparse}
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": text,
+    }
+    resp = requests.post(f"{OLLAMA_URL}/api/embeddings", json=payload, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    # Ollama returns: {"embedding": [..]}
+    return data["embedding"]
 
 
-def embed_bge_m3_value(text: str) -> Dict[str, Any]:
+# ---------------- SIMPLE SPARSE BUILDER ----------------
+def text_to_sparse(text: str) -> Dict[int, float]:
     """
-    For actual values (short strings like 'hyderabad')
-    Value side usually only needs dense, but we return same structure for symmetry.
+    Since Ollama embeddings are dense-only, we create a simple sparse
+    vector ourselves:
+      - lowercase
+      - split on spaces
+      - for each token -> hash -> positive id -> weight = 1.0
+    This is not as good as real BGE-M3 lexical weights, but lets us store
+    something in Milvus SPARSE_FLOAT_VECTOR.
     """
-    dense = [0.0] * BGE_DIM
-    sparse = {3: 0.9}
-    return {"dense": dense, "sparse": sparse}
+    sparse: Dict[int, float] = {}
+    if not text:
+        return sparse
+    tokens = text.lower().replace(";", " ").replace(":", " ").split()
+    for tok in tokens:
+        if not tok:
+            continue
+        # stable-ish id: take hash & 0x7fffffff
+        tid = abs(hash(tok)) % 1000000  # keep in a range
+        # you can increment weight if repeat
+        sparse[tid] = sparse.get(tid, 0.0) + 1.0
+    return sparse
 
 
-# ------------------------------------------------------------
-# COLLECTION CREATION
-# ------------------------------------------------------------
+# ---------------- COLLECTION ----------------
 def ensure_collection(client: MilvusClient):
     if client.has_collection(COLLECTION):
         return
 
     schema = client.create_schema(auto_id=False)
 
-    # PK
     schema.add_field("id", DataType.INT64, is_primary=True)
-
-    # CSV fields
     schema.add_field("question_label", DataType.VARCHAR, max_length=256)
     schema.add_field("prop", DataType.VARCHAR, max_length=256)
     schema.add_field("value_text", DataType.VARCHAR, max_length=2048)
@@ -195,20 +93,17 @@ def ensure_collection(client: MilvusClient):
     schema.add_field("status", DataType.VARCHAR, max_length=64)
 
     # 3 vector legs
-    schema.add_field("dense", DataType.FLOAT_VECTOR, dim=BGE_DIM)             # schema dense
-    schema.add_field("sparse", DataType.SPARSE_FLOAT_VECTOR)                  # schema sparse
-    schema.add_field("value_vec", DataType.FLOAT_VECTOR, dim=BGE_DIM)         # value dense
+    schema.add_field("dense", DataType.FLOAT_VECTOR, dim=BGE_DIM)      # schema dense
+    schema.add_field("sparse", DataType.SPARSE_FLOAT_VECTOR)           # schema sparse
+    schema.add_field("value_vec", DataType.FLOAT_VECTOR, dim=BGE_DIM)  # value dense
 
     index_params = client.prepare_index_params()
-
-    # 1) schema dense
     index_params.add_index(
         field_name="dense",
         index_name="dense_idx",
         index_type="AUTOINDEX",
         metric_type="COSINE",
     )
-    # 2) schema sparse
     index_params.add_index(
         field_name="sparse",
         index_name="sparse_idx",
@@ -216,7 +111,6 @@ def ensure_collection(client: MilvusClient):
         metric_type="IP",
         params={"inverted_index_algo": "DAAT_MAXSCORE"},
     )
-    # 3) value dense
     index_params.add_index(
         field_name="value_vec",
         index_name="value_vec_idx",
@@ -229,13 +123,10 @@ def ensure_collection(client: MilvusClient):
         schema=schema,
         index_params=index_params,
     )
-
     client.load_collection(COLLECTION)
 
 
-# ------------------------------------------------------------
-# HELPERS
-# ------------------------------------------------------------
+# ---------------- HELPERS ----------------
 def normalize_value(val: str) -> str:
     return (val or "").strip().lower()
 
@@ -265,13 +156,10 @@ def build_schema_text(row: Dict[str, str]) -> str:
         parts.append(f"subsection: {sub}")
     if ptr:
         parts.append(f"pointer: {ptr}")
-
     return " ; ".join(parts)
 
 
-# ------------------------------------------------------------
-# INGEST
-# ------------------------------------------------------------
+# ---------------- INGEST ----------------
 def ingest_csv(client: MilvusClient, csv_path: str):
     ensure_collection(client)
 
@@ -302,16 +190,18 @@ def ingest_csv(client: MilvusClient, csv_path: str):
 
             val_norm = normalize_value(val)
 
-            # 1) schema embedding (always)
+            # 1) schema text
             schema_text = build_schema_text(row)
-            schema_emb = embed_bge_m3_schema(schema_text)
+            # 1a) dense from Ollama
+            schema_dense = ollama_embed(schema_text)
+            # 1b) sparse from our tokenizer
+            schema_sparse = text_to_sparse(schema_text)
 
-            # 2) value embedding (only for short, non-JSON)
+            # 2) value dense (only if small and not JSON)
             if val and not is_json_like(val) and len(val) < 120:
-                value_emb = embed_bge_m3_value(val)
-                value_vec = value_emb["dense"]
+                value_dense = ollama_embed(val)
             else:
-                value_vec = [0.0] * BGE_DIM
+                value_dense = [0.0] * BGE_DIM
 
             buf["id"].append(pk)
             buf["question_label"].append(ql)
@@ -321,9 +211,9 @@ def ingest_csv(client: MilvusClient, csv_path: str):
             buf["section"].append(sec)
             buf["subsection"].append(sub)
             buf["status"].append(DEFAULT_STATUS)
-            buf["dense"].append(schema_emb["dense"])
-            buf["sparse"].append(schema_emb["sparse"])
-            buf["value_vec"].append(value_vec)
+            buf["dense"].append(schema_dense)
+            buf["sparse"].append(schema_sparse)
+            buf["value_vec"].append(value_dense)
 
             pk += 1
 
@@ -351,36 +241,32 @@ if __name__ == "__main__":
 
 
 
+
 #!/usr/bin/env python3
 """
-retrieve_milvus_v3.py
+retrieve_milvus_v3_ollama.py
 
-3-leg hybrid search in Milvus:
-  1. schema dense   (field: dense)
-  2. schema sparse  (field: sparse)
-  3. value dense    (field: value_vec)
+3-leg hybrid search using:
+  - schema dense (Ollama bge-m3)
+  - schema sparse (our text->sparse hasher)
+  - value dense (Ollama bge-m3)
 
-Supports scalar filters:
-  - section
-  - subsection
-  - status
-  - value_text  (normalized, exact)
+Supports filters:
+  --section
+  --subsection
+  --status
+  --value   (exact normalized value_text)
 
-Examples:
-
-1) schema-only
-    python retrieve_milvus_v3.py --query "address"
-
-2) schema + value filter (your Hyderabad case)
-    python retrieve_milvus_v3.py --query "address" --section "Address" --value "hyderabad"
-
-3) fuzzy on value (uses value_vec)
-    python retrieve_milvus_v3.py --query "address hyderbad"
+Usage:
+    python retrieve_milvus_v3_ollama.py --query "address" --section "Address"
+    python retrieve_milvus_v3_ollama.py --query "address hyderbad"
+    python retrieve_milvus_v3_ollama.py --query "address" --section "Address" --value "hyderabad"
 """
 
 import os
 import argparse
-from typing import Any, Dict
+import requests
+from typing import Dict, Any, List
 
 from pymilvus import (
     MilvusClient,
@@ -392,22 +278,33 @@ MILVUS_URI = os.environ.get("MILVUS_URI", "http://localhost:19530")
 MILVUS_TOKEN = os.environ.get("MILVUS_TOKEN", "root:Milvus")
 COLLECTION = os.environ.get("MILVUS_COLLECTION", "forms_hybrid_v3")
 BGE_DIM = 1024
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "bge-m3")
 
 
-# ---------------- EMBEDDING (same stubs as ingest) ----------------
-def embed_bge_m3_schema(text: str) -> Dict[str, Any]:
-    dense = [0.0] * BGE_DIM
-    sparse = {1: 0.8, 5: 0.4}
-    return {"dense": dense, "sparse": sparse}
+def ollama_embed(text: str) -> List[float]:
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": text,
+    }
+    resp = requests.post(f"{OLLAMA_URL}/api/embeddings", json=payload, timeout=20)
+    resp.raise_for_status()
+    return resp.json()["embedding"]
 
 
-def embed_bge_m3_value(text: str) -> Dict[str, Any]:
-    dense = [0.0] * BGE_DIM
-    sparse = {3: 0.7}
-    return {"dense": dense, "sparse": sparse}
+def text_to_sparse(text: str) -> Dict[int, float]:
+    sparse: Dict[int, float] = {}
+    if not text:
+        return sparse
+    tokens = text.lower().replace(";", " ").replace(":", " ").split()
+    for tok in tokens:
+        if not tok:
+            continue
+        tid = abs(hash(tok)) % 1000000
+        sparse[tid] = sparse.get(tid, 0.0) + 1.0
+    return sparse
 
 
-# ---------------- FILTER BUILDER ----------------
 def build_expr(section: str, subsection: str, status: str, value_text: str) -> str:
     clauses = []
     if section:
@@ -431,18 +328,15 @@ def run_hybrid_3leg(
     value_text: str = "",
     topk: int = 10,
 ):
-    # Embed query for schema
-    schema_emb = embed_bge_m3_schema(query_text)
-    q_schema_dense = schema_emb["dense"]
-    q_schema_sparse = schema_emb["sparse"]
-
-    # Embed query for value
-    value_emb = embed_bge_m3_value(query_text)
-    q_value_dense = value_emb["dense"]
+    # 1) schema dense from Ollama
+    q_schema_dense = ollama_embed(query_text)
+    # 2) schema sparse from our tokenizer
+    q_schema_sparse = text_to_sparse(query_text)
+    # 3) value dense (we reuse the same text; in real code you might extract the value token)
+    q_value_dense = ollama_embed(query_text)
 
     expr = build_expr(section, subsection, status, value_text)
 
-    # 1) schema dense request
     req_schema_dense = AnnSearchRequest(
         data=[q_schema_dense],
         anns_field="dense",
@@ -451,7 +345,6 @@ def run_hybrid_3leg(
         expr=expr if expr else None,
     )
 
-    # 2) schema sparse request
     req_schema_sparse = AnnSearchRequest(
         data=[q_schema_sparse],
         anns_field="sparse",
@@ -463,7 +356,6 @@ def run_hybrid_3leg(
         expr=expr if expr else None,
     )
 
-    # 3) value dense request
     req_value_dense = AnnSearchRequest(
         data=[q_value_dense],
         anns_field="value_vec",
@@ -472,7 +364,7 @@ def run_hybrid_3leg(
         expr=expr if expr else None,
     )
 
-    # weights: tune! 0.5 schema dense, 0.3 schema sparse, 0.2 value
+    # weights: tune later
     ranker = WeightedRanker(0.5, 0.3, 0.2)
 
     res = client.hybrid_search(
@@ -500,7 +392,7 @@ def main():
     ap.add_argument("--section", default="", help="Filter: section")
     ap.add_argument("--subsection", default="", help="Filter: subsection")
     ap.add_argument("--status", default="active", help="Filter: status")
-    ap.add_argument("--value", default="", help="Filter: exact value_text (normalized)")
+    ap.add_argument("--value", default="", help="Filter: exact normalized value_text")
     ap.add_argument("--topk", type=int, default=10, help="Top-k")
     args = ap.parse_args()
 
@@ -532,7 +424,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 
