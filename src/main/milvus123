@@ -649,3 +649,318 @@ User query: {user_q}
     }
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# langgraph_milvus_rag.py
+
+import json
+import requests
+from typing import Any, Dict, List, Optional
+
+from pymilvus import MilvusClient, AnnSearchRequest, RRFRanker
+from langgraph.graph import StateGraph, MessagesState
+
+# -------------------------------------------------
+# CONFIG
+# -------------------------------------------------
+OLLAMA_URL = "http://localhost:11434"
+MILVUS_URI = "http://localhost:19530"
+MILVUS_TOKEN = "root:Milvus"
+COLLECTION = "forms_hybrid_v3"   # <- use your actual collection name
+
+
+# -------------------------------------------------
+# OLLAMA HELPERS
+# -------------------------------------------------
+def ollama_chat(model: str, content: str) -> str:
+    """Call Ollama chat and return assistant text."""
+    r = requests.post(
+        f"{OLLAMA_URL}/api/chat",
+        json={"model": model, "messages": [{"role": "user", "content": content}]},
+        timeout=60,
+    )
+    r.raise_for_status()
+    data = r.json()
+    return data["message"]["content"]
+
+
+def ollama_embed_bgem3(text: str) -> List[float]:
+    """Get dense embedding from Ollama bge-m3."""
+    r = requests.post(
+        f"{OLLAMA_URL}/api/embeddings",
+        json={"model": "bge-m3", "prompt": text},
+        timeout=60,
+    )
+    r.raise_for_status()
+    data = r.json()
+    return data["embedding"]  # list[float]
+
+
+# -------------------------------------------------
+# MILVUS CLIENT
+# -------------------------------------------------
+milvus = MilvusClient(uri=MILVUS_URI, token=MILVUS_TOKEN)
+
+
+# -------------------------------------------------
+# 1) NODE: REWRITE (NL → search spec)
+# -------------------------------------------------
+def rewrite_node(state: MessagesState) -> Dict[str, Any]:
+    user_q = state["messages"][-1]["content"]
+
+    prompt = f"""
+You convert a natural language request about FORM FIELDS into a JSON search spec.
+
+Each row in the DB has these columns:
+- question_label
+- prop
+- value_text
+- section
+- subsection
+- json_pointer
+- form_id
+- status
+
+Return JSON ONLY, like:
+{{
+  "semantic_query": "...",   // text to embed (usually from the user's intent)
+  "section": null or "Address",
+  "subsection": null or "Current",
+  "form_id": null or "Form A",
+  "value_eq": null or "hyderabad",  // for exact value_text filter
+  "limit": 10
+}}
+
+User query: {user_q}
+""".strip()
+
+    raw = ollama_chat("llama3.2", prompt)
+    try:
+        spec = json.loads(raw)
+    except json.JSONDecodeError:
+        # fallback if model gave extra text
+        spec = {
+            "semantic_query": user_q,
+            "section": None,
+            "subsection": None,
+            "form_id": None,
+            "value_eq": None,
+            "limit": 10,
+        }
+
+    # store into state so next node can use
+    return {
+        **state,
+        "search_spec": spec,
+    }
+
+
+# -------------------------------------------------
+# (optional) sparse: for now we send empty dict
+# later you plug your bm25 sparse builder here
+# -------------------------------------------------
+def build_sparse_from_bm25(query: str) -> Dict[int, float]:
+    # placeholder: return {} → Milvus will just use dense leg
+    return {}
+
+
+# -------------------------------------------------
+# helper: format hits for LLM
+# -------------------------------------------------
+def format_hits_for_llm(res, limit: int = 6) -> str:
+    # res is SearchResults -> take first hits (we queried 1 vector)
+    hits = res[0]
+    blocks = []
+    for i, h in enumerate(hits[:limit], start=1):
+        blocks.append(
+            "\n".join(
+                [
+                    f"[{i}]",
+                    f"question_label: {h.get('question_label')}",
+                    f"prop: {h.get('prop')}",
+                    f"value_text: {h.get('value_text')}",
+                    f"section: {h.get('section')}",
+                    f"subsection: {h.get('subsection')}",
+                    f"json_pointer: {h.get('json_pointer')}",
+                    f"form_id: {h.get('form_id')}",
+                ]
+            )
+        )
+    return "CONTEXT (retrieved rows):\n" + "\n\n".join(blocks)
+
+
+# -------------------------------------------------
+# 2) NODE: RETRIEVE (Milvus hybrid)
+# -------------------------------------------------
+def retrieve_node(state: MessagesState) -> Dict[str, Any]:
+    spec = state.get("search_spec") or {}
+    sem_q = spec.get("semantic_query") or state["messages"][-1]["content"]
+
+    q_dense = ollama_embed_bgem3(sem_q)
+    q_sparse = build_sparse_from_bm25(sem_q)  # can be {} for now
+
+    # build filter expr
+    clauses = ['status == "active"']  # you added this in ingest
+    if spec.get("form_id"):
+        clauses.append(f'form_id == "{spec["form_id"]}"')
+    if spec.get("section"):
+        clauses.append(f'section == "{spec["section"]}"')
+    if spec.get("subsection"):
+        clauses.append(f'subsection == "{spec["subsection"]}"')
+    if spec.get("value_eq"):
+        val = spec["value_eq"].lower().strip()
+        clauses.append(f'value_text == "{val}"')
+
+    expr = " and ".join(clauses)
+    topk = int(spec.get("limit", 10))
+
+    reqs = []
+
+    # dense leg
+    req_dense = AnnSearchRequest(
+        data=[q_dense],
+        anns_field="dense",
+        param={"metric_type": "COSINE", "params": {}},
+        limit=topk,
+        expr=expr,
+    )
+    reqs.append(req_dense)
+
+    # sparse leg (add only if not empty)
+    if q_sparse:
+        req_sparse = AnnSearchRequest(
+            data=[q_sparse],
+            anns_field="sparse",
+            param={"metric_type": "IP", "params": {"drop_ratio_search": 0.2}},
+            limit=topk,
+            expr=expr,
+        )
+        reqs.append(req_sparse)
+
+    # use RRF because you asked earlier
+    ranker = RRFRanker()
+
+    res = milvus.hybrid_search(
+        collection_name=COLLECTION,
+        reqs=reqs,
+        ranker=ranker,
+        limit=topk,
+        output_fields=[
+            "question_label",
+            "prop",
+            "value_text",
+            "section",
+            "subsection",
+            "json_pointer",
+            "form_id",
+            "status",
+        ],
+    )
+
+    ctx_text = format_hits_for_llm(res, limit=6)
+
+    # 👇 append as system message so next LLM sees it
+    new_messages = list(state["messages"]) + [
+        {
+            "role": "system",
+            "content": ctx_text,
+        }
+    ]
+
+    return {
+        **state,
+        "messages": new_messages,
+        "retrieval_raw": ctx_text,  # optional: keep raw
+    }
+
+
+# -------------------------------------------------
+# 3) NODE: ANSWER (LLM over context)
+# -------------------------------------------------
+def answer_node(state: MessagesState) -> Dict[str, Any]:
+    user_q = state["messages"][-1]["content"]
+
+    # find latest system CONTEXT
+    ctx_text = "CONTEXT: (empty)"
+    for m in reversed(state["messages"]):
+        if m["role"] == "system" and m["content"].startswith("CONTEXT"):
+            ctx_text = m["content"]
+            break
+
+    prompt = f"""
+You are a forms RAG assistant.
+
+You are given some retrieved rows from the database.
+Each row represents one field (question_label, prop, value_text, section, subsection, json_pointer).
+
+You MUST answer ONLY from these rows.
+If the user asks for "all related" information, return all rows that look related.
+If the answer is not in the rows, say exactly: "Not found in retrieved rows."
+
+{ctx_text}
+
+USER QUESTION: {user_q}
+
+Answer:
+""".strip()
+
+    answer = ollama_chat("llama3.2", prompt)
+
+    new_messages = list(state["messages"]) + [
+        {"role": "assistant", "content": answer}
+    ]
+
+    return {
+        **state,
+        "messages": new_messages,
+    }
+
+
+# -------------------------------------------------
+# BUILD THE GRAPH
+# -------------------------------------------------
+def build_graph():
+    g = StateGraph(MessagesState)
+    g.add_node("rewrite", rewrite_node)
+    g.add_node("retrieve", retrieve_node)
+    g.add_node("answer", answer_node)
+
+    # flow: user -> rewrite -> retrieve -> answer
+    g.set_entry_point("rewrite")
+    g.add_edge("rewrite", "retrieve")
+    g.add_edge("retrieve", "answer")
+    g.set_finish_point("answer")
+
+    return g.compile()
+
+
+if __name__ == "__main__":
+    app = build_graph()
+    # run once
+    result = app.invoke(
+        {
+            "messages": [
+                {"role": "user", "content": "Get me address related information from Form A"}
+            ]
+        }
+    )
+    # final assistant message
+    for m in result["messages"]:
+        if m["role"] == "assistant":
+            print("\nASSISTANT:\n", m["content"])
+
+
