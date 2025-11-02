@@ -521,3 +521,25 @@ def retrieve_from_milvus(query: str) -> str:
 
 
 
+
+
+
+
+def format_hits_for_llm(hits, limit=5):
+    blocks = []
+    for i, h in enumerate(hits[:limit], start=1):
+        blocks.append(
+            "\n".join([
+                f"[{i}]",
+                f"question_label: {h.get('question_label')}",
+                f"prop: {h.get('prop')}",
+                f"value_text: {h.get('value_text')}",
+                f"section: {h.get('section')}",
+                f"subsection: {h.get('subsection')}",
+                f"json_pointer: {h.get('json_pointer')}",
+            ])
+        )
+    return "CONTEXT:\n" + "\n\n".join(blocks)
+
+
+
