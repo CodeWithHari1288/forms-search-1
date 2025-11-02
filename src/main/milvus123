@@ -495,3 +495,29 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+from langgraph.graph import StateGraph, MessagesState, END
+from langchain.tools import tool
+
+@tool("milvus_retrieve", return_direct=True)
+def milvus_retrieve_tool(query: str) -> str:
+    """Retrieve relevant form fields from Milvus hybrid index"""
+    return retrieve_from_milvus(query)
+
+
+
+
+def retrieve_from_milvus(query: str) -> str:
+    res = milvus_client.hybrid_search(...query...)
+    top_texts = [
+        f"[{hit.id}] {hit.get('label')} → {hit.get('value_text')}"
+        for hit in res[0]
+    ]
+    return "\n".join(top_texts)
+
+
+
+
