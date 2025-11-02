@@ -543,3 +543,109 @@ def format_hits_for_llm(hits, limit=5):
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import json
+import requests
+
+OLLAMA_URL = "http://localhost:11434"   # change if different
+
+def ollama_chat(model: str, content: str) -> str:
+    r = requests.post(
+        f"{OLLAMA_URL}/api/chat",
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": content}],
+        },
+        timeout=60,
+    )
+    r.raise_for_status()
+    return r.json()["message"]["content"]
+
+
+def rewrite_node(state):
+    """
+    LangGraph node:
+    - input: state["messages"] (last is user)
+    - output: same state + state["search_spec"]
+    """
+    user_q = state["messages"][-1]["content"]
+
+    prompt = f"""
+You convert a natural language query about FORM FIELDS into JSON for search.
+
+Each row in the DB has these columns:
+- question_label
+- prop
+- value_text
+- section
+- subsection
+- json_pointer
+- form_id
+- status
+
+Return JSON ONLY in this shape:
+
+{{
+  "semantic_query": "text to embed for semantic search",
+  "section": null or "Address" or "KYC" or "Contact",
+  "subsection": null or "Current" or "Billing" or "Mailing",
+  "form_id": null or "Form A" or "A" or "B",
+  "value_eq": null or "hyderabad" or "IN",
+  "limit": 10
+}}
+
+Rules:
+- If the user mentions a form, set form_id.
+- If the user mentions a section, set section.
+- If the user mentions an exact value (like a city), set value_eq (lowercase).
+- If unsure, leave fields null.
+- Always set limit (default 10).
+
+User query: {user_q}
+""".strip()
+
+    raw = ollama_chat("llama3.2", prompt)
+
+    # be defensive, the model may add text
+    try:
+        spec = json.loads(raw)
+    except json.JSONDecodeError:
+        spec = {
+            "semantic_query": user_q,
+            "section": None,
+            "subsection": None,
+            "form_id": None,
+            "value_eq": None,
+            "limit": 10,
+        }
+
+    # normalize value_eq to lowercase, if present
+    if spec.get("value_eq"):
+        spec["value_eq"] = str(spec["value_eq"]).lower().strip()
+
+    # return updated state
+    return {
+        **state,
+        "search_spec": spec,
+    }
+
+
