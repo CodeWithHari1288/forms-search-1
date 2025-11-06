@@ -964,3 +964,161 @@ if __name__ == "__main__":
             print("\nASSISTANT:\n", m["content"])
 
 
+
+
+
+
+
+
+
+#!/usr/bin/env python3
+"""
+Ingest script for Milvus standalone with dual collections:
+1. form_schema_index  -> schema-level metadata (Question_label, Prop, Section, Subsection)
+2. form_field_values  -> field-level hybrid (includes Value, Context, Pointer)
+
+Uses BGE-M3 for dense + sparse embeddings (via FlagEmbedding).
+"""
+
+import os, glob, pandas as pd
+from pymilvus import MilvusClient, DataType, FieldSchema, CollectionSchema, Collection
+from FlagEmbedding import BGEM3FlagModel
+
+# ----------------------------
+# CONFIG
+# ----------------------------
+LITE_DB_FILE = "./forms.db"
+CSV_DIR = "./csvs"
+SCHEMA_COLLECTION = "form_schema_index"
+FIELD_COLLECTION = "form_field_values"
+DENSE_DIM = 1024
+BATCH_SIZE = 100
+
+REQUIRED_COLS = [
+    "Question_label", "Prop", "Value",
+    "Json_pointer", "Question_context",
+    "Section", "Subsection"
+]
+
+# ----------------------------
+# MODEL
+# ----------------------------
+print("Loading BGE-M3 model...")
+model = BGEM3FlagModel('BAAI/bge-m3', use_fp16=True)
+
+# ----------------------------
+# CONNECT TO MILVUS
+# ----------------------------
+client = MilvusClient(uri=LITE_DB_FILE)
+
+# ----------------------------
+# COLLECTION DEFINITIONS
+# ----------------------------
+def ensure_collection(name: str, mode: str):
+    """
+    Create collection if not exists.
+    mode = 'schema' | 'field'
+    """
+    if client.has_collection(name):
+        print(f"✅ Collection '{name}' already exists.")
+        return
+
+    base_fields = [
+        FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
+        FieldSchema(name="Question_label", dtype=DataType.VARCHAR, max_length=512),
+        FieldSchema(name="Prop", dtype=DataType.VARCHAR, max_length=256),
+        FieldSchema(name="Section", dtype=DataType.VARCHAR, max_length=256),
+        FieldSchema(name="Subsection", dtype=DataType.VARCHAR, max_length=256),
+        FieldSchema(name="dense", dtype=DataType.FLOAT_VECTOR, dim=DENSE_DIM),
+        FieldSchema(name="sparse", dtype=DataType.SPARSE_FLOAT_VECTOR)
+    ]
+
+    if mode == "field":
+        base_fields += [
+            FieldSchema(name="Value", dtype=DataType.VARCHAR, max_length=2048),
+            FieldSchema(name="Json_pointer", dtype=DataType.VARCHAR, max_length=512),
+            FieldSchema(name="Question_context", dtype=DataType.VARCHAR, max_length=2048)
+        ]
+
+    schema = CollectionSchema(fields=base_fields, description=f"{mode} collection")
+    client.create_collection(name=name, schema=schema)
+    print(f"🆕 Created collection '{name}' with mode '{mode}'.")
+
+# ----------------------------
+# EMBEDDING HELPERS
+# ----------------------------
+def embed_row(label, prop, value=None):
+    """Create dense+sparse embeddings for given text."""
+    if value:
+        text = f"{label} {prop} {value}"
+    else:
+        text = f"{label} {prop}"
+    emb = model.encode(text, return_dense=True, return_sparse=True)
+    return emb["dense_vecs"][0], emb["lexical_weights"][0]
+
+# ----------------------------
+# INGESTION
+# ----------------------------
+def ingest_csv_folder(folder):
+    csv_files = glob.glob(os.path.join(folder, "*.csv"))
+    if not csv_files:
+        print("❌ No CSV files found.")
+        return
+
+    ensure_collection(SCHEMA_COLLECTION, "schema")
+    ensure_collection(FIELD_COLLECTION, "field")
+
+    for path in csv_files:
+        print(f"📄 Reading {os.path.basename(path)} ...")
+        df = pd.read_csv(path)
+        missing = [c for c in REQUIRED_COLS if c not in df.columns]
+        if missing:
+            print(f"⚠️ Missing columns {missing} in {path}, skipping.")
+            continue
+
+        ingest_df(df)
+
+def ingest_df(df: pd.DataFrame):
+    schema_rows = []
+    field_rows = []
+
+    for _, row in df.iterrows():
+        dense1, sparse1 = embed_row(row["Question_label"], row["Prop"])
+        schema_rows.append({
+            "Question_label": row["Question_label"],
+            "Prop": row["Prop"],
+            "Section": row["Section"],
+            "Subsection": row["Subsection"],
+            "dense": dense1,
+            "sparse": sparse1
+        })
+
+        dense2, sparse2 = embed_row(row["Question_label"], row["Prop"], row["Value"])
+        field_rows.append({
+            "Question_label": row["Question_label"],
+            "Prop": row["Prop"],
+            "Value": row["Value"],
+            "Json_pointer": row["Json_pointer"],
+            "Question_context": row["Question_context"],
+            "Section": row["Section"],
+            "Subsection": row["Subsection"],
+            "dense": dense2,
+            "sparse": sparse2
+        })
+
+    print(f"⬆️ Inserting {len(schema_rows)} schema rows...")
+    client.insert(collection_name=SCHEMA_COLLECTION, data=schema_rows)
+
+    print(f"⬆️ Inserting {len(field_rows)} field rows...")
+    client.insert(collection_name=FIELD_COLLECTION, data=field_rows)
+
+    print("✅ Done inserting batch.\n")
+
+# ----------------------------
+# MAIN
+# ----------------------------
+if __name__ == "__main__":
+    ingest_csv_folder(CSV_DIR)
+    print("✅ All CSVs ingested successfully.")
+
+
