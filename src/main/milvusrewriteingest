@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""
+Ingest a schema-only collection for rewrite/query understanding in LangGraph.
+
+Collection: form_schema_index
+
+Fields:
+  - id (INT64, auto_id primary key)
+  - Question_label   (VARCHAR)
+  - Prop             (VARCHAR)
+  - Section          (VARCHAR)
+  - Subsection       (VARCHAR)
+  - dense            (FLOAT_VECTOR, 1024)  <-- from BGE-M3 via Ollama
+
+No Value / Json_pointer / Question_context here.
+This is ONLY for mapping user NLP → schema fields in your rewrite node.
+"""
+
+import os
+import glob
+from typing import List, Dict, Any
+
+import pandas as pd
+import requests
+from pymilvus import (
+    MilvusClient,
+    DataType,
+    FieldSchema,
+    CollectionSchema,
+)
+
+# ----------------------------
+# CONFIG
+# ----------------------------
+MILVUS_URI = "http://localhost:19530"   # Milvus standalone
+CSV_DIR = "./csvs"                      # folder containing your CSV files
+SCHEMA_COLLECTION = "form_schema_index"
+
+# BGE-M3 dense dimension
+DENSE_DIM = 1024
+
+# Batch insert size
+BATCH_SIZE = 100
+
+# Ollama config
+OLLAMA_URL = "http://localhost:11434/api/embeddings"
+OLLAMA_MODEL = "bge-m3"
+
+# CSV headers we expect (we only use some of them)
+REQUIRED_COLS = [
+    "Question_label",
+    "Prop",
+    "Value",
+    "Json_pointer",
+    "Question_context",
+    "Section",
+    "Subsection",
+]
+
+
+# ----------------------------
+# CONNECT TO MILVUS
+# ----------------------------
+client = MilvusClient(uri=MILVUS_URI)
+
+
+# ----------------------------
+# COLLECTION DEFINITION
+# ----------------------------
+def ensure_schema_collection():
+    if client.has_collection(SCHEMA_COLLECTION):
+        print(f"✅ Collection '{SCHEMA_COLLECTION}' already exists.")
+        return
+
+    fields = [
+        FieldSchema(
+            name="id",
+            dtype=DataType.INT64,
+            is_primary=True,
+            auto_id=True,
+        ),
+        FieldSchema(
+            name="Question_label",
+            dtype=DataType.VARCHAR,
+            max_length=512,
+        ),
+        FieldSchema(
+            name="Prop",
+            dtype=DataType.VARCHAR,
+            max_length=256,
+        ),
+        FieldSchema(
+            name="Section",
+            dtype=DataType.VARCHAR,
+            max_length=256,
+        ),
+        FieldSchema(
+            name="Subsection",
+            dtype=DataType.VARCHAR,
+            max_length=256,
+        ),
+        FieldSchema(
+            name="dense",
+            dtype=DataType.FLOAT_VECTOR,
+            dim=DENSE_DIM,
+        ),
+    ]
+
+    schema = CollectionSchema(
+        fields=fields,
+        description="Schema-only collection (dense BGE-M3) for query rewrite",
+    )
+
+    client.create_collection(
+        collection_name=SCHEMA_COLLECTION,
+        schema=schema,
+    )
+    print(f"🆕 Created collection '{SCHEMA_COLLECTION}'.")
+
+    # Create index on dense vector
+    print("📦 Creating HNSW index on 'dense' ...")
+    client.create_index(
+        collection_name=SCHEMA_COLLECTION,
+        field_name="dense",
+        index_params={
+            "index_type": "HNSW",
+            "metric_type": "COSINE",
+            "params": {"M": 16, "efConstruction": 64},
+        },
+    )
+
+    client.load_collection(SCHEMA_COLLECTION)
+    print("✅ Index created and collection loaded.")
+
+
+# ----------------------------
+# OLLAMA EMBEDDINGS (BGE-M3)
+# ----------------------------
+def get_bgem3_embedding(text: str):
+    """
+    Call Ollama /api/embeddings for BGE-M3 and return a 1024-dim vector.
+    """
+    resp = requests.post(
+        OLLAMA_URL,
+        json={
+            "model": OLLAMA_MODEL,
+            "prompt": text,
+        },
+        timeout=120,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Ollama returns: {"embedding": [...], ...}
+    emb = data.get("embedding")
+    if emb is None:
+        raise RuntimeError(f"No 'embedding' field in Ollama response: {data}")
+
+    if len(emb) != DENSE_DIM:
+        print(f"⚠️ Warning: expected dim {DENSE_DIM}, got {len(emb)}")
+
+    return emb
+
+
+def embed_schema_text(label: str, prop: str, section: str, subsection: str):
+    """
+    Build the schema text to embed.
+
+    You can adjust this prompt style anytime:
+      e.g., include more hints like "field label", "property name", etc.
+    """
+    parts = [label, f"({prop})"]
+    if section:
+        parts.append(f"section: {section}")
+    if subsection:
+        parts.append(f"subsection: {subsection}")
+    text = " - ".join(parts)
+
+    return get_bgem3_embedding(text)
+
+
+# ----------------------------
+# INGESTION
+# ----------------------------
+def ingest_csv_folder(folder: str):
+    csv_files = glob.glob(os.path.join(folder, "*.csv"))
+    if not csv_files:
+        print(f"❌ No CSV files found in {folder}")
+        return
+
+    ensure_schema_collection()
+
+    for path in csv_files:
+        print(f"📄 Reading {os.path.basename(path)} ...")
+        df = pd.read_csv(path)
+
+        missing = [c for c in REQUIRED_COLS if c not in df.columns]
+        if missing:
+            print(f"⚠️ Missing columns {missing} in {path}, skipping.")
+            continue
+
+        ingest_df(df)
+
+
+def ingest_df(df: pd.DataFrame):
+    batch: List[Dict[str, Any]] = []
+
+    for _, row in df.iterrows():
+        q_label = str(row["Question_label"])
+        prop = str(row["Prop"])
+        section = "" if pd.isna(row["Section"]) else str(row["Section"])
+        subsection = "" if pd.isna(row["Subsection"]) else str(row["Subsection"])
+
+        dense_vec = embed_schema_text(q_label, prop, section, subsection)
+
+        record = {
+            "Question_label": q_label,
+            "Prop": prop,
+            "Section": section,
+            "Subsection": subsection,
+            "dense": dense_vec,
+        }
+        batch.append(record)
+
+        if len(batch) >= BATCH_SIZE:
+            flush_batch(batch)
+
+    if batch:
+        flush_batch(batch)
+
+
+def flush_batch(batch: List[Dict[str, Any]]):
+    print(f"⬆️ Inserting batch of {len(batch)} rows into '{SCHEMA_COLLECTION}' ...")
+    client.insert(collection_name=SCHEMA_COLLECTION, data=batch)
+    print("✅ Batch inserted.")
+
+
+# ----------------------------
+# MAIN
+# ----------------------------
+if __name__ == "__main__":
+    ingest_csv_folder(CSV_DIR)
+    print("🎉 Finished ingesting schema collection with dense BGE-M3 embeddings.")
