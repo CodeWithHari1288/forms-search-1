@@ -717,3 +717,249 @@ if __name__ == "__main__":
 
     print("\n=== Structured query ===")
     pprint(result["structured_query"])
+
+
+
+
+
+
+
+
+
+
+
+# rewrite_query_ollama_bgem3.py
+"""
+LangGraph node for query rewrite using:
+- Ollama bge-m3 embeddings  (http://localhost:11434/api/embeddings)
+- Milvus for schema search
+- Rule-based conversion to JSON filters (NO GPT / NO OpenAI)
+
+Collection used: form_schema_index
+
+Expected fields in `form_schema_index`:
+  - Question_label (VARCHAR)
+  - Prop           (VARCHAR)
+  - Section        (VARCHAR)
+  - Subsection     (VARCHAR)
+  - dense          (FLOAT_VECTOR, 1024)   <-- from Ollama bge-m3
+"""
+
+from typing import List, Dict, Any
+from typing_extensions import TypedDict
+import os
+import requests
+
+from langgraph.graph import StateGraph, START, END
+from pymilvus import MilvusClient
+
+
+# -------------------------
+# CONFIG
+# -------------------------
+MILVUS_URI = os.getenv("MILVUS_URI", "http://localhost:19530")
+SCHEMA_COLLECTION = os.getenv("SCHEMA_COLLECTION", "form_schema_index")
+
+# Ollama settings
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/embeddings")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "bge-m3")
+
+DENSE_DIM = 1024
+TOP_K_SCHEMA = 8          # how many schema fields to consider
+SCORE_THRESHOLD = 0.0     # keep all; bump this up to drop weak matches
+
+
+# -------------------------
+# LANGGRAPH STATE
+# -------------------------
+class RewriteState(TypedDict):
+    # Input
+    user_query: str
+
+    # Outputs (filled by node)
+    schema_hits: List[Dict[str, Any]]
+    structured_query: Dict[str, Any]
+
+
+# -------------------------
+# MILVUS CLIENT
+# -------------------------
+client = MilvusClient(uri=MILVUS_URI)
+
+
+# -------------------------
+# OLLAMA bge-m3 EMBEDDINGS
+# -------------------------
+def get_bgem3_embedding(text: str) -> List[float]:
+    """
+    Call Ollama /api/embeddings with bge-m3 and return a 1024-dim vector.
+
+    This MUST match how you embedded when ingesting form_schema_index.
+    """
+    resp = requests.post(
+        OLLAMA_URL,
+        json={
+            "model": OLLAMA_MODEL,
+            "prompt": text,   # use "prompt" to be consistent with your ingest script
+        },
+        timeout=120,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    emb = data.get("embedding")
+    if emb is None:
+        raise RuntimeError(f"No 'embedding' field in Ollama response: {data}")
+
+    if len(emb) != DENSE_DIM:
+        print(f"⚠️ Warning: expected dim {DENSE_DIM}, got {len(emb)}")
+
+    return emb
+
+
+# -------------------------
+# SCHEMA SEARCH
+# -------------------------
+def search_schema_in_milvus(query: str, k: int = TOP_K_SCHEMA) -> List[Dict[str, Any]]:
+    """
+    Vector search against form_schema_index using bge-m3 embedding from Ollama.
+    Returns a list[dict] with label/prop/section/subsection + score.
+    """
+    q_vec = get_bgem3_embedding(query)
+
+    res = client.search(
+        collection_name=SCHEMA_COLLECTION,
+        data=[q_vec],
+        anns_field="dense",
+        limit=k,
+        output_fields=["Question_label", "Prop", "Section", "Subsection"],
+        search_params={
+            "metric_type": "COSINE",
+            "params": {},
+        },
+    )
+
+    hits: List[Dict[str, Any]] = []
+    if not res:
+        return hits
+
+    # res is List[List[hit]]; one query vector => res[0]
+    for hit in res[0]:
+        entity = hit.get("entity", {})
+        score = hit.get("distance")  # for COSINE this is similarity / distance depending on Milvus config
+        hits.append(
+            {
+                "id": hit.get("id"),
+                "score": score,
+                "Question_label": entity.get("Question_label", ""),
+                "Prop": entity.get("Prop", ""),
+                "Section": entity.get("Section", ""),
+                "Subsection": entity.get("Subsection", ""),
+            }
+        )
+
+    return hits
+
+
+# -------------------------
+# SIMPLE RULE-BASED "REWRITE"
+# -------------------------
+def build_structured_query(
+    user_query: str,
+    schema_hits: List[Dict[str, Any]],
+    score_threshold: float = SCORE_THRESHOLD,
+) -> Dict[str, Any]:
+    """
+    Convert top schema hits into a simple structured JSON filter.
+
+    No LLM here: we just pick the best matches from Milvus.
+    """
+    filters: List[Dict[str, str]] = []
+
+    for h in schema_hits:
+        score = h.get("score") or 0.0
+        # If you want to drop weak matches, set SCORE_THRESHOLD > 0
+        if score < score_threshold:
+            continue
+
+        filters.append(
+            {
+                "prop": h.get("Prop", ""),
+                "section": h.get("Section", "") or "",
+                "subsection": h.get("Subsection", "") or "",
+            }
+        )
+
+    # Very basic "rewrite" string (just for logging/debug)
+    if filters:
+        prop_list = [f["prop"] for f in filters if f["prop"]]
+        rewrite_str = (
+            f"Use fields: {', '.join(prop_list)} for the query: {user_query}"
+            if prop_list
+            else user_query
+        )
+    else:
+        rewrite_str = user_query
+
+    return {
+        "filters": filters,
+        "original_query": user_query,
+        "rewrite": rewrite_str,
+    }
+
+
+# -------------------------
+# LANGGRAPH NODE
+# -------------------------
+def rewrite_query_node(state: RewriteState) -> Dict[str, Any]:
+    """
+    Node:
+      input : state['user_query']
+      output: state['schema_hits'], state['structured_query']
+
+    Uses only:
+      - Ollama bge-m3 embeddings
+      - Milvus search
+      - Rule-based conversion to JSON filters
+    """
+    user_query = state["user_query"]
+
+    # 1) Vector search on schema collection
+    schema_hits = search_schema_in_milvus(user_query, k=TOP_K_SCHEMA)
+
+    # 2) Build structured query JSON
+    structured = build_structured_query(user_query, schema_hits)
+
+    return {
+        "schema_hits": schema_hits,
+        "structured_query": structured,
+    }
+
+
+# -------------------------
+# BUILD GRAPH
+# -------------------------
+builder = StateGraph(RewriteState)
+
+builder.add_node("rewrite_query", rewrite_query_node)
+builder.add_edge(START, "rewrite_query")
+builder.add_edge("rewrite_query", END)
+
+rewrite_graph = builder.compile()
+
+
+if __name__ == "__main__":
+    # Quick manual test
+    test_state: RewriteState = {
+        "user_query": "Get all PAN and GSTIN fields for billing address"
+    }
+
+    result = rewrite_graph.invoke(test_state)
+
+    from pprint import pprint
+
+    print("\n=== Schema hits ===")
+    pprint(result["schema_hits"])
+
+    print("\n=== Structured query ===")
+    pprint(result["structured_query"])
