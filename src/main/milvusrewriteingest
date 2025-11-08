@@ -1058,3 +1058,21 @@ def build_expr(structured_query: dict) -> str:
     # ( ... ) or ( ... ) or ( ... )
     expr = " or ".join(groups)
     return expr
+
+
+
+
+
+
+
+
+
+total = 0
+offset = 0
+while True:
+    batch = client.query(collection_name, filter=expr, output_fields=["id"], limit=1000, offset=offset)
+    total += len(batch)
+    if len(batch) < 1000:
+        break
+    offset += 1000
+print(total)
