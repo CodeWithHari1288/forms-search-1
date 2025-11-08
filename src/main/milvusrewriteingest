@@ -1020,3 +1020,41 @@ results = get_results_in_prop_order(structured_query, limit=10)
 
 for r in results:
     print(r["Prop"], "|", r["Question_label"], "|", r.get("Value"))
+
+
+
+
+
+
+
+
+
+
+def build_expr(structured_query: dict) -> str:
+    filters = structured_query.get("filters", [])
+    if not filters:
+        return ""
+
+    groups = []
+
+    for f in filters:
+        conds = []
+
+        prop = f.get("prop")
+        section = f.get("section")
+        subsection = f.get("subsection")
+
+        if prop:
+            conds.append(f"Prop == '{prop}'")
+        if section:
+            conds.append(f"Section == '{section}'")
+        if subsection:
+            conds.append(f"Subsection == '{subsection}'")
+
+        if conds:
+            # (Prop == '...' and Section == '...' and Subsection == '...')
+            groups.append("(" + " and ".join(conds) + ")")
+
+    # ( ... ) or ( ... ) or ( ... )
+    expr = " or ".join(groups)
+    return expr
