@@ -963,3 +963,60 @@ if __name__ == "__main__":
 
     print("\n=== Structured query ===")
     pprint(result["structured_query"])
+
+
+
+
+
+
+
+
+
+
+
+
+
+from pymilvus import MilvusClient
+
+client = MilvusClient(uri="http://localhost:19530")
+
+def get_results_in_prop_order(structured_query, limit=10):
+    ordered_results = []
+
+    for f in structured_query["filters"]:
+        expr_parts = []
+
+        if f.get("prop"):
+            expr_parts.append(f"Prop == '{f['prop']}'")
+        if f.get("section"):
+            expr_parts.append(f"Section == '{f['section']}'")
+        if f.get("subsection"):
+            expr_parts.append(f"Subsection == '{f['subsection']}'")
+
+        expr = " and ".join(expr_parts)
+        # Query only this prop’s rows
+        rows = client.query(
+            collection_name="form_field_values",   # your main collection
+            filter=expr,
+            output_fields=[
+                "Question_label",
+                "Prop",
+                "Section",
+                "Subsection",
+                "Value",
+            ],
+            limit=limit,  # per-prop cap
+        )
+
+        ordered_results.extend(rows)
+
+        if len(ordered_results) >= limit:
+            break
+
+    return ordered_results[:limit]
+
+
+results = get_results_in_prop_order(structured_query, limit=10)
+
+for r in results:
+    print(r["Prop"], "|", r["Question_label"], "|", r.get("Value"))
