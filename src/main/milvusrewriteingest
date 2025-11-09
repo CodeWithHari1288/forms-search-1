@@ -1383,3 +1383,108 @@ function handleSend(userInput) {
             )
         );
     });
+
+
+
+
+
+
+
+
+
+
+
+
+from typing import Annotated, TypedDict, List, Dict, Any
+from langgraph.graph import add_messages
+
+def limited_add_messages(prev, new):
+    combined = add_messages(prev, new)
+    return combined[-7:]
+
+def limited_add_filters(prev, new):
+    combined = prev + new
+    return combined[-7:]
+
+class State(TypedDict):
+    messages: Annotated[list, limited_add_messages]     # user + assistant messages
+    query: str                                           # current rewritten query
+    filters: dict                                        # current filters
+    filter_history: Annotated[List[Dict[str, Any]], limited_add_filters]
+
+
+
+
+
+def rewrite_node(state: State) -> State:
+    # get last user message
+    last_user = next((m for m in reversed(state["messages"]) if m["role"] == "user"), None)
+    if not last_user:
+        return state
+
+    user_query = last_user["content"]
+
+    # build history context
+    context_msgs = [m["content"] for m in state["messages"][-5:]]  # last 5
+    history_text = "\n".join(context_msgs)
+
+    # candidate props (vector search in schema collection)
+    candidates = get_candidate_props_from_schema(user_query, k=5)
+    cand_text = "\n".join(
+        f"- {c['Prop']} ({c['Section']}) score={c['score']:.3f}"
+        for c in candidates if c["Prop"]
+    ) or "None"
+
+    # allowed schema list
+    props_list = ", ".join(SCHEMA["props"])
+    sections_list = ", ".join(SCHEMA["sections"])
+
+    system_prompt = f"""
+You are a query rewriter for a Milvus search over form fields.
+
+Conversation history:
+{history_text}
+
+Allowed props: {props_list}
+Allowed sections: {sections_list}
+Candidate props (semantic match): {cand_text}
+
+Output JSON: {{"query": "...", "filters": {{"Prop": "...", "Section": "...", "crfId": "..."}}}}
+"""
+
+    resp = rewrite_llm.invoke([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_query},
+    ])
+    raw = resp.content.strip()
+
+    # parse result
+    try:
+        data = json.loads(raw)
+    except Exception:
+        data = {"query": user_query, "filters": {}}
+
+    # validate filters against schema
+    query = data.get("query", user_query)
+    filters = data.get("filters", {}) or {}
+    if filters.get("Prop") not in SCHEMA["props"]:
+        filters.pop("Prop", None)
+    if filters.get("Section") not in SCHEMA["sections"]:
+        filters.pop("Section", None)
+
+    # update state
+    state["query"] = query
+    state["filters"] = filters
+    state["filter_history"].append({
+        "raw_query": user_query,
+        "query": query,
+        "filters": filters,
+    })
+
+    # append assistant message
+    state["messages"].append({
+        "role": "assistant",
+        "content": f"[rewrite] query='{query}', filters={filters}"
+    })
+
+    return state
