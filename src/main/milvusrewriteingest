@@ -1076,3 +1076,118 @@ while True:
         break
     offset += 1000
 print(total)
+
+
+
+
+
+
+
+
+
+from typing import Annotated, TypedDict
+from langgraph.graph import add_messages
+
+def limited_add_messages(prev, new):
+    """
+    Combine old + new messages and keep only the last 7.
+    This replaces the default add_messages reducer.
+    """
+    combined = add_messages(prev, new)
+    return combined[-7:]
+
+class State(TypedDict):
+    # This tells LangGraph:
+    # - this channel is called "messages"
+    # - when a node returns {"messages": [...]}, merge using limited_add_messages
+    messages: Annotated[list, limited_add_messages]
+
+
+
+
+from langgraph.graph import StateGraph, START, END
+
+builder = StateGraph(State)
+
+# you’ll add nodes next…
+
+
+from langchain.schema import HumanMessage, AIMessage
+
+def rewrite_node(state: State):
+    messages = state["messages"]
+
+    # last message is the current user query (assuming you always append user last)
+    last_msg = messages[-1]
+    user_query = last_msg["content"] if isinstance(last_msg, dict) else last_msg.content
+
+    # do your rewrite logic here (LLM, rules, etc.)
+    structured_query = {
+        "original_query": user_query,
+        # ... field_filters, record_filters, value_slots, etc.
+    }
+
+    # if you want to also store an assistant “rewrite done” message in history:
+    assistant_msg = {
+        "role": "assistant",
+        "content": f"[rewrite] {structured_query}"
+    }
+
+    # IMPORTANT: return *only new messages*; reducer will merge and trim to 7
+    return {
+        "messages": [assistant_msg],
+        # you can also put structured_query in some other channel if you want
+    }
+
+
+
+def rewrite_node(state: State):
+    messages = state["messages"]
+    last_msg = messages[-1]
+    user_query = last_msg.content
+
+    # ...
+    assistant_msg = AIMessage(content="[rewrite done]")
+    return {"messages": [assistant_msg]}
+
+
+
+
+def retrieve_node(state: State):
+    messages = state["messages"]
+    last_msg = messages[-1]   # still the most recent (user or assistant)
+
+    # you can also inspect previous messages:
+    # messages[-2], messages[-3], etc. (up to 7 stored)
+
+    # Do retrieval, then add an assistant message with answer
+    answer = "..."  # from LLM or RAG
+
+    assistant_msg = {
+        "role": "assistant",
+        "content": answer,
+    }
+
+    return {"messages": [assistant_msg]}
+
+
+
+builder.add_node("rewrite", rewrite_node)
+builder.add_node("retrieve", retrieve_node)
+
+builder.add_edge(START, "rewrite")
+builder.add_edge("rewrite", "retrieve")
+builder.add_edge("retrieve", END)
+
+graph = builder.compile(
+    # you can still use SqliteSaver + store if you want persistence
+    checkpointer=checkpointer,
+    store=memory_store,
+)
+
+
+
+graph.invoke(
+    {"messages": [{"role": "user", "content": "get addresses for client abc"}]},
+    config={"configurable": {"thread_id": "t1"}},
+)
