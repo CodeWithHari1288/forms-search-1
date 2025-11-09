@@ -1331,3 +1331,19 @@ for m in messages[-5:-1]:
     role = m["role"]
     content = m["content"]
     history_text += f"{role}: {content}\n"
+
+
+
+
+
+
+
+
+
+from langchain_community.vectorstores import Milvus as LC_Milvus
+
+vectorstore = LC_Milvus(
+    embedding_function=embeddings,        # your Ollama BGE-M3 embedder
+    connection_args={"host": "localhost", "port": "19530"},
+    collection_name="forms_hybrid",       # your existing collection name
+)
