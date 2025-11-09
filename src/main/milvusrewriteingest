@@ -1347,3 +1347,39 @@ vectorstore = LC_Milvus(
     connection_args={"host": "localhost", "port": "19530"},
     collection_name="forms_hybrid",       # your existing collection name
 )
+
+
+
+
+
+
+
+
+
+You could try creating a temporary "thinking" message when the user sends a prompt, then update that same message with the actual response when it comes back. Something like this might work:
+```javascript
+const [messages, setMessages] = useState([]);
+
+function handleSend(userInput) {
+    const tempId = generateUniqueId();
+    
+    setMessages(old => [
+        ...old,
+        { id: tempId, role: "assistant", content: "Thinking...", isPending: true }
+    ]);
+    
+    fetch("/api/...", {
+        method: "POST",
+        body: JSON.stringify({ input: userInput, tempId }),
+        headers: { "Content-Type": "application/json" }
+    })
+    .then(response => response.json())
+    .then(data => {
+        setMessages(old => 
+            old.map(msg => 
+                msg.id === tempId 
+                    ? { ...msg, content: data.content, isPending: false }
+                    : msg
+            )
+        );
+    });
