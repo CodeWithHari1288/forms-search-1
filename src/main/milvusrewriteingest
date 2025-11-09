@@ -1191,3 +1191,143 @@ graph.invoke(
     {"messages": [{"role": "user", "content": "get addresses for client abc"}]},
     config={"configurable": {"thread_id": "t1"}},
 )
+
+
+
+
+----++----++++-----------------
+
+from typing import Annotated, TypedDict
+from langgraph.graph import add_messages
+
+def limited_add_messages(prev, new):
+    """Merge old + new messages, keep only last 7."""
+    combined = add_messages(prev, new)
+    return combined[-7:]
+
+class State(TypedDict):
+    # LangGraph will use limited_add_messages whenever a node
+    # returns {"messages": [...]} to merge with existing messages.
+    messages: Annotated[list, limited_add_messages]
+
+
+from langgraph.graph import StateGraph, START, END
+from langchain_openai import ChatOpenAI
+from langchain.schema import SystemMessage, HumanMessage, AIMessage
+
+llm = ChatOpenAI(model="gpt-4o-mini")  # or your LLM client
+
+def rewrite_node(state: State) -> dict:
+    messages = state["messages"]
+    # last message is the latest user input
+    last_user = messages[-1]
+
+    # build a tiny text context from previous messages (last 5)
+    history_text = ""
+    for m in messages[-5:-1]:  # all but last
+        role = m["role"]
+        content = m["content"]
+        history_text += f"{role}: {content}\n"
+
+    user_query = last_user["content"]
+
+    chat_messages = [
+        SystemMessage(content=(
+            "You rewrite user queries for a retrieval system.\n"
+            "Use the conversation history to resolve references like "
+            "'above', 'this client', 'same as before'.\n"
+            "Return ONLY the cleaned query text, no explanation."
+        )),
+        HumanMessage(content=f"History:\n{history_text}\n\nCurrent query:\n{user_query}")
+    ]
+
+    resp = llm.invoke(chat_messages)
+    cleaned_query = resp.content.strip()
+
+    # Option 1: store the cleaned query as an assistant message
+    rewrite_msg = {
+        "role": "assistant",
+        "content": f"[rewrite] {cleaned_query}",
+    }
+
+    # Option 2: also (or instead) store it in some other state key if you expand State later.
+
+    return {"messages": [rewrite_msg]}
+
+
+def answer_node(state: State) -> dict:
+    messages = state["messages"]
+
+    # pick the last rewrite (assistant) and last user query
+    last_user = None
+    last_rewrite = None
+    for m in reversed(messages):
+        if last_user is None and m["role"] == "user":
+            last_user = m
+        if last_rewrite is None and m["role"] == "assistant" and m["content"].startswith("[rewrite]"):
+            last_rewrite = m
+        if last_user and last_rewrite:
+            break
+
+    user_query = last_user["content"] if last_user else ""
+    cleaned_query = last_rewrite["content"].replace("[rewrite]", "", 1).strip() if last_rewrite else user_query
+
+    # now use cleaned_query + maybe history for final answer
+    chat_messages = [
+        SystemMessage(content="You are a helpful assistant answering user questions."),
+        HumanMessage(content=f"Original question: {user_query}\n\nRewritten query: {cleaned_query}")
+    ]
+
+    resp = llm.invoke(chat_messages)
+    answer = resp.content.strip()
+
+    answer_msg = {
+        "role": "assistant",
+        "content": answer,
+    }
+
+    return {"messages": [answer_msg]}
+
+
+# Build the graph
+builder = StateGraph(State)
+builder.add_node("rewrite", rewrite_node)
+builder.add_node("answer", answer_node)
+
+builder.add_edge(START, "rewrite")
+builder.add_edge("rewrite", "answer")
+builder.add_edge("answer", END)
+
+graph = builder.compile()  # 👈 no checkpointer, no store
+
+
+
+
+# initial empty state
+state: State = {"messages": []}
+
+while True:
+    user_input = input("You: ")
+    if not user_input:
+        break
+
+    # 1) append user message to state
+    state["messages"].append({"role": "user", "content": user_input})
+
+    # 2) run the graph; it will:
+    #    - call rewrite_node → adds [rewrite] message
+    #    - call answer_node  → adds answer message
+    state = graph.invoke(state)
+
+    # 3) get the last assistant answer (the final message)
+    last_msg = state["messages"][-1]
+    print("Bot:", last_msg["content"])
+
+
+
+
+history_text = ""
+for m in messages[-5:-1]:
+    role = m["role"]
+    content = m["content"]
+    history_text += f"{role}: {content}\n"
